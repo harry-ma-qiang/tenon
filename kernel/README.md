@@ -1,6 +1,6 @@
 # tenon — atom kernel
 
-One Erlang module (`src/tenon.erl`, ~890 lines, zero dependencies, OTP 27) that is the
+One Erlang module (`src/tenon.erl`, ~980 lines, zero dependencies, OTP 27) that is the
 whole Tenon microkernel: a plugin/service/hook registry with lifecycle, dependency
 gating, event dispatch, effect disposal, and a wire protocol for out-of-VM plugins.
 
@@ -96,7 +96,7 @@ Ctx is a plain map: `#{kernel := pid(), tabs := map(), fiber := pid()}`.
 
 | Function | Meaning |
 |---|---|
-| `start_link()` / `start_link(Opts)` | start a kernel linked to the caller (supervised use). `Opts`: `deadline` (default 30000 ms), `grace` (default 5000 ms) |
+| `start_link()` / `start_link(Opts)` | start a kernel linked to the caller (supervised use). `Opts`: `deadline` (default 30000 ms), `grace` (default 5000 ms), `max_frame` (default `TENON_MAX_FRAME` or 1048576 bytes) |
 | `start()` / `start(Opts)` | same, unlinked: survives a short-lived caller (scripts, tests, shell) |
 | `stop(Kernel)` | stop the kernel; every fiber stops with it |
 | `root(Kernel) -> Ctx` | ctx of the root fiber |
@@ -131,8 +131,34 @@ load(Ctx, Config) ->
 
 ## Wire (external plugins)
 
-Transport: Erlang `Port`, `{packet, 4}`, binary, payload JSON (OTP 27 `json`). The frame
-set is transport-independent; a socket transport or an ETF codec is one extra clause.
+Transport: Erlang `Port` opened with `nouse_stdio`, `{packet, 4}`, `binary`, payload JSON
+(OTP 27 `json`). The frame set is transport-independent; a socket transport or an ETF
+codec is one extra clause.
+
+**Wire v1.1 — fd 3 and fd 4.** The plugin reads frames from **file descriptor 3** and
+writes frames to **file descriptor 4**. Its own stdin, stdout and stderr are untouched
+and inherited from the VM, so `print`, `console.log` and stack traces are free for logs
+and never corrupt the protocol. A frame is a 4-byte big-endian length followed by that
+many bytes of JSON — unchanged from v1.0, only the descriptors moved.
+
+```python
+import os, json, struct
+wire_in, wire_out = os.fdopen(3, "rb", 0), os.fdopen(4, "wb", 0)
+
+def send(frame):
+    body = json.dumps(frame).encode()
+    wire_out.write(struct.pack(">I", len(body)) + body)
+
+def recv():
+    head = readn(4)                      # loop until 4 bytes or EOF
+    return json.loads(readn(struct.unpack(">I", head)[0]))
+
+send({"t": "hello", "inject": []})
+print("logs go to stdout, the wire does not", flush=True)
+```
+
+A shell plugin can simply move the descriptors: `python3 -c '...' <&3 >&4` (see
+`../playground/plugins/shell_echo.sh`).
 
 Kernel to plugin:
 
@@ -189,9 +215,37 @@ Rules:
   5 s) for the process to exit, then closes the port and `SIGKILL`s the OS process if it
   is still there. A plugin's process lifetime therefore equals its loaded state:
   `restart` and a regained dependency re-spawn the command.
-* Control plane only. Bulk data (PTY bytes, DOM trees, model tokens) must flow
-  plugin-to-plugin over a channel the plugins negotiate themselves; the kernel only
-  brokers discovery through services.
+* Control plane only. **Bulk data goes by handle, never over the wire.** A plugin holding
+  PTY bytes, a DOM tree, a file or a token stream returns a *handle* — a path, a unix
+  socket, a URL, an fd, a stream endpoint — and the two plugins talk over that channel
+  themselves. The kernel only brokers discovery through services. The frame cap below is
+  what enforces the rule.
+* Every plugin process is spawned with two environment variables appended to the spec's
+  `env`: `TENON_MAX_FRAME` (the cap in bytes) and `TENON_KERNEL_DEADLINE` (the request
+  deadline in ms). An SDK reads them at startup and sizes its own buffers and timeouts
+  accordingly.
+
+### Frame size cap
+
+Every frame in both directions is capped. The limit is the `max_frame` kernel option in
+bytes; if it is absent, the `TENON_MAX_FRAME` environment variable of the *VM* is used
+when it parses as a positive integer; otherwise the default is 1048576 (1 MB).
+
+```erlang
+{ok, K} = tenon:start(#{max_frame => 4194304}).   %% 4 MB
+```
+
+* **Outgoing** (kernel to plugin): the frame is encoded, and if it exceeds the cap it is
+  *not* written to the port. The event is logged, and a pending request — a `svc` call, a
+  `call`-mode hook, a `result` continuation — is answered `{error, frame_too_large}`
+  instead of being parked. An oversized `load` frame (a huge config) fails the fiber.
+* **Incoming** (plugin to kernel): the frame is logged and dropped, and if it correlates
+  to a pending request that request is answered `{error, frame_too_large}`. Note the
+  asymmetry: `{packet, 4}` gives the emulator no way to refuse a large packet before
+  reading it, so by the time the cap is checked the bytes are already in the VM. The cap
+  therefore protects the *system* from acting on oversized payloads, not the VM from
+  receiving them. **Plugins must respect `TENON_MAX_FRAME` themselves**; a plugin that
+  ships a 100 MB frame still costs one 100 MB allocation before it is thrown away.
 
 ## Constraints
 
@@ -274,13 +328,15 @@ mix test
 mix test --seed 1        # order-independent; seeds 1..5 verified
 ```
 
-35 tests in one file: the whole P1 acceptance list (load/unload, reverse disposers, kill
-sweep, inject wait/lose/regain/swap, prepend, waterfall rewrite and short-circuit, parent
-cascade, failed -> restart, internal events, two kernels, 500-fiber stress), a python3
-plugin written to a temp file for the wire cases (hello with inject, emit-mode hook,
-call-mode hook with `next` + `await` and post-processing, provide + svc, off + unprovide,
-exit 3 on load -> failed, unmount ends the OS process, request timeout), and the two perf
-smoke tests above.
+58 tests in two files. `test/tenon_test.exs` (40) is the whole P1 acceptance list
+(load/unload, reverse disposers, kill sweep, inject wait/lose/regain/swap, prepend,
+waterfall rewrite and short-circuit, parent cascade, failed -> restart, internal events,
+two kernels, 500-fiber stress), a python3 plugin written to a temp file for the wire cases
+(hello with inject, emit-mode hook, call-mode hook with `next` + `await` and
+post-processing, provide + svc, off + unprovide, exit 3 on load -> failed, unmount ends the
+OS process, request timeout, noisy stdout/stderr, oversized reply, cap by option and by
+`TENON_MAX_FRAME`, plugin environment), and the two perf smoke tests above.
+`test/tenon_adversarial_test.exs` (18) covers hot swap, scale, concurrency and wire abuse.
 
 ## Deviations from NOTES section 9
 

@@ -109,31 +109,36 @@ defmodule TenonAdversarialTest do
   MODE = sys.argv[1] if len(sys.argv) > 1 else "misc"
 
 
-  def recv():
-      head = sys.stdin.buffer.read(4)
-      if not head or len(head) < 4:
-          return None
-      size = struct.unpack(">I", head)[0]
-      body = b""
-      while len(body) < size:
-          chunk = sys.stdin.buffer.read(size - len(body))
+  WIRE_IN = os.fdopen(3, "rb", 0)
+  WIRE_OUT = os.fdopen(4, "wb", 0)
+
+
+  def readn(size):
+      buf = b""
+      while len(buf) < size:
+          chunk = WIRE_IN.read(size - len(buf))
           if not chunk:
               return None
-          body += chunk
+          buf += chunk
+      return buf
+
+
+  def recv():
+      head = readn(4)
+      if head is None:
+          return None
+      body = readn(struct.unpack(">I", head)[0])
+      if body is None:
+          return None
       return json.loads(body.decode())
 
 
   def send(frame):
-      body = json.dumps(frame).encode()
-      sys.stdout.buffer.write(struct.pack(">I", len(body)))
-      sys.stdout.buffer.write(body)
-      sys.stdout.buffer.flush()
+      send_raw(json.dumps(frame).encode())
 
 
   def send_raw(payload):
-      sys.stdout.buffer.write(struct.pack(">I", len(payload)))
-      sys.stdout.buffer.write(payload)
-      sys.stdout.buffer.flush()
+      WIRE_OUT.write(struct.pack(">I", len(payload)) + payload)
 
 
   if MODE == "silent":

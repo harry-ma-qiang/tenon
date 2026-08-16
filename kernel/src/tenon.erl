@@ -12,6 +12,7 @@
 -define(DEADLINE, 30000).
 -define(GRACE, 5000).
 -define(MAX_ARITY, 5).
+-define(MAX_FRAME, 1048576).
 
 -type tabs() :: #{fibers := ets:tid(), services := ets:tid(),
                   hooks := ets:tid(), seq := ets:tid()}.
@@ -256,9 +257,14 @@ handle_info({tenon_drop, Ref}, #f{} = State) ->
 handle_info({tenon_forget, Ref}, #f{disposers = Ds} = State) ->
     {noreply, State#f{disposers = lists:keydelete(Ref, 1, Ds)}};
 handle_info({Port, {data, Bin}}, #f{port = Port} = State) ->
-    case decode_frame(Bin) of
-        {ok, Frame} -> {noreply, handle_frame(Frame, State)};
-        error -> {noreply, State}
+    case byte_size(Bin) > max_frame(State) of
+        true ->
+            {noreply, reject_frame(Bin, State)};
+        false ->
+            case decode_frame(Bin) of
+                {ok, Frame} -> {noreply, handle_frame(Frame, State)};
+                error -> {noreply, State}
+            end
     end;
 handle_info({Port, {exit_status, Code}}, #f{port = Port} = State) ->
     port_gone(State#f{os_pid = undefined}, {exit_status, Code});
@@ -300,7 +306,14 @@ decode_frame(Bin) ->
 
 options(Opts) ->
     #{deadline => maps:get(deadline, Opts, ?DEADLINE),
-      grace => maps:get(grace, Opts, ?GRACE)}.
+      grace => maps:get(grace, Opts, ?GRACE),
+      max_frame => maps:get(max_frame, Opts, env_frame())}.
+
+env_frame() ->
+    case string:to_integer(os:getenv("TENON_MAX_FRAME", "")) of
+        {Bytes, ""} when Bytes > 0 -> Bytes;
+        _ -> ?MAX_FRAME
+    end.
 
 start_fiber(#k{tabs = Tabs, opts = Opts}, Spec, Parent, Ref) ->
     gen_server:start_link(?MODULE,
@@ -624,14 +637,20 @@ grace(#f{opts = Opts}) -> maps:get(grace, Opts, ?GRACE).
 
 deadline(#f{opts = Opts}) -> maps:get(deadline, Opts, ?DEADLINE).
 
+max_frame(#f{opts = Opts}) -> maps:get(max_frame, Opts, ?MAX_FRAME).
+
+wire_env(State) ->
+    [{"TENON_MAX_FRAME", integer_to_list(max_frame(State))},
+     {"TENON_KERNEL_DEADLINE", integer_to_list(deadline(State))}].
+
 open_plugin(#f{spec = Spec} = State) ->
     Cmd = maps:get(cmd, Spec),
     Args = maps:get(args, Spec, []),
-    Env = maps:get(env, Spec, []),
+    Env = maps:get(env, Spec, []) ++ wire_env(State),
     try
         Port = open_port({spawn_executable, Cmd},
                          [{args, Args}, {env, Env}, {packet, 4}, binary, exit_status,
-                          use_stdio, hide]),
+                          nouse_stdio, hide]),
         OsPid = case erlang:port_info(Port, os_pid) of
                     {os_pid, Pid} -> Pid;
                     _ -> undefined
@@ -649,40 +668,55 @@ arm(#f{pending = Pending} = State, Req) ->
 next_req(#f{ctx = #{tabs := #{seq := Seq}}}) ->
     ets:update_counter(Seq, req, 1).
 
-send_frame(#f{port = Port}, Frame) when is_port(Port) ->
+send_frame(#f{port = Port} = State, Frame) when is_port(Port) ->
     try
-        port_command(Port, json:encode(Frame)),
-        ok
+        Data = json:encode(Frame),
+        Size = iolist_size(Data),
+        case Size > max_frame(State) of
+            true -> too_large(Frame, Size, State);
+            false -> port_command(Port, Data), ok
+        end
     catch
         _:_ -> ok
     end;
 send_frame(_State, _Frame) ->
     ok.
 
+too_large(Frame, Size, State) ->
+    logger:error("tenon: outbound ~p frame of ~p bytes over cap ~p, dropped",
+                 [maps:get(t, Frame, undefined), Size, max_frame(State)]),
+    {error, frame_too_large}.
+
 notice(State, Frame) ->
-    send_frame(State, Frame),
+    _ = send_frame(State, Frame),
     State.
 
 request(#f{port = Port} = State, From, Frame) when is_port(Port) ->
     Req = next_req(State),
-    send_frame(State, Frame#{req => Req}),
-    Timer = erlang:send_after(deadline(State), self(), {tenon_deadline, Req}),
-    {noreply, State#f{pending = maps:put(Req, {call, From, Timer}, State#f.pending)}};
+    park(send_frame(State, Frame#{req => Req}), Req, From, State);
 request(State, _From, _Frame) ->
     {reply, {error, no_plugin}, State}.
 
 resume(#f{port = Port} = State, From, Req, Result) when is_port(Port) ->
-    send_frame(State, #{t => <<"result">>, req => Req, result => enc(Result)}),
-    Timer = erlang:send_after(deadline(State), self(), {tenon_deadline, Req}),
-    {noreply, State#f{pending = maps:put(Req, {call, From, Timer}, State#f.pending)}};
+    Frame = #{t => <<"result">>, req => Req, result => enc(Result)},
+    park(send_frame(State, Frame), Req, From, State);
 resume(State, _From, _Req, _Result) ->
     {reply, {error, no_plugin}, State}.
+
+park(ok, Req, From, State) ->
+    Timer = erlang:send_after(deadline(State), self(), {tenon_deadline, Req}),
+    {noreply, State#f{pending = maps:put(Req, {call, From, Timer}, State#f.pending)}};
+park({error, Reason}, _Req, _From, State) ->
+    {reply, {error, Reason}, State}.
 
 wire_load(State0) ->
     Req = next_req(State0),
     State = State0#f{phase = loading},
-    send_frame(State, #{t => <<"load">>, req => Req, config => enc(State#f.config)}),
-    arm(State, Req).
+    Frame = #{t => <<"load">>, req => Req, config => enc(State#f.config)},
+    case send_frame(State, Frame) of
+        ok -> arm(State, Req);
+        {error, Reason} -> settle(fail(State#f{phase = ready}, Reason))
+    end.
 
 close_plugin(#f{port = Port} = State) when is_port(Port) ->
     send_frame(State, #{t => <<"unload">>}),
@@ -737,16 +771,27 @@ cancel({call, From, Timer}, Reply) ->
     gen_server:reply(From, Reply),
     ok.
 
-expire(#f{pending = Pending} = State, Req) ->
+expire(State, Req) ->
+    expire(State, Req, timeout).
+
+expire(#f{pending = Pending} = State, Req, Reason) ->
     case maps:take(Req, Pending) of
         {{load, _}, Rest} ->
             settle(fail_external((close_port(State#f{pending = Rest}))#f{phase = ready},
-                                 timeout));
+                                 Reason));
         {{call, From, _}, Rest} ->
-            gen_server:reply(From, {error, timeout}),
+            gen_server:reply(From, {error, Reason}),
             State#f{pending = Rest};
         error ->
             State
+    end.
+
+reject_frame(Bin, State) ->
+    logger:error("tenon: inbound frame of ~p bytes over cap ~p, dropped",
+                 [byte_size(Bin), max_frame(State)]),
+    case decode_frame(Bin) of
+        {ok, Frame} -> expire(State, maps:get(<<"req">>, Frame, undefined), frame_too_large);
+        error -> State
     end.
 
 take_pending(#f{pending = Pending} = State, Req) ->
