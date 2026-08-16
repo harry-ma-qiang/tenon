@@ -10,6 +10,10 @@ bridge/dsh/dist/
 bridge/dsh/test/_build/
 bridge/dsh/test/deps/
 
+# Rust
+target/
+Cargo.lock
+
 # BEAM / Elixir / Erlang
 _build/
 cover/
