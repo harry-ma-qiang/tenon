@@ -115,3 +115,8 @@ load/unload; disposer reverse order; `Process.exit(fiber, :kill)` leaves no hook
 - Plugins `use Tenon.Plugin`, which imports `Kernel` except `apply/2` (BEAM name clash).
 - Kernel LoC came out at 765 (ctx 91, kernel 163, fiber 292, events 118, plugin 36, service 65), above the ~650 estimate; every file is well under the 600 limit.
 - `mix.exs` gained `elixirc_paths` so `test/support/plugins.ex` compiles in the test env.
+
+## 8. P1 result (2026-08-16)
+
+Commit `6ddb254` + fix. lib/tenon: plugin 36, ctx 91, kernel 163, fiber ~300, events 118, service 65 (~770 LoC). 51 tests (34 coder + 17 adversarial), 0 failures, stable across seeds 1/2/7/12/19/33.
+Adversarial findings: (1) FIXED root fiber not settled before `Kernel.init` returned -> `tree/1` flaky `:pending`; root (module nil) now mounts inside `init`. (2) `internal/plugin` fires on mount only, not dispose (documented, not symmetric). (3) provider withdraw deletes ETS row before dependents unload; dependents never see stale impl but unload is asynchronous vs Cordis's synchronous cascade. (4) a hook calling its own fiber synchronously gets `{:calling_self, _}` swallowed by `emit` isolation (logged, no hang). Constraint: hooks must not call fibers synchronously.
