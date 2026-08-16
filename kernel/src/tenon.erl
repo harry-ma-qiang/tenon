@@ -14,8 +14,8 @@
 -define(MAX_ARITY, 5).
 -define(MAX_FRAME, 1048576).
 
--type tabs() :: #{fibers := ets:tid(), services := ets:tid(),
-                  hooks := ets:tid(), seq := ets:tid()}.
+-type tabs() :: #{fibers := ets:tid(), services := ets:tid(), hooks := ets:tid(),
+                  deps := ets:tid(), seq := ets:tid()}.
 -type ctx() :: #{kernel := pid(), tabs := tabs(), fiber := pid()}.
 -type disposer() :: fun(() -> any()).
 -type status() :: pending | loading | active | failed | unloading | disposed.
@@ -74,9 +74,11 @@ status(Fiber) ->
 mount(#{kernel := Kernel, fiber := Owner}, Spec) ->
     Ref = make_ref(),
     {ok, Fiber} = gen_server:call(Kernel, {mount, Spec, Owner, Ref}, infinity),
-    ok = attach(Owner, Ref, fun() -> unmount(Fiber) end),
-    _ = status(Fiber),
-    {ok, Fiber}.
+    try attach(Owner, Ref, fun() -> unmount(Fiber) end) of
+        ok -> _ = status(Fiber), {ok, Fiber}
+    catch
+        exit:Reason -> unmount(Fiber), error({owner_gone, Owner, Reason})
+    end.
 
 -spec unmount(pid()) -> ok.
 unmount(Fiber) ->
@@ -160,6 +162,7 @@ init({kernel, Opts}) ->
     Tabs = #{fibers => ets:new(fibers, [set, public, {read_concurrency, true}]),
              services => ets:new(services, [set, public, {read_concurrency, true}]),
              hooks => ets:new(hooks, [ordered_set, public, {read_concurrency, true}]),
+             deps => ets:new(deps, [bag, public, {read_concurrency, true}]),
              seq => ets:new(seq, [set, public, {write_concurrency, true}])},
     ets:insert(maps:get(seq, Tabs), [{uid, 0}, {append, 0}, {prepend, 0}, {req, 0}]),
     State = #k{tabs = Tabs, opts = options(Opts)},
@@ -176,6 +179,7 @@ init({fiber, Args}) ->
                config = maps:get(config, Spec, undefined), spec = Spec, opts = Opts},
     Loaded = State#f{inject = declared_inject(State)},
     write_row(Loaded),
+    index_inject(Loaded),
     case kind(Loaded) of
         root -> {ok, announce(Loaded)};
         _ -> {ok, Loaded, {continue, mount}}
@@ -278,8 +282,9 @@ handle_info(_Other, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #k{} | #f{}) -> ok.
-terminate(_Reason, #f{ctx = #{tabs := #{fibers := Fibers}}} = State) ->
+terminate(_Reason, #f{ctx = #{tabs := #{fibers := Fibers, deps := Deps}}} = State) ->
     catch ets:delete(Fibers, self()),
+    catch ets:match_delete(Deps, {'_', self()}),
     catch close_port(State),
     forget(State#f.anchor),
     ok;
@@ -331,12 +336,18 @@ forget({Parent, Ref}) ->
     catch Parent ! {tenon_forget, Ref},
     ok.
 
-sweep(#{hooks := Hooks, services := Services, fibers := Fibers}, Owner) ->
+sweep(#{hooks := Hooks, services := Services, fibers := Fibers, deps := Deps}, Owner) ->
     ets:match_delete(Hooks, {{'_', '_'}, '_', Owner, '_'}),
     Names = [Name || [Name] <- ets:match(Services, {'$1', '_', Owner})],
     lists:foreach(fun(Name) -> ets:delete(Services, Name) end, Names),
+    ets:match_delete(Deps, {'_', Owner}),
     ets:delete(Fibers, Owner),
     Names.
+
+index_inject(#f{ctx = #{tabs := #{deps := Deps}}, inject = Inject}) ->
+    ets:match_delete(Deps, {'_', self()}),
+    ets:insert(Deps, [{Name, self()} || Name <- Inject]),
+    ok.
 
 dispose_children(#k{tabs = #{fibers := Fibers}}, Parent) ->
     Children = ets:match(Fibers, {'$1', '_', '_', Parent, '_', '_', '_', '_', '_'}),
@@ -344,15 +355,9 @@ dispose_children(#k{tabs = #{fibers := Fibers}}, Parent) ->
 
 notify(_State, []) ->
     ok;
-notify(#k{tabs = #{fibers := Fibers}}, Names) ->
-    Rows = ets:tab2list(Fibers),
-    lists:foreach(fun(Row) ->
-                          case lists:any(fun(N) -> lists:member(N, Names) end, element(7, Row)) of
-                              true -> gen_server:cast(element(1, Row), refresh);
-                              false -> ok
-                          end
-                  end,
-                  Rows).
+notify(#k{tabs = #{deps := Deps}}, Names) ->
+    Dependents = lists:usort([Pid || Name <- Names, {_, Pid} <- ets:lookup(Deps, Name)]),
+    lists:foreach(fun(Pid) -> gen_server:cast(Pid, refresh) end, Dependents).
 
 build_tree(#k{tabs = #{fibers := Fibers}, root = Root}) ->
     Rows = ets:tab2list(Fibers),
@@ -806,6 +811,7 @@ handle_frame(#{<<"t">> := <<"hello">>} = Frame, State0) ->
     Inject = [to_atom(N) || N <- maps:get(<<"inject">>, Frame, [])],
     State2 = State1#f{inject = Inject, phase = ready},
     write_row(State2),
+    index_inject(State2),
     settle(resume_load(State2));
 handle_frame(#{<<"t">> := <<"on">>} = Frame, State) ->
     wire_on(Frame, State);
@@ -863,16 +869,21 @@ reply_frame({load, Timer}, Frame, State) ->
     _ = erlang:cancel_timer(Timer),
     case maps:get(<<"error">>, Frame, undefined) of
         undefined -> settle(set_status(State#f{phase = ready}, active));
-        Error -> settle(fail(State#f{phase = ready}, {plugin_error, Error}))
+        Error -> settle(fail(State#f{phase = ready}, {plugin_error, wire_error(Error)}))
     end;
 reply_frame({call, _From, _Timer} = Entry, Frame, State) ->
     case maps:get(<<"error">>, Frame, undefined) of
         undefined -> answer(Entry, {rep, maps:get(<<"result">>, Frame, undefined)});
-        Error -> answer(Entry, {error, Error})
+        Error -> answer(Entry, {error, wire_error(Error)})
     end,
     State;
 reply_frame(none, _Frame, State) ->
     State.
+
+wire_error(<<"frame_too_large">>) -> frame_too_large;
+wire_error(<<"timeout">>) -> timeout;
+wire_error(<<"plugin_gone">>) -> plugin_gone;
+wire_error(Error) -> Error.
 
 answer({call, From, Timer}, Reply) ->
     _ = erlang:cancel_timer(Timer),

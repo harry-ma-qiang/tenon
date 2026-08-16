@@ -419,7 +419,7 @@ defmodule TenonAdversarialTest do
 
     IO.puts(
       "adversarial perf: 100 provide/unprovide cycles of one service over #{total} total fibers = #{ms} ms " <>
-        "(notify does a full ets:tab2list scan of the fibers table on every provide/unprovide)"
+        "(notify looks the changed names up in the deps index, it does not scan the fibers table)"
     )
 
     assert ms < 5_000
