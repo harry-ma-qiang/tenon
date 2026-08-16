@@ -17,6 +17,7 @@ defmodule Tenon.CLI do
     dsh_home: :string,
     dsh_root: :string,
     dsh_bridge: :string,
+    dsh_bundles: :string,
     profile: :string
   ]
 
@@ -33,6 +34,7 @@ defmodule Tenon.CLI do
     --dsh-home DIR           enable the DSH collapse target and write its profile there
     --dsh-root DIR           the DSH checkout, for the default node launcher
     --dsh-bridge FILE        tenon-bridge plugin.js (default $TENON_DSH_BRIDGE)
+    --dsh-bundles LIST       comma separated dsh.profile.bundles (default @deepseek-ai/dsh-base)
     --profile NAME           DSH profile name (default "tenon")
 
   A layer ending in .patch.yml is a patch list, any other layer is an entry list.
@@ -47,13 +49,18 @@ defmodule Tenon.CLI do
   def exec(["check" | argv]), do: run(argv, &check/1)
   def exec(_argv), do: fail(@usage)
 
-  defp run(argv, command) do
+  @spec options([String.t()]) :: {:ok, map()} | {:error, String.t()}
+  def options(argv) do
     {opts, layers, invalid} = OptionParser.parse(argv, strict: @switches)
 
     with :ok <- validate(layers, invalid),
-         {:ok, registry} <- Registry.load(opts[:registry]) do
-      command.(config(layers, registry, opts))
-    else
+         {:ok, registry} <- Registry.load(opts[:registry]),
+         do: {:ok, config(layers, registry, opts)}
+  end
+
+  defp run(argv, command) do
+    case options(argv) do
+      {:ok, config} -> command.(config)
       {:error, message} -> fail(message)
     end
   end
@@ -76,7 +83,18 @@ defmodule Tenon.CLI do
   defp dsh(opts) do
     bridge = opts[:dsh_bridge] || System.get_env("TENON_DSH_BRIDGE") || "plugin.js"
     home = %{dsh_home: opts[:dsh_home], dsh_root: opts[:dsh_root]}
-    Map.merge(home, %{profile: opts[:profile] || "tenon", bridge: %{module_path: bridge}})
+    base = Map.merge(home, %{profile: opts[:profile] || "tenon", bridge: %{module_path: bridge}})
+
+    case bundles(opts[:dsh_bundles]) do
+      [] -> base
+      bundles -> Map.put(base, :bundles, bundles)
+    end
+  end
+
+  defp bundles(nil), do: []
+
+  defp bundles(list) do
+    list |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
   end
 
   defp start(config) do

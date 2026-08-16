@@ -17,8 +17,9 @@ cd cli && mix escript.build      # produces ./tenon
 | `tenon check <layer.yml>...` | compose only; print unknown names, bad rows and patch warnings. Exit 1 if any row failed |
 
 Options (all three commands): `--registry MOD_OR_FILE`, `--dsh-home DIR`,
-`--dsh-root DIR`, `--dsh-bridge FILE`, `--profile NAME`. A layer ending in `.patch.yml`
-is a patch list, any other layer is an entry list; layers apply in the order given.
+`--dsh-root DIR`, `--dsh-bridge FILE`, `--dsh-bundles LIST`, `--profile NAME`. A layer
+ending in `.patch.yml` is a patch list, any other layer is an entry list; layers apply in
+the order given.
 
 ```
 $ ./tenon dump demo/cordis.yml --registry demo/registry.yml
@@ -60,7 +61,10 @@ The source is a `.yml` map, a `.exs` file evaluating to a map, or a module expor
 built-in collapse target: every `@deepseek-ai/dsh-*` row (or `tenon: dsh` row) leaves the
 Tenon tree, is written into `$DSH_HOME/profiles/<profile>/cordis.patch.yml`, and DSH is
 mounted as one external fiber. `dump` and `check` only *report* the collapse; the profile
-files are written by `start`. See `../loader/README.md` and `../bridge/dsh/README.md`.
+files are written by `start`. `--dsh-bundles` is the comma separated
+`dsh.profile.bundles` list of that profile (default `@deepseek-ai/dsh-base`), e.g.
+`--dsh-bundles @deepseek-ai/dsh-base,@deepseek-ai/dsh-web-app` for the web app.
+See `../loader/README.md` and `../bridge/dsh/README.md`.
 
 ## Signals
 
@@ -77,6 +81,6 @@ mix compile --warnings-as-errors && mix format --check-formatted
 mix credo --strict && mix test
 ```
 
-6 tests. They run `dump` and `check` in process against the `../loader/test/fixtures`
+7 tests. They run `dump` and `check` in process against the `../loader/test/fixtures`
 trees (tree, DSH composition + patch layer) and assert the resolved kinds, the collapse
 line, the exit codes and that nothing is mounted or written.
