@@ -1,0 +1,14 @@
+# A profile patch layer over the composition above.
+
+- id: bash
+  config:
+    timeoutMs: 30000
+
+- id: fs-local
+  disabled: true
+
+- insert:
+    - id: policy
+      name: tenon:policy
+      config:
+        mode: strict

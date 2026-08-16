@@ -1,0 +1,39 @@
+# Trimmed copy of a DSH example composition (examples/headless-agent/cordis.yml):
+# real row shapes, real `!!js` scalars, real package names.
+
+- id: settings
+  name: '@deepseek-ai/dsh-settings-file'
+
+- id: credentials
+  name: '@deepseek-ai/dsh-credentials-local'
+
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    thinking: enabled
+    reasoningEffort: max
+    models:
+      - id: deepseek-v4-pro
+        contextWindow: 128000
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    timeoutMs: 60000
+
+- id: persistence
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: './.sessions'
+    compression: !!js "process.env.DSH_SNAPSHOT === undefined ? 'zstd' : 'none'"
+
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.cwd()
+
+- id: telemetry
+  name: '@deepseek-ai/dsh-session-telemetry-otel'
+  disabled: !!js process.platform === 'win32'
+  config:
+    mode: !!js process.env.DSH_TELEMETRY_MODE || 'DISABLED'

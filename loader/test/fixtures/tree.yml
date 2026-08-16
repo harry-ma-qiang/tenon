@@ -1,0 +1,18 @@
+- id: alpha
+  name: probe
+  config:
+    tag: a
+
+- id: grp
+  name: cordis:group
+  group: true
+  config:
+    - id: beta
+      name: probe
+      config:
+        tag: b
+
+    - id: gamma
+      name: probe
+      config:
+        tag: c
