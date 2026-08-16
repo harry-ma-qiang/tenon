@@ -1,13 +1,18 @@
 # Tenon
 
-White-label functional port of the Cordis kernel to Elixir/OTP. Processes are
-fibers, Registry is reflect, supervision is cascading dispose.
+White-label functional port of the Cordis microkernel to Erlang/OTP. Processes are
+fibers, ETS is the registry, supervision is cascading dispose.
 
-Design reference: Cordis (MIT), see NOTICE. All design, decisions and phase
-plans live in NOTES.md.
+The kernel is one Erlang module: [`kernel/src/tenon.erl`](kernel/src/tenon.erl).
+Read [`kernel/README.md`](kernel/README.md) for the architecture, the API, the wire
+protocol and the hot swap procedure. Everything else — config loader, schema, bridges —
+is a plugin outside the kernel.
+
+Design reference: Cordis (MIT), see NOTICE. All decisions and phase plans live in
+NOTES.md.
 
 Gates:
 
 ```
-mix deps.get && mix compile --warnings-as-errors && mix format --check-formatted && mix credo --strict && mix test
+cd kernel && mix compile && mix format --check-formatted && mix test
 ```
