@@ -4,6 +4,7 @@ defmodule Tenon.Loader.Tree do
   require Logger
 
   alias Tenon.Loader.Config
+  alias Tenon.Loader.Dsh
   alias Tenon.Loader.Group
 
   @group_name "cordis:group"
@@ -35,15 +36,34 @@ defmodule Tenon.Loader.Tree do
   @spec build([map()], map()) :: %{nodes: [node_t()], collapse: [{String.t(), [map()], fun()}]}
   def build(rows, opts) do
     registry = Map.get(opts, :registry, %{})
-    collapse = Map.get(opts, :collapse, [])
-    acc = %{nodes: [], seen: MapSet.new(), collapse: Map.new(collapse, fn {p, _f} -> {p, []} end)}
+    collapse = targets(opts)
+
+    acc = %{
+      nodes: [],
+      seen: MapSet.new(),
+      collapse: Map.new(collapse, fn {k, _m, _f} -> {k, []} end)
+    }
+
     acc = walk(rows, nil, false, {registry, collapse}, acc)
 
     %{
       nodes: Enum.reverse(acc.nodes),
       collapse:
-        Enum.map(collapse, fn {p, f} -> {p, Enum.reverse(Map.fetch!(acc.collapse, p)), f} end)
+        Enum.map(collapse, fn {k, _m, f} -> {k, Enum.reverse(Map.fetch!(acc.collapse, k)), f} end)
     }
+  end
+
+  @spec targets(map()) :: [{String.t(), (map() -> boolean()), ([map()] -> map())}]
+  def targets(opts) do
+    user =
+      Enum.map(Map.get(opts, :collapse, []), fn {prefix, fun} ->
+        {prefix, &String.starts_with?(to_string(Map.get(&1, "name", "")), prefix), fun}
+      end)
+
+    case Map.fetch(opts, :dsh) do
+      {:ok, dsh} -> [{"dsh", &Dsh.row?/1, &Dsh.spec(dsh, &1)} | user]
+      :error -> user
+    end
   end
 
   @spec sync(map(), state(), map()) :: state()
@@ -90,10 +110,10 @@ defmodule Tenon.Loader.Tree do
     rows ++ Enum.map(state.collapse, &collapse_row/1)
   end
 
-  defp collapse_row({prefix, entry}) do
+  defp collapse_row({key, entry}) do
     %{
-      id: "collapse:" <> prefix,
-      name: prefix,
+      id: Map.fetch!(entry.spec, :id),
+      name: key,
       kind: :collapsed,
       parent: nil,
       group: false,
@@ -123,8 +143,8 @@ defmodule Tenon.Loader.Tree do
       group?(row, name) ->
         group(row, id, name, parent, ancestor_off, env, acc)
 
-      prefix = matching(name, collapse) ->
-        harvest(acc, prefix, row, ancestor_off)
+      key = matching(row, collapse) ->
+        harvest(acc, key, row, ancestor_off)
 
       true ->
         leaf(row, id, name, parent, ancestor_off, registry, acc)
@@ -225,10 +245,8 @@ defmodule Tenon.Loader.Tree do
     end
   end
 
-  defp matching(name, collapse) do
-    Enum.find_value(collapse, fn {prefix, _fun} ->
-      if String.starts_with?(name, prefix), do: prefix
-    end)
+  defp matching(row, collapse) do
+    Enum.find_value(collapse, fn {key, match?, _fun} -> if match?.(row), do: key end)
   end
 
   defp fail(acc, id, name, parent, ancestor_off, reason) do
@@ -355,7 +373,7 @@ defmodule Tenon.Loader.Tree do
 
   defp collapse_one(ctx, acc, prev, {prefix, rows, fun}) do
     id = "collapse:" <> prefix
-    spec = rows |> fun.() |> Map.put(:id, id)
+    spec = rows |> fun.() |> Map.put_new(:id, id)
 
     cond do
       prev == nil -> collapse_mount(ctx, acc, prefix, spec, rows, id)

@@ -2,7 +2,7 @@ defmodule Tenon.Loader do
   @moduledoc """
   In-VM Tenon plugin that composes a Cordis/DSH config tree and mounts it.
 
-  Config: `%{layers: [layer], registry: %{name => spec}, collapse: [{prefix, fun}]}`.
+  Config: `%{layers: [layer], registry: %{name => spec}, collapse: [{prefix, fun}], dsh: map()}`.
   See `README.md` for the row, patch and `!!js` semantics.
   """
 
