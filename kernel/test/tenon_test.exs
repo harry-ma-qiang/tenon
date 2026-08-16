@@ -61,6 +61,13 @@ defmodule Tenon.Test.Child do
   end
 end
 
+defmodule Tenon.Test.Group do
+  def load(ctx, %{pid: pid}) do
+    :tenon.effect(ctx, fn -> fn -> send(pid, {:hook, :group_own}) end end)
+    :ok
+  end
+end
+
 defmodule Tenon.Test.Boom do
   def load(ctx, %{pid: pid, agent: agent}) do
     :tenon.effect(ctx, fn -> fn -> send(pid, {:hook, :partial}) end end)
@@ -165,6 +172,8 @@ defmodule TenonTest do
               send({"t": "rep", "req": frame["req"], "result": os.environ.get(args[0], "")})
           elif method == "boom":
               send({"t": "rep", "req": frame["req"], "error": "nope"})
+          elif method == "refuse":
+              send({"t": "rep", "req": frame["req"], "error": "frame_too_large"})
           elif method == "unhook":
               send({"t": "off", "hook": 1})
               send({"t": "unprovide", "name": "pysvc"})
@@ -192,6 +201,13 @@ defmodule TenonTest do
       cmd: String.to_charlist(@plugin),
       args: [String.to_charlist(mode)],
       config: config
+    })
+  end
+
+  defp mount_into(ctx, owner, tag) do
+    :tenon.mount(%{ctx | fiber: owner}, %{
+      module: Tenon.Test.Child,
+      config: %{pid: self(), tag: tag}
     })
   end
 
@@ -482,6 +498,32 @@ defmodule TenonTest do
     assert :ets.lookup(ctx.tabs.fibers, child) == []
   end
 
+  test "a foreign process mounts into a group fiber's ctx and the child unwinds with it" do
+    {_k, ctx} = kernel()
+    {:ok, group} = :tenon.mount(ctx, %{module: Tenon.Test.Group, config: %{pid: self()}})
+    {:ok, child} = mount_into(ctx, group, :grouped)
+
+    assert :tenon.status(child) == :active
+    assert ctx.tabs.fibers |> :ets.lookup(child) |> hd() |> elem(3) == group
+
+    :ok = :tenon.unmount(group)
+
+    assert collected() == [:grouped, :group_own]
+    refute Process.alive?(child)
+    assert :ets.lookup(ctx.tabs.fibers, child) == []
+  end
+
+  test "killing a group fiber disposes the children a foreign process mounted into it" do
+    {_k, ctx} = kernel()
+    {:ok, group} = :tenon.mount(ctx, %{module: Tenon.Test.Group, config: %{pid: self()}})
+    {:ok, child} = mount_into(ctx, group, :grouped)
+
+    Process.exit(group, :kill)
+    wait_until(fn -> not Process.alive?(child) end)
+
+    assert :ets.lookup(ctx.tabs.fibers, child) == []
+  end
+
   @tag :capture_log
   test "a load that raises leaves the fiber failed and restartable" do
     {k, ctx} = kernel()
@@ -701,6 +743,15 @@ defmodule TenonTest do
     assert Process.alive?(fiber)
     assert :tenon.status(fiber) == :active
     assert :tenon.svc(ctx, :pysvc, :add, [1, 2]) == 3
+  end
+
+  test "a plugin error names a kernel error and comes back as that atom" do
+    {_k, ctx} = kernel()
+    {:ok, fiber} = wire(ctx, "basic")
+    assert :tenon.status(fiber) == :active
+
+    assert :tenon.svc(ctx, :pysvc, :refuse, []) == {:error, :frame_too_large}
+    assert :tenon.svc(ctx, :pysvc, :boom, []) == {:error, "nope"}
   end
 
   test "the frame cap is configurable by option and by TENON_MAX_FRAME" do

@@ -1,6 +1,6 @@
 # tenon — atom kernel
 
-One Erlang module (`src/tenon.erl`, ~980 lines, zero dependencies, OTP 27) that is the
+One Erlang module (`src/tenon.erl`, ~990 lines, zero dependencies, OTP 27) that is the
 whole Tenon microkernel: a plugin/service/hook registry with lifecycle, dependency
 gating, event dispatch, effect disposal, and a wire protocol for out-of-VM plugins.
 
@@ -25,15 +25,15 @@ state record (`#k{}` for the kernel, `#f{}` for a fiber).
 
 ```
                  ETS (owned by the kernel, unnamed, public)
-      fibers          services         hooks            seq
-   {pid,uid,id,     {name,impl,     {{event,seq},    counters
-    parent,module,   owner}          ref,owner,fun}   uid/append/prepend/req
-    status,inject,
+      fibers          services         hooks           deps       seq
+   {pid,uid,id,     {name,impl,     {{event,seq},    {name,      counters
+    parent,module,   owner}          ref,owner,fun}   fiber}      uid/append/
+    status,inject,                                    (bag)       prepend/req
     epoch,error}
-        ^                ^                ^
-        | single writer  | writer=owner   | writer=owner
-        |                |                |
-   +----+----------------+----------------+-----------------------+
+        ^                ^                ^              ^
+        | single writer  | writer=owner   | writer=owner | writer=owner
+        |                |                |              |
+   +----+----------------+----------------+--------------+--------+
    |                                                              |
  kernel gen_server  --start_link/monitor-->  fiber gen_server ... fiber
    |  mount/unmount, DOWN sweep, refresh casts   |  load/unload, disposer stack,
@@ -45,8 +45,14 @@ state record (`#k{}` for the kernel, `#f{}` for a fiber).
 * **Kernel.** Starts fibers (`gen_server:start_link` from the kernel process, so it is
   linked to every fiber and traps exits), sweeps hook/service/fiber rows by owner on
   `EXIT`, cascades `unmount` to the dead fiber's children, and casts `refresh` to fibers
-  whose `inject` list mentions a service that just appeared or vanished. It is not on
-  any hot path: dispatch never touches it.
+  whose `inject` list mentions a service that just appeared or vanished — found by
+  looking the changed names up in the `deps` index, never by scanning `fibers`. It is
+  not on any hot path: dispatch never touches it.
+* **`deps`.** A bag of `{ServiceName, FiberPid}`, one row per injected name of every live
+  fiber. Written by the fiber itself when its `inject` list becomes known (`init/1` for an
+  in-VM plugin, the `hello` frame for an external one, rewritten on every re-`hello`), and
+  removed by the kernel's `EXIT` sweep and by the fiber's `terminate/2`. It is an index
+  only: `inject` stays in the `fibers` row, so `tree/1` is unaffected.
 * **Fiber.** Runs the plugin's `load/2` in its own process, accumulates disposers,
   writes its own status row, and (for external plugins) owns the `Port` and a pending
   request map. It never blocks on the wire: every wire request is a `gen_server` reply
@@ -89,10 +95,21 @@ they are linked to it and close their ports on the way out.
    mounted. Parent unload therefore disposes children in reverse effect order, not
    unconditionally first.
 9. Many kernels per VM. All tables are unnamed and reached through the ctx.
+10. **The ctx you pass names the owner.** Any process may register on behalf of a fiber:
+    `mount/2`, `on/3,4`, `provide/3` and `effect/2` all use `maps:get(fiber, Ctx)` as the
+    owner, not `self()`. Hand a plugin `Ctx#{fiber := OtherFiber}` and its registrations
+    belong to `OtherFiber` — they sit at that point of *its* disposer stack, unwind in
+    reverse when it unloads, and vanish when it dies. Do it from the fiber itself or from
+    a process that is not blocked on that fiber: a foreign registration is a
+    `gen_server:call` into the owner, so a process the owner is waiting on will deadlock.
 
 ## API
 
-Ctx is a plain map: `#{kernel := pid(), tabs := map(), fiber := pid()}`.
+Ctx is a plain map: `#{kernel := pid(), tabs := map(), fiber := pid()}`. `fiber` is the
+*owner* every registration below is charged to, and it is a plain field: passing
+`Ctx#{fiber := OtherFiber}` registers on that fiber's behalf (invariant 10). A group
+loader uses this to mount children into a group fiber so one `unmount` takes the group
+and everything under it.
 
 | Function | Meaning |
 |---|---|
@@ -102,7 +119,7 @@ Ctx is a plain map: `#{kernel := pid(), tabs := map(), fiber := pid()}`.
 | `root(Kernel) -> Ctx` | ctx of the root fiber |
 | `tree(Kernel) -> map()` | nested `#{pid, uid, id, parent, module, status, inject, epoch, error, children}` |
 | `status(Fiber) -> pending \| loading \| active \| failed \| unloading \| disposed` | settle point: recomputes the epoch, blocks while the fiber is mid-handshake |
-| `mount(Ctx, Spec) -> {ok, Fiber}` | `Spec` = `#{module := M, config => C, id => Id}` or `#{cmd := Cmd, args => [..], env => [..], config => C, id => Id}`. Child of `Ctx`'s fiber, settled before return |
+| `mount(Ctx, Spec) -> {ok, Fiber}` | `Spec` = `#{module := M, config => C, id => Id}` or `#{cmd := Cmd, args => [..], env => [..], config => C, id => Id}`. Child of `Ctx`'s fiber, settled before return. If that fiber dies mid-mount the new child is unmounted again and the call raises `{owner_gone, Fiber, Reason}` |
 | `unmount(Fiber) -> ok` | run disposers in reverse, sweep rows, stop. Idempotent |
 | `restart(Fiber)` / `restart(Fiber, Config)` | unload then load again; the two-arity form replaces the config (this is the old `update`) |
 | `effect(Ctx, Fun) -> Disposer` | `Fun` runs now; returning a 0-arity fun registers it, `ok` / `undefined` / `nil` registers nothing |
@@ -207,6 +224,13 @@ Example session (kernel `>`, plugin `<`):
 
 Rules:
 
+* **Known error names are normalized at the kernel boundary.** A `rep` frame carrying
+  `error` is answered as `{error, Reason}`. If the string is one of the kernel's own error
+  names — `"frame_too_large"`, `"timeout"`, `"plugin_gone"` — it becomes the *atom* of the
+  same name, so a plugin SDK that refuses to send an oversized frame itself and a kernel
+  that refuses to write one produce the identical `{error, frame_too_large}`. Any other
+  error string is passed through as a binary (`{error, <<"nope">>}`), and a failed `load`
+  reply becomes `{plugin_error, Reason}` with the same normalization.
 * Every kernel-to-plugin request carries a deadline (`deadline` option, default 30 s).
   On expiry a pending `svc` / `hook` call answers `{error, timeout}`; an expired `load`
   or `hello` fails the fiber and closes the port.
@@ -305,7 +329,7 @@ From the smoke tests in `test/tenon_test.exs` (OTP 27.3, arm64, one core busy):
 | 100 000 `emit` with 3 hooks | ~100 ms, ~1 000 000 emits/s |
 | 10 000 wire round trips (`svc` to a python3 plugin) | ~340 ms, ~29 000 round trips/s |
 | 100 000 `emit` with a 10 000-row hooks table | ~1.3x an empty table (~135 ms vs ~105 ms) |
-| 100 provide/unprovide cycles with 10 000 fibers | ~0.5 s |
+| 100 provide/unprovide cycles with 10 000 fibers | ~0.19 s (~0.52 s before the `deps` index) |
 
 Dispatch cost is one `ets:select` on an ordered_set plus one `apply` per hook, in the
 caller process; nothing is serialised through the kernel. The wire number is dominated by
@@ -313,10 +337,15 @@ the JSON encode/decode and the pipe round trip in python.
 
 Dispatch scales with the number of *matching* hooks, not the table size: a partial-key
 select on an ordered_set seeks to the `{Event, _}` range, so a 10 000-row hooks table
-costs about 1.3x an empty one. `provide` / `unprovide` notification is the one O(total
-fibers) path — `notify/2` does an `ets:tab2list` of the fibers table per name — which is
-~0.5 s for 100 cycles at 10 000 fibers. Acceptable for a control plane that registers
-services at load time; index services-to-dependents if that ever becomes a hot path.
+costs about 1.3x an empty one.
+
+`provide` / `unprovide` notification used to be the one O(total fibers) path: `notify/2`
+did an `ets:tab2list` of the fibers table per changed name. The `deps` bag replaced that
+with one `ets:lookup` per name, so the cost is now O(dependents of that name). The
+adversarial scale test (`test/tenon_adversarial_test.exs`, 100 provide/unprovide cycles of
+one service with one real dependent among 10 001 fibers) went from **~520 ms to ~190 ms**
+— a 2.8x improvement on the whole mount/unmount cycle; what is left is the fiber spawn,
+load and settle, not the notification.
 
 ## Tests
 
@@ -328,14 +357,16 @@ mix test
 mix test --seed 1        # order-independent; seeds 1..5 verified
 ```
 
-58 tests in two files. `test/tenon_test.exs` (40) is the whole P1 acceptance list
+61 tests in two files. `test/tenon_test.exs` (43) is the whole P1 acceptance list
 (load/unload, reverse disposers, kill sweep, inject wait/lose/regain/swap, prepend,
-waterfall rewrite and short-circuit, parent cascade, failed -> restart, internal events,
+waterfall rewrite and short-circuit, parent cascade, cross-fiber mount into a group ctx
+unwound by unmount and by kill, failed -> restart, internal events,
 two kernels, 500-fiber stress), a python3 plugin written to a temp file for the wire cases
 (hello with inject, emit-mode hook, call-mode hook with `next` + `await` and
 post-processing, provide + svc, off + unprovide, exit 3 on load -> failed, unmount ends the
 OS process, request timeout, noisy stdout/stderr, oversized reply, cap by option and by
-`TENON_MAX_FRAME`, plugin environment), and the two perf smoke tests above.
+`TENON_MAX_FRAME`, plugin environment, error-name normalization), and the two perf smoke
+tests above.
 `test/tenon_adversarial_test.exs` (18) covers hot swap, scale, concurrency and wire abuse.
 
 ## Deviations from NOTES section 9
