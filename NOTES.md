@@ -171,3 +171,29 @@ Verified: double in-place `code:load_file(tenon)` with live fibers + external pl
 Defects found by review/adversarial and fixed: unguarded `json:decode` crashed fiber; `status/1` respawned a failed external plugin once (epoch stayed inactive); kernel dies with its `start_link` caller (documented; `start/1` unlinked added; ETS writes tolerate dead table). Earlier audit fixed 7 more (orphan fibers on kernel death, svc envelope leak, pid-recycle kill, unmount grace stall, reload not re-sending load, dead parent disposer entries, stale wire map).
 Known/accepted: `notify` is O(total fibers) per provide/unprovide (0.5 s per 100 cycles at 10k fibers); external unload = process exit + respawn on load; wire atoms via `binary_to_atom` (trusted control plane); hooks must not call their own fiber synchronously.
 Not in kernel (by design, next work): language SDKs (py/ts/rust ~100 lines each), loader plugin (yml tree + patch), socket transport + ETF codec, isolate realms, broker bridge.
+
+## 11. Arch note for later: message-only wire, big payloads (2026-08-16)
+
+Kernel is already registrar + lifecycle + dispatcher; wire frames are async messages with req-id correlation; in-VM `call/svc` are Erlang-idiomatic sync views of the same messages. Not refactoring that.
+Rules to adopt now: (1) frame size cap (default 1 MB, kernel option) -> `{error, frame_too_large}`; (2) bulk data never crosses the wire: plugins return handles (path / UDS / URL / fd / stream endpoint) and talk plugin-to-plugin; kernel only brokers discovery. (3) wire v1.1: Port `nouse_stdio` (plugin reads fd 3, writes fd 4), stdout/stderr free for logs, frames unchanged. (4) wire v2 later: UDS/TCP transport, same frames, enables remote plugins/nodes.
+Deferred: fully async in-VM API, kernel-side streaming.
+
+## 12. P2 plan: config model + DSH compatibility
+
+Compat levels: L1 config files (cordis.yml, cordis.patch.yml, profiles/bundles) accepted unchanged -> same tree. L2 DSH TS plugins run unmodified -> the whole DSH plugin tree runs in one Node process on real Cordis, mounted as one Tenon external plugin (`bridge/dsh`). L3 selected DSH services/events mirrored onto the Tenon bus via a manifest. Per-plugin Tenon fibers for TS plugins: deferred (would mean re-implementing Cordis semantics in TS).
+
+Layout:
+```
+tenon/
+  kernel/        atom kernel (done)
+  loader/        Elixir in-VM plugin: yml tree + patch layers + profile/bundle resolution + name registry -> mount specs; ops (reload/dump); golden test vs `dsh --dump-config`
+  bridge/dsh/    TS: Cordis plugin `tenon-bridge` (inside the DSH Node process, mirrors services/events over the wire) + `tenon-dsh-host` launcher (runs a DSH profile with the bridge patched in, wire on fd 3/4)
+  sdk/py sdk/ts sdk/rs   wire SDKs (~100 lines each): frame io, hello/on/provide/svc, handle-based bulk data
+  playground/    examples (gitignored now; promote the good ones to examples/ later)
+```
+Steps:
+- P2.0 wire v1.1 (kernel): `nouse_stdio`, frame cap, README + playground plugins updated. Small.
+- P2.1 sdk/py + sdk/ts (needed by bridge and tests); sdk/rs after.
+- P2.2 loader (Elixir): parse yml tree; patch layers by id (replace/insert/disable); name registry `name -> {module | cmd | dsh}`; `dsh-*` rows collapse into one bridge/dsh mount; `!!js` passed through untouched to the DSH host; ops reload/dump; tests: golden vs `dsh --profile headless --dump-config` (Sonnet explores DSH app-boot composition rules first).
+- P2.3 bridge/dsh: explore how DSH profiles install out-of-tree plugins (`cordis.patch.yml`, profile home); `tenon-bridge` Cordis plugin: manifest of mirrored services/events; `tenon-dsh-host` bin; demo: Tenon mounts DSH headless, a python plugin registers a `tools/pre-execute` guard visible to DSH tools, and calls `ctx.llm` via svc.
+- Language decisions: loader Elixir (control plane, direct API); bridge TS (must); Rust only later for a CLI launcher around `mix release`.
