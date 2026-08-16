@@ -1,0 +1,5 @@
+This project uses Cordis (https://github.com/cordiverse/cordis, MIT License) as
+its design reference. Tenon is a functional port of the Cordis kernel concepts to
+Elixir/OTP: it reimplements the context, fiber, service and event semantics on
+top of OTP processes and supervision trees. No Cordis source code is copied or
+redistributed here; credit for the original design belongs to the Cordis authors.
