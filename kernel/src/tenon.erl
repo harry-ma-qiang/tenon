@@ -2,9 +2,9 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, start_link/1, stop/1, root/1, tree/1, status/1, mount/2,
-         unmount/1, restart/1, restart/2, effect/2, on/3, on/4, emit/3, call/4,
-         bail/3, provide/3, get/2, svc/4]).
+-export([start/0, start/1, start_link/0, start_link/1, stop/1, root/1, tree/1,
+         status/1, mount/2, unmount/1, restart/1, restart/2, effect/2, on/3, on/4,
+         emit/3, call/4, bail/3, provide/3, get/2, svc/4]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -32,6 +32,14 @@
             phase = ready :: ready | hello | loading, waiters = [] :: list(),
             anchor :: {pid(), reference()} | undefined, port :: port() | undefined,
             os_pid :: integer() | undefined, wire = #{} :: map(), pending = #{} :: map()}).
+
+-spec start() -> {ok, pid()}.
+start() ->
+    start(#{}).
+
+-spec start(map()) -> {ok, pid()}.
+start(Opts) when is_map(Opts) ->
+    gen_server:start(?MODULE, {kernel, Opts}, []).
 
 -spec start_link() -> {ok, pid()}.
 start_link() ->
@@ -244,7 +252,10 @@ handle_info({tenon_drop, Ref}, #f{} = State) ->
 handle_info({tenon_forget, Ref}, #f{disposers = Ds} = State) ->
     {noreply, State#f{disposers = lists:keydelete(Ref, 1, Ds)}};
 handle_info({Port, {data, Bin}}, #f{port = Port} = State) ->
-    {noreply, handle_frame(json:decode(Bin), State)};
+    case decode_frame(Bin) of
+        {ok, Frame} -> {noreply, handle_frame(Frame, State)};
+        error -> {noreply, State}
+    end;
 handle_info({Port, {exit_status, Code}}, #f{port = Port} = State) ->
     port_gone(State#f{os_pid = undefined}, {exit_status, Code});
 handle_info({'EXIT', Port, Reason}, #f{port = Port} = State) when is_port(Port) ->
@@ -273,6 +284,15 @@ code_change(_Vsn, #f{} = State, _Extra) ->
 
 unwrap({rep, Result}) -> Result;
 unwrap(Other) -> Other.
+
+decode_frame(Bin) ->
+    try
+        {ok, json:decode(Bin)}
+    catch
+        Class:Reason ->
+            logger:error("tenon: bad frame ~p", [{Class, Reason, Bin}]),
+            error
+    end.
 
 options(Opts) ->
     #{deadline => maps:get(deadline, Opts, ?DEADLINE),
@@ -541,6 +561,9 @@ fail(State, Reason) ->
     logger:error("tenon: fiber ~p failed to load: ~p", [self(), Reason]),
     set_status(State#f{error = Reason}, failed).
 
+fail_external(State, Reason) ->
+    fail(State#f{epoch = compute_epoch(State)}, Reason).
+
 do_unload(State0) ->
     State1 = set_status(State0, unloading),
     Ds = State1#f.disposers,
@@ -569,9 +592,14 @@ set_status(State, Status) ->
     Updated.
 
 write_row(#f{ctx = #{tabs := #{fibers := Fibers}}} = State) ->
-    ets:insert(Fibers,
-               {self(), State#f.uid, State#f.id, State#f.parent, State#f.module,
-                State#f.status, State#f.inject, State#f.epoch, State#f.error}).
+    Row = {self(), State#f.uid, State#f.id, State#f.parent, State#f.module,
+           State#f.status, State#f.inject, State#f.epoch, State#f.error},
+    try
+        ets:insert(Fibers, Row),
+        ok
+    catch
+        error:badarg -> ok
+    end.
 
 teardown(#f{status = disposed} = State, _From) ->
     {reply, ok, State};
@@ -581,7 +609,12 @@ teardown(State0, _From) ->
     {stop, normal, ok, State}.
 
 delete_row(#f{ctx = #{tabs := #{fibers := Fibers}}}) ->
-    ets:delete(Fibers, self()).
+    try
+        ets:delete(Fibers, self()),
+        ok
+    catch
+        error:badarg -> ok
+    end.
 
 grace(#f{opts = Opts}) -> maps:get(grace, Opts, ?GRACE).
 
@@ -601,7 +634,8 @@ open_plugin(#f{spec = Spec} = State) ->
                 end,
         arm(State#f{port = Port, os_pid = OsPid}, hello)
     catch
-        Class:Reason -> settle(fail(State#f{phase = ready}, {spawn_failed, Class, Reason}))
+        Class:Reason ->
+            settle(fail_external(State#f{phase = ready}, {spawn_failed, Class, Reason}))
     end.
 
 arm(#f{pending = Pending} = State, Req) ->
@@ -685,7 +719,7 @@ kill(OsPid) ->
 
 port_gone(State0, Reason) ->
     State1 = do_unload(close_port(State0)),
-    {noreply, settle(fail(State1#f{phase = ready}, Reason))}.
+    {noreply, settle(fail_external(State1#f{phase = ready}, Reason))}.
 
 cancel_all(#f{pending = Pending} = State) ->
     maps:foreach(fun(_Req, Entry) -> cancel(Entry, {error, plugin_gone}) end, Pending),
@@ -702,7 +736,8 @@ cancel({call, From, Timer}, Reply) ->
 expire(#f{pending = Pending} = State, Req) ->
     case maps:take(Req, Pending) of
         {{load, _}, Rest} ->
-            settle(fail((close_port(State#f{pending = Rest}))#f{phase = ready}, timeout));
+            settle(fail_external((close_port(State#f{pending = Rest}))#f{phase = ready},
+                                 timeout));
         {{call, From, _}, Rest} ->
             gen_server:reply(From, {error, timeout}),
             State#f{pending = Rest};
