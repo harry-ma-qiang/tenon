@@ -37,10 +37,11 @@ Companion naming (per AGY, not yet applied): tenon (CLI) / tenon-core (Rust data
 
 ## 3. Bridge (P3)
 
-`Tenon.Bridge` plugin: `%{cmd, args, env, protocol, launcher}`.
-protocol `:lines` (JSON per line) | `:mcp` | `:acp` | `:jsonrpc` (DSH sdk).
-launcher `:port` (default) | `:vibe_term` (visible pane) | `:bwrap`/`:landlock` | `:microvm` | `:remote` (node/e2b).
-Order: sh script -> MCP server -> DSH `--profile headless`/ACP whole agent.
+Cordis has three channels: A direct service call, B event bus/waterfall, C JSON-RPC cross-process.
+v0.1 external plugins use channel B only: `Tenon.Bridge` mounts a shell script via Erlang Port, JSON per line.
+The script declares which events it listens to (and mode); Bridge registers hooks that forward `{event, args}`; for waterfall the script replies `{next: args}` or `{result: value}`. Script exit -> fiber failed; unload -> port closed.
+`%{cmd, args, env}` only. protocol `:lines`, launcher `:port`. MCP/ACP/JSON-RPC, other launchers, VM: later.
+Order: sh script echo demo -> DSH headless via the same lines protocol -> then channel A/C if needed.
 
 ## 4. Phases
 
@@ -77,7 +78,7 @@ Target <= ~650 LoC total, tests separate.
 1. Kernel never calls a fiber synchronously and never runs user code (no apply, no hooks, no disposers). Kernel -> fiber is cast only. Fiber -> Kernel may be call.
 2. Kernel emits no events. Fibers emit `internal/*` about themselves.
 3. Dispatch runs in the caller process, hooks in registration order (prepend goes before). `emit`: each hook isolated (rescue + Logger, never breaks emitter). `parallel`: Task.async_stream, returns `:ok | {:error, [reason]}`. `serial`/`bail`: first non-nil result wins, else nil (bail == serial on BEAM). `waterfall(ctx, event, args, terminal)`: hook `fn ..args, next -> ... end`; `next.(args...)` passes possibly modified args downstream; not calling `next` short-circuits; terminal is the default. Coder must verify call order against `vendor/cordis/src/events.ts:234-243`.
-4. Every registration returns a disposer. `Ctx.effect(ctx, fun)`: fun runs now, returns disposer or nil. Works from inside the fiber process (during apply; collected then merged into state) and from other processes (call to fiber). Disposers run reverse order in the fiber process on unload.
+4. Every registration returns a disposer. `Ctx.effect(ctx, fun)`: fun runs now in the caller, returns disposer or nil; the disposer is handed to the owning fiber: from another process via `GenServer.call(fiber, {:effect, d})`, from inside the fiber process itself (during apply) via `send(self(), {:effect, d})` (mailbox FIFO keeps order, no deadlock, no process dictionary). Disposers run reverse order in the fiber process on unload.
 5. Hooks and services rows carry owner fiber pid. Kernel monitors every fiber; on DOWN it deletes rows by owner and re-evaluates dependents. No orphan registrations after kill.
 6. apply/2 raising -> fiber `:failed` (process stays, error kept, shows in tree; `restart` retries). Any other crash -> DOWN sweep.
 7. inject epoch: `[{name, provider_pid}]`. pending + all present -> load. active + one missing -> unload -> pending. active + provider pid changed -> reload. Optional deps: `Ctx.get/2` returns nil.
@@ -93,8 +94,13 @@ Target <= ~650 LoC total, tests separate.
 
 load/unload; disposer reverse order; `Process.exit(fiber, :kill)` leaves no hooks/services rows; inject waits then loads; provider dispose -> dependent pending; provider back -> reload; provider swap -> reload; 5 modes incl. prepend and waterfall short-circuit + arg rewrite; parent unload disposes children first; apply raise -> failed, restart -> active; internal/* observed; two kernels do not see each other.
 
-## 7. Open questions for reviewers
+## 7. Open questions & Architectural decisions
 
-- Should `emit` really swallow hook errors (Cordis propagates)? We chose isolation for reliability.
-- Process-dictionary accumulator for effects during apply: acceptable, or force `apply/2` to return disposers?
-- Fiber process stays alive in `:failed`: fine, or let it die and keep a tombstone row?
+- **Q1: Should `emit` swallow hook errors (Cordis propagates)?**
+  * **Decision**: **Confirmed isolation (`rescue + Logger.error`)**. `emit` is a decoupled broadcast notification; individual observer failures must never crash the business caller. Errors in `waterfall` / `serial` will propagate.
+- **Q2: Effect collection during `apply/2` (pdict accumulator vs explicit messaging)?**
+  * **Decision**: **Avoid hidden process-dictionary**. Use `Ctx.effect(ctx, fun)` via explicit Fiber GenServer message/state management or return `:ok | {:ok, disposer}` from `apply/2` to preserve OTP purity and debuggability.
+  * **Applied**: invariant 6.2.4 — disposer travels as a message to the fiber (`call` from other processes, `send` to self during apply). `apply/2` may also return `{:ok, disposer}`.
+- **Q3: Fiber process lifecycle on `:failed` (stay alive vs death + tombstone)?**
+  * **Decision**: **Stay alive in `:failed` state**. Retains full inspectability in `Kernel.tree/1`, preserves the error stack trace, and allows clean manual/supervised retry via `Fiber.restart/1`.
+
