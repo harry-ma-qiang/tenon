@@ -1,0 +1,289 @@
+# tenon — atom kernel
+
+One Erlang module (`src/tenon.erl`, ~890 lines, zero dependencies, OTP 27) that is the
+whole Tenon microkernel: a plugin/service/hook registry with lifecycle, dependency
+gating, event dispatch, effect disposal, and a wire protocol for out-of-VM plugins.
+
+Everything else — config loader, YAML tree, schema validation, broker bridges, SDKs —
+is a plugin outside the kernel. The kernel has no comments by design; this file is the
+explanation.
+
+Design record and phase history: `../NOTES.md` (section 9 is the spec this implements).
+
+## Purpose
+
+Cordis-style composition on the BEAM. A running system is a tree of *fibers*. Each fiber
+owns one plugin instance. Plugins publish *services* and *hooks*, consume services by
+declaring `inject/0`, and register *effects* whose disposers unwind in reverse order.
+The kernel guarantees that when a fiber dies — cleanly or violently — nothing it
+registered survives it.
+
+## Architecture and process model
+
+Two kinds of `gen_server`, both implemented by the same module, distinguished by their
+state record (`#k{}` for the kernel, `#f{}` for a fiber).
+
+```
+                 ETS (owned by the kernel, unnamed, public)
+      fibers          services         hooks            seq
+   {pid,uid,id,     {name,impl,     {{event,seq},    counters
+    parent,module,   owner}          ref,owner,fun}   uid/append/prepend/req
+    status,inject,
+    epoch,error}
+        ^                ^                ^
+        | single writer  | writer=owner   | writer=owner
+        |                |                |
+   +----+----------------+----------------+-----------------------+
+   |                                                              |
+ kernel gen_server  --start_link/monitor-->  fiber gen_server ... fiber
+   |  mount/unmount, DOWN sweep, refresh casts   |  load/unload, disposer stack,
+   |  never calls a fiber, never runs user code  |  own status row, own port
+   |                                             |
+   +-- root fiber (module = undefined) mounted synchronously in init/1
+```
+
+* **Kernel.** Starts fibers (`gen_server:start_link` from the kernel process, so it is
+  linked to every fiber and traps exits), sweeps hook/service/fiber rows by owner on
+  `EXIT`, cascades `unmount` to the dead fiber's children, and casts `refresh` to fibers
+  whose `inject` list mentions a service that just appeared or vanished. It is not on
+  any hot path: dispatch never touches it.
+* **Fiber.** Runs the plugin's `load/2` in its own process, accumulates disposers,
+  writes its own status row, and (for external plugins) owns the `Port` and a pending
+  request map. It never blocks on the wire: every wire request is a `gen_server` reply
+  parked behind a request id with a deadline timer.
+* **Dispatch.** `emit`/`call`/`bail` read the `hooks` ordered_set straight from ETS in
+  the *caller's* process and run the hook funs there. Hook order is table order:
+  `append` uses an increasing sequence, `prepend` a decreasing negative one, so the most
+  recent prepend runs first.
+* **Wire-originated work.** `emit`, `call` and `svc` frames coming *from* a plugin are
+  executed in a freshly spawned worker process, never in the port owner, so a plugin can
+  call a service it provides itself without deadlocking its own fiber.
+
+## Invariants
+
+1. The kernel never calls a fiber synchronously and never runs user code. Kernel to
+   fiber is `cast` only; fiber to kernel may be `call`.
+2. The kernel emits no events. Fibers emit `internal/plugin`, `internal/status` and
+   `internal/service` about themselves.
+3. Dispatch runs in the caller process, in registration order. `emit` isolates each hook
+   (`try` + `logger:error`); `call` and `bail` let errors propagate.
+4. Every registration returns a disposer. `effect/2` runs the body immediately in the
+   caller and hands the resulting disposer to the owning fiber: `gen_server:call` from a
+   foreign process, `send(self(), ...)` from inside the fiber (mailbox FIFO keeps order,
+   no deadlock, no process dictionary). Disposers run in reverse order in the fiber.
+5. Hook and service rows carry the owner fiber pid. The kernel monitors every fiber; on
+   `EXIT` it deletes rows by owner and re-evaluates dependents. `exit(Fiber, kill)`
+   leaves no rows.
+6. `load/2` raising, returning `{error, R}`, or returning anything unexpected puts the
+   fiber in `failed`. The process stays alive with the error in its row, so it shows in
+   `tree/1` and `restart/1` retries. Any other crash is handled by the `EXIT` sweep.
+7. Inject epoch is `[{Name, ProviderPid}]`. pending + all present -> load; active + one
+   missing -> unload -> pending; active + provider pid changed -> unload + load.
+8. A child fiber is mounted as an effect of its parent, at the position where it was
+   mounted. Parent unload therefore disposes children in reverse effect order, not
+   unconditionally first.
+9. Many kernels per VM. All tables are unnamed and reached through the ctx.
+
+## API
+
+Ctx is a plain map: `#{kernel := pid(), tabs := map(), fiber := pid()}`.
+
+| Function | Meaning |
+|---|---|
+| `start_link()` / `start_link(Opts)` | start a kernel. `Opts`: `deadline` (default 30000 ms), `grace` (default 5000 ms) |
+| `stop(Kernel)` | stop the kernel; every fiber stops with it |
+| `root(Kernel) -> Ctx` | ctx of the root fiber |
+| `tree(Kernel) -> map()` | nested `#{pid, uid, id, parent, module, status, inject, epoch, error, children}` |
+| `status(Fiber) -> pending \| loading \| active \| failed \| unloading \| disposed` | settle point: recomputes the epoch, blocks while the fiber is mid-handshake |
+| `mount(Ctx, Spec) -> {ok, Fiber}` | `Spec` = `#{module := M, config => C, id => Id}` or `#{cmd := Cmd, args => [..], env => [..], config => C, id => Id}`. Child of `Ctx`'s fiber, settled before return |
+| `unmount(Fiber) -> ok` | run disposers in reverse, sweep rows, stop. Idempotent |
+| `restart(Fiber)` / `restart(Fiber, Config)` | unload then load again; the two-arity form replaces the config (this is the old `update`) |
+| `effect(Ctx, Fun) -> Disposer` | `Fun` runs now; returning a 0-arity fun registers it, `ok` / `undefined` / `nil` registers nothing |
+| `on(Ctx, Event, Fun)` / `on(Ctx, Event, Fun, #{prepend => true})` | register a hook, returns a disposer |
+| `emit(Ctx, Event, Args) -> ok` | broadcast; hooks isolated, errors logged |
+| `call(Ctx, Event, Args, Terminal) -> Result` | waterfall. Hook is `fun(A.., Next)`; `Next(A'..)` rewrites args downstream; not calling `Next` short-circuits; `Terminal` is the default. Max 5 args |
+| `bail(Ctx, Event, Args) -> Result \| undefined` | first hook returning something other than `undefined` wins |
+| `provide(Ctx, Name, Impl) -> Disposer` | duplicate name raises `{service_exists, Name}` |
+| `get(Ctx, Name) -> Impl \| undefined` | raw impl; for a wire service this is the opaque `{tenon_wire, Fiber, Name}` |
+| `svc(Ctx, Name, Method, Args) -> Result` | module impl -> `Impl:Method(Args..)`; `fun/2` -> `Impl(Method, Args)`; wire ref -> request to the owning port |
+
+Plugin module callbacks: `inject() -> [atom()]` (optional) and
+`load(Ctx, Config) -> ok | {ok, Disposer} | {error, Reason}`.
+
+```erlang
+%% an in-VM plugin
+-module(my_plugin).
+-export([inject/0, load/2]).
+inject() -> [db].
+load(Ctx, Config) ->
+    tenon:on(Ctx, 'request/before', fun(Req, Next) -> Next(Req#{seen => true}) end),
+    tenon:provide(Ctx, cache, ?MODULE),
+    tenon:effect(Ctx, fun() -> Fd = open(Config), fun() -> close(Fd) end end),
+    ok.
+```
+
+## Wire (external plugins)
+
+Transport: Erlang `Port`, `{packet, 4}`, binary, payload JSON (OTP 27 `json`). The frame
+set is transport-independent; a socket transport or an ETF codec is one extra clause.
+
+Kernel to plugin:
+
+| Frame | Fields | Meaning |
+|---|---|---|
+| `load` | `req`, `config` | become active; answer with `rep` |
+| `unload` | — | release everything and exit (see below) |
+| `hook` | `req`, `hook`, `event`, `args`, `mode` | a hook you registered fired. `mode: "emit"` has no `req` answer; `mode: "call"` expects `next` or `rep` |
+| `result` | `req`, `result` | downstream result of a `next` you sent with `await: true` |
+| `svc` | `req`, `name`, `method`, `args` | someone called your service; answer with `rep` |
+| `rep` | `id`, `result` \| `error` | answer to your `call` / `svc` request |
+
+Plugin to kernel:
+
+| Frame | Fields | Meaning |
+|---|---|---|
+| `hello` | `inject` | first frame, always. Declares the injected service names |
+| `on` | `hook`, `event`, `arity`, `mode`, `prepend` | register a hook (`hook` is your own id) |
+| `off` | `hook` | remove it |
+| `provide` / `unprovide` | `name` | publish / withdraw a service |
+| `emit` | `event`, `args` | fire and forget |
+| `call` | `id`, `event`, `args` | waterfall; answered with `rep{id}` |
+| `svc` | `id`, `name`, `method`, `args` | call another plugin's service; answered with `rep{id}` |
+| `next` | `req`, `args`, `await` | continue a `call`-mode hook. `args` must keep the arity. `await: true` asks for the downstream result before you finish |
+| `rep` | `req`, `result` \| `error` | answer a `load`, `hook` or `svc` request |
+
+Example session (kernel `>`, plugin `<`):
+
+```
+<  {"t":"hello","inject":["db"]}
+                                     ... fiber stays pending until db exists
+>  {"t":"load","req":1,"config":{"path":"/tmp/x"}}
+<  {"t":"on","hook":2,"event":"wire/call","arity":1,"mode":"call"}
+<  {"t":"provide","name":"pysvc"}
+<  {"t":"rep","req":1,"result":"ok"}
+                                     ... fiber active
+>  {"t":"hook","req":7,"hook":2,"event":"wire/call","args":[1],"mode":"call"}
+<  {"t":"next","req":7,"args":[2],"await":true}
+>  {"t":"result","req":7,"result":20}
+<  {"t":"rep","req":7,"result":21}
+>  {"t":"svc","req":8,"name":"pysvc","method":"add","args":[1,2]}
+<  {"t":"rep","req":8,"result":3}
+>  {"t":"unload"}
+                                     ... plugin exits, port closes
+```
+
+Rules:
+
+* Every kernel-to-plugin request carries a deadline (`deadline` option, default 30 s).
+  On expiry a pending `svc` / `hook` call answers `{error, timeout}`; an expired `load`
+  or `hello` fails the fiber and closes the port.
+* Plugin exit while loaded -> fiber `failed` with `{exit_status, N}`, all its rows swept.
+* `unmount` (and any lifecycle unload) sends `unload`, then waits up to `grace` (default
+  5 s) for the process to exit, then closes the port and `SIGKILL`s the OS process if it
+  is still there. A plugin's process lifetime therefore equals its loaded state:
+  `restart` and a regained dependency re-spawn the command.
+* Control plane only. Bulk data (PTY bytes, DOM trees, model tokens) must flow
+  plugin-to-plugin over a channel the plugins negotiate themselves; the kernel only
+  brokers discovery through services.
+
+## Constraints
+
+* **A hook must not synchronously call its own fiber.** Dispatch runs in the caller, so a
+  hook that does `tenon:status(self_fiber)` or `tenon:svc/4` into its own fiber while
+  that fiber is emitting will deadlock (with `call`/`bail`) or be caught and logged
+  (with `emit`). Do the work asynchronously instead. Wire plugins are exempt: their
+  inbound `emit`/`call`/`svc` frames run in a spawned worker.
+* Same rule between parent and child during `load/2`: a child that calls its parent
+  synchronously while the parent is inside `mount/2` will deadlock.
+* Max hook arity for `call` is 5; more raises `{too_many_args, N}`.
+* Event and service names arriving over the wire are converted with `binary_to_atom`.
+  The wire is a trusted control plane, not an untrusted input surface.
+* `emit`, `call` and `bail` share one hook table. A hook registered for `call` (arity
+  N+1) will fail with a bad arity if the same event is `emit`ed, and vice versa. Pick one
+  mode per event name.
+* Config and results crossing the wire are JSON: atoms become strings, tuples become
+  arrays, anything unencodable becomes its `~p` text. Keep wire configs to maps,
+  binaries, numbers and booleans.
+
+## Hot swap
+
+The kernel and every fiber run the same module, so one load swaps them all:
+
+```
+1> c(tenon).          %% or l(tenon) after erlc
+{ok,tenon}
+```
+
+`gen_server` calls `code_change/3` on both records (`#k{}` and `#f{}`) at the next
+callback. All shared state lives in ETS owned by the kernel process, which is not
+restarted, so hooks, services and status rows survive the swap untouched. When a record
+gains a field, add a clause to `code_change/3` that rebuilds the old tuple; that is the
+only place that needs to know about versions.
+
+In-VM plugin code:
+
+```
+2> l(my_plugin).
+3> tenon:restart(Fiber).     %% unload -> disposers -> load with the new code
+```
+
+External plugin: edit the script, then `tenon:restart(Fiber)` — the fiber sends `unload`,
+waits for the process to exit, and re-spawns `cmd` with the same spec. Use
+`tenon:restart(Fiber, NewConfig)` to change the config at the same time.
+
+## Performance
+
+From the smoke tests in `test/tenon_test.exs` (OTP 27.3, arm64, one core busy):
+
+| Workload | Result |
+|---|---|
+| 100 000 `emit` with 3 hooks | ~100 ms, ~1 000 000 emits/s |
+| 10 000 wire round trips (`svc` to a python3 plugin) | ~340 ms, ~29 000 round trips/s |
+
+Dispatch cost is one `ets:select` on an ordered_set plus one `apply` per hook, in the
+caller process; nothing is serialised through the kernel. The wire number is dominated by
+the JSON encode/decode and the pipe round trip in python.
+
+## Tests
+
+```
+cd kernel
+mix compile              # erlc with warnings_as_errors
+mix format --check-formatted
+mix test
+mix test --seed 1        # order-independent; seeds 1..5 verified
+```
+
+35 tests in one file: the whole P1 acceptance list (load/unload, reverse disposers, kill
+sweep, inject wait/lose/regain/swap, prepend, waterfall rewrite and short-circuit, parent
+cascade, failed -> restart, internal events, two kernels, 500-fiber stress), a python3
+plugin written to a temp file for the wire cases (hello with inject, emit-mode hook,
+call-mode hook with `next` + `await` and post-processing, provide + svc, off + unprovide,
+exit 3 on load -> failed, unmount ends the OS process, request timeout), and the two perf
+smoke tests above.
+
+## Deviations from NOTES section 9
+
+1. **External unload terminates the plugin process.** Section 9.4 only describes this for
+   `unmount`. We apply it to every unload (including a lost dependency) so that "the
+   process is running" and "the fiber is loaded" are the same fact; `do_load` re-spawns
+   the command when there is no port. The grace + `SIGKILL` backstop is unchanged. The
+   alternative — keeping an idle process alive across a dependency outage — needs a
+   second handshake to distinguish "unload" from "quit" and was not worth it.
+2. **`svc` on a wire service returns the plugin's value directly**, not the internal
+   `{rep, Value}` envelope. Errors surface as `{error, Reason}` / `{error, timeout}`.
+3. **A `call` frame from a plugin uses an identity terminal** that returns the final
+   (possibly rewritten) argument list, since the plugin cannot supply an Erlang fun.
+4. **Extra exports** beyond the section 9 list: `start_link/0` and `stop/1`. `effect/2`
+   also accepts `nil` from the body so Elixir plugins read naturally.
+5. **Fibers stop when their kernel stops.** Fibers trap exits and are linked to the
+   kernel, so a plain `EXIT` would have left them orphaned with dead ETS tables; they now
+   stop with `shutdown` and close any port on the way out.
+6. **`restart/1,2` return before an external plugin has re-settled.** The call would
+   otherwise have to block the fiber on the wire. Call `status/1` afterwards; it is the
+   settle point.
+7. The root fiber has `module`, `id` and `parent` set to `undefined`, and `bail`/`get`
+   report absence as `undefined` (not `nil`) — Erlang conventions, visible from Elixir.
+8. As specified in 9.1, `parallel`, `serial`, the Service and Plugin macros, the Ctx
+   struct and `update` are gone. `serial` was already identical to `bail` on the BEAM and
+   `update(Config)` is `restart(Fiber, Config)`.
