@@ -35,3 +35,9 @@ a binary. `_build/`, `deps/`, `target/`, `node_modules/`, `dist/` and `playgroun
 Append results to `NOTES.md` rather than adding new documents. Decisions go in the decision
 log (section 0); a finished phase gets its own numbered section with what was built, what
 was measured, and what was deliberately left out.
+
+## Secrets and pushing
+
+- `git config core.hooksPath .githooks` is set for this clone; `.githooks/pre-commit` and `pre-push` run `scripts/scan-secrets.sh` (staged diff / pushed range). New clones must run `git config core.hooksPath .githooks` once.
+- `.gitignore` excludes `.env*`, `*.env.sh`, keys, pems, tokens, `secrets/`, `credentials*`. Real keys live only in the shell environment (e.g. `source ../deepseek.env.sh`), never in files under this repo.
+- Agents never `git push`; the human pushes. Full-history scan: `scripts/scan-secrets.sh range $(git rev-list --max-parents=0 HEAD) HEAD`.

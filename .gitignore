@@ -67,3 +67,22 @@ ehthumbs_vista.db
 *.swo
 *~
 
+
+# Secrets: never tracked
+.env
+.env.*
+*.env
+*.env.sh
+env.sh
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+*.secret
+secrets/
+credentials*
+id_rsa*
+id_ed25519*
+*.jks
+*.keystore
