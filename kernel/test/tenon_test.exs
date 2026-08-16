@@ -88,27 +88,39 @@ defmodule TenonTest do
 
   MODE = sys.argv[1] if len(sys.argv) > 1 else "basic"
 
+  WIRE_IN = os.fdopen(3, "rb", 0)
+  WIRE_OUT = os.fdopen(4, "wb", 0)
 
-  def recv():
-      head = sys.stdin.buffer.read(4)
-      if not head or len(head) < 4:
-          return None
-      size = struct.unpack(">I", head)[0]
-      body = b""
-      while len(body) < size:
-          chunk = sys.stdin.buffer.read(size - len(body))
+
+  def readn(size):
+      buf = b""
+      while len(buf) < size:
+          chunk = WIRE_IN.read(size - len(buf))
           if not chunk:
               return None
-          body += chunk
+          buf += chunk
+      return buf
+
+
+  def recv():
+      head = readn(4)
+      if head is None:
+          return None
+      body = readn(struct.unpack(">I", head)[0])
+      if body is None:
+          return None
       return json.loads(body.decode())
 
 
   def send(frame):
       body = json.dumps(frame).encode()
-      sys.stdout.buffer.write(struct.pack(">I", len(body)))
-      sys.stdout.buffer.write(body)
-      sys.stdout.buffer.flush()
+      WIRE_OUT.write(struct.pack(">I", len(body)) + body)
 
+
+  if MODE == "noisy":
+      print("plugin stdout is free for logs", flush=True)
+      sys.stderr.write("plugin stderr is free for logs\n")
+      sys.stderr.flush()
 
   send({"t": "hello", "inject": ["db"] if MODE == "inject" else []})
 
@@ -117,6 +129,10 @@ defmodule TenonTest do
       if frame is None:
           break
       kind = frame.get("t")
+      if MODE == "noisy":
+          print("plugin saw a %s frame" % kind, flush=True)
+          sys.stderr.write("plugin saw a %s frame\n" % kind)
+          sys.stderr.flush()
       if kind == "load":
           if MODE == "crash":
               sys.exit(3)
@@ -143,6 +159,10 @@ defmodule TenonTest do
               send({"t": "rep", "req": frame["req"], "result": args[0]})
           elif method == "ospid":
               send({"t": "rep", "req": frame["req"], "result": os.getpid()})
+          elif method == "big":
+              send({"t": "rep", "req": frame["req"], "result": "x" * args[0]})
+          elif method == "getenv":
+              send({"t": "rep", "req": frame["req"], "result": os.environ.get(args[0], "")})
           elif method == "boom":
               send({"t": "rep", "req": frame["req"], "error": "nope"})
           elif method == "unhook":
@@ -655,6 +675,62 @@ defmodule TenonTest do
 
     assert :tenon.svc(ctx, :pysvc, :slow, []) == {:error, :timeout}
     assert :tenon.svc(ctx, :pysvc, :add, [1, 1]) == 2
+  end
+
+  test "a plugin that writes to stdout and stderr still talks over fd 3 and fd 4" do
+    {_k, ctx} = kernel()
+    me = self()
+    :tenon.on(ctx, :"wire/seen", fn value -> send(me, {:seen, value}) end)
+
+    {:ok, fiber} = wire(ctx, "noisy")
+    assert :tenon.status(fiber) == :active
+
+    assert :tenon.svc(ctx, :pysvc, :add, [20, 22]) == 42
+    :tenon.emit(ctx, :"wire/emit", [7])
+    assert_receive {:seen, 7}, 2_000
+  end
+
+  @tag :capture_log
+  test "a reply over the frame cap is dropped and the caller is told" do
+    {_k, ctx} = kernel(%{max_frame: 4096})
+    {:ok, fiber} = wire(ctx, "basic")
+    assert :tenon.status(fiber) == :active
+
+    assert :tenon.svc(ctx, :pysvc, :big, [100_000]) == {:error, :frame_too_large}
+
+    assert Process.alive?(fiber)
+    assert :tenon.status(fiber) == :active
+    assert :tenon.svc(ctx, :pysvc, :add, [1, 2]) == 3
+  end
+
+  test "the frame cap is configurable by option and by TENON_MAX_FRAME" do
+    {_k, ctx} = kernel(%{max_frame: 4_194_304})
+    {:ok, fiber} = wire(ctx, "basic")
+    assert :tenon.status(fiber) == :active
+    assert byte_size(:tenon.svc(ctx, :pysvc, :big, [2_000_000])) == 2_000_000
+
+    previous = System.get_env("TENON_MAX_FRAME")
+    System.put_env("TENON_MAX_FRAME", "4194304")
+
+    try do
+      {_k2, ctx2} = kernel()
+      {:ok, fiber2} = wire(ctx2, "basic")
+      assert :tenon.status(fiber2) == :active
+      assert byte_size(:tenon.svc(ctx2, :pysvc, :big, [2_000_000])) == 2_000_000
+    after
+      if previous,
+        do: System.put_env("TENON_MAX_FRAME", previous),
+        else: System.delete_env("TENON_MAX_FRAME")
+    end
+  end
+
+  test "a plugin receives the cap and the deadline in its environment" do
+    {_k, ctx} = kernel(%{max_frame: 4096, deadline: 7000})
+    {:ok, fiber} = wire(ctx, "basic")
+    assert :tenon.status(fiber) == :active
+
+    assert :tenon.svc(ctx, :pysvc, :getenv, ["TENON_MAX_FRAME"]) == "4096"
+    assert :tenon.svc(ctx, :pysvc, :getenv, ["TENON_KERNEL_DEADLINE"]) == "7000"
   end
 
   test "perf smoke: 100k emits with three hooks" do
