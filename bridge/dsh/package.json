@@ -1,0 +1,23 @@
+{
+  "name": "@tenon/dsh-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "imports": {
+    "#sdk": {
+      "types": "./dist/tenon.d.ts",
+      "default": "./dist/tenon.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.sdk.json && tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.sdk.json --noEmit && tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.9.2"
+  }
+}
