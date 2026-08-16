@@ -260,3 +260,7 @@ registry/table set per realm) for `intercept` / `isolate`; graceful kernel stop 
 tree before closing ports, so `stop/1` is quiet with live external plugins); loader file
 watch for native rows (today `reload/1` is explicit; only DSH rows hot-reload through the
 profile patch); `mix release` packaging of kernel + loader + cli as one artifact.
+
+## 16. Live run: DSH web under the Tenon kernel (2026-08-16)
+
+`cli/tenon start playground/web/tenon.yml --dsh-bundles dsh-base,dsh-web-app ...` (kernel = top process; DSH node process is its child via erl_child_setup). Tree: guard (py, sdk/py, `tools/pre-execute` call hook, prepend) / audit (py, emit hooks -> audit.jsonl) / dsh (collapsed, web at http://127.0.0.1:3080). Real model deepseek-v4-flash via DEEPSEEK_API_KEY (env only). Smoke via JSON-RPC `/api/*`: pong PASS; bash `echo tenon-ok` executed PASS; `rm -rf` denied by the Tenon-side python guard PASS; audit lines PASS. Fix landed: `--dsh-bundles` flag (`618809c`). Test-profile rows `sandbox-policy danger-full-access` + `approval never` (no sandbox backend on this host) live in the Tenon yml as `tenon: dsh` rows and were hot-applied with SIGHUP (DSH HMR, same pid). Caveat unchanged: TS plugins inside Node run on real Cordis (L2 design). Web binds 127.0.0.1 only; use an SSH tunnel.
