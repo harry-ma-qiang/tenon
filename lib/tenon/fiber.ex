@@ -77,14 +77,15 @@ defmodule Tenon.Fiber do
     }
 
     write_row(state)
-    {:ok, state, {:continue, :mount}}
+
+    case module do
+      nil -> {:ok, mount(state)}
+      _ -> {:ok, state, {:continue, :mount}}
+    end
   end
 
   @impl GenServer
-  def handle_continue(:mount, state) do
-    Events.emit(state.ctx, :"internal/plugin", [self()])
-    {:noreply, refresh(state)}
-  end
+  def handle_continue(:mount, state), do: {:noreply, mount(state)}
 
   @impl GenServer
   def handle_call(:status, _from, state) do
@@ -125,6 +126,11 @@ defmodule Tenon.Fiber do
   def handle_info({:tenon_drop, ref}, state), do: {:noreply, run_disposer(state, ref)}
 
   def handle_info(_message, state), do: {:noreply, state}
+
+  defp mount(state) do
+    Events.emit(state.ctx, :"internal/plugin", [self()])
+    refresh(state)
+  end
 
   defp drop(fiber, ref) do
     if self() == fiber do
