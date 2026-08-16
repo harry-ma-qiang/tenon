@@ -1,3 +1,4 @@
+# BEAM / Elixir / Erlang
 _build/
 cover/
 deps/
@@ -8,3 +9,34 @@ erl_crash.dump
 *.ez
 *.tar
 /tmp/
+
+# Disposable / Playground (safe from colliding with production sandbox)
+playground/
+scratch/
+.playground/
+.scratch/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+*.lnk
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
