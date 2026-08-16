@@ -205,3 +205,10 @@ Steps:
 - P2.2 `5f64588` loader/ (Elixir, 753 LoC): faithful `applyEntryPatches`, DSH layer order, `!!js` capture, stable ids `anon:<parent>/<name>:<n>`, diff reload (mount/unmount/restart/toggle), groups cascade, collapse mechanism for dsh rows, reload/dump; 49 tests.
 - Small follow-ups: (a) kernel README should document + test mounting into another fiber's ctx from a foreign process (loader groups rely on it); (b) SDK-side oversize error is `{:error, "frame_too_large"}` (binary) vs kernel atom — normalize later; (c) `notify` O(N) index later.
 - Next P2.3: DSH pnpm install, custom `tenon` profile = dsh-base + `tenon-bridge` row, bridge mirrors services/events over the wire via sdk/ts.
+
+## 14. P2.3 result: DSH runs as one Tenon plugin (2026-08-16, commit 71af016)
+
+`bridge/dsh`: Cordis plugin `tenon-bridge` (TS, reuses sdk/ts) inserted into a custom DSH profile `tenon` (bundle dsh-base + one patch row). DSH boots unmodified as ONE external fiber (`node apps/cli/lib/bin.js --profile tenon`, fd 3/4) in ~1.1 s. Service `dsh`: ping, pid, mirrors, tools.list, tools.execute, sessions.list/create, agents.list. Mirrors: `session/created`, `session/event` (emit), `tools/pre-execute` (call, JSON projection + pick allowlist; `{deny}` short-circuits DSH's tool pipeline).
+Proven end to end: a sdk/py plugin on the Tenon bus denies a DSH tool call (`rm -rf` -> denied with the python reason; `echo` -> ok) — no model turn needed. 5 tests green.
+Compat status: L1 config files (loader) yes; L2 DSH TS plugins unmodified yes (real Cordis inside Node); L3 selected services/events on the Tenon bus yes (manifest-driven). Deviations in bridge/dsh/README.md.
+Prereq for the built launcher: DSH `pnpm install`, `pnpm run build:lib:host` and `build:lib:client`. Loader-side collapse of dsh rows into the profile patch (writing `$DSH_HOME/profiles/tenon/cordis.patch.yml`) is the remaining L1 glue: P2.4.
