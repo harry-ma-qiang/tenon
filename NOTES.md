@@ -163,3 +163,11 @@ Single module: `c:l(tenon)` swaps kernel + all fibers atomically; state lives in
 
 All P1 tests translated (load/unload, reverse disposers, kill sweep, inject wait/lose/regain/swap, prepend, waterfall rewrite/short-circuit, cascade, failed->restart, internal events, two kernels, 500-fiber stress no leak) + wire: python3 test plugin (hello/on/provide/call/next+await/svc, exit -> failed, unmount closes port) + perf smoke (100k emit with 3 hooks, 10k wire round trips; assert generous bounds, print numbers).
 Gates: erlc warnings as errors, `mix format --check-formatted` (test), `mix test`. LoC: `wc -l src/tenon.erl` < 1000.
+
+## 10. Atom kernel result (2026-08-16, commit fadd4be)
+
+`kernel/src/tenon.erl` 929 LoC, zero comments, zero deps. Tests: `tenon_test.exs` (35, spec + wire + perf) and `tenon_adversarial_test.exs` (18, hot swap / scale / concurrency / wire abuse); 53 green, seeds 1-5, no flakiness. README 305 lines carries the explanation.
+Verified: double in-place `code:load_file(tenon)` with live fibers + external plugin, all keeps working; 100k emit x 3 hooks ~100 ms (~1M/s); 10k wire round trips (python3) ~350-390 ms (~25-29k/s); 10k-row hooks table costs 1.3x empty (partial-key select, no scan); 20k-frame flood no leak; 50 procs x 20 mount/unmount concurrent, tables back to baseline.
+Defects found by review/adversarial and fixed: unguarded `json:decode` crashed fiber; `status/1` respawned a failed external plugin once (epoch stayed inactive); kernel dies with its `start_link` caller (documented; `start/1` unlinked added; ETS writes tolerate dead table). Earlier audit fixed 7 more (orphan fibers on kernel death, svc envelope leak, pid-recycle kill, unmount grace stall, reload not re-sending load, dead parent disposer entries, stale wire map).
+Known/accepted: `notify` is O(total fibers) per provide/unprovide (0.5 s per 100 cycles at 10k fibers); external unload = process exit + respawn on load; wire atoms via `binary_to_atom` (trusted control plane); hooks must not call their own fiber synchronously.
+Not in kernel (by design, next work): language SDKs (py/ts/rust ~100 lines each), loader plugin (yml tree + patch), socket transport + ETF codec, isolate realms, broker bridge.
