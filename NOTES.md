@@ -197,3 +197,11 @@ Steps:
 - P2.2 loader (Elixir): parse yml tree; patch layers by id (replace/insert/disable); name registry `name -> {module | cmd | dsh}`; `dsh-*` rows collapse into one bridge/dsh mount; `!!js` passed through untouched to the DSH host; ops reload/dump; tests: golden vs `dsh --profile headless --dump-config` (Sonnet explores DSH app-boot composition rules first).
 - P2.3 bridge/dsh: explore how DSH profiles install out-of-tree plugins (`cordis.patch.yml`, profile home); `tenon-bridge` Cordis plugin: manifest of mirrored services/events; `tenon-dsh-host` bin; demo: Tenon mounts DSH headless, a python plugin registers a `tools/pre-execute` guard visible to DSH tools, and calls `ctx.llm` via svc.
 - Language decisions: loader Elixir (control plane, direct API); bridge TS (must); Rust only later for a CLI launcher around `mix release`.
+
+## 13. P2.0-2.2 results (2026-08-16)
+
+- P2.0 `d9993d0` wire v1.1: Port `nouse_stdio` (fd 3 in / fd 4 out), frame cap `max_frame` (option > env `TENON_MAX_FRAME` > 1 MB) enforced both directions, cap + deadline passed to plugin env. kernel 978 LoC, 58 tests.
+- P2.1 `88e93bf` sdk/py/tenon.py 282, sdk/ts/tenon.ts 298 (zero deps, re-entrant waits, next/await, svc), same demo in both, sdk/test 8 conformance tests incl. py<->ts nested svc. Finding: Node `fs.createReadStream(fd 3)` blocks exit; use `net.Socket({fd:3})`.
+- P2.2 `5f64588` loader/ (Elixir, 753 LoC): faithful `applyEntryPatches`, DSH layer order, `!!js` capture, stable ids `anon:<parent>/<name>:<n>`, diff reload (mount/unmount/restart/toggle), groups cascade, collapse mechanism for dsh rows, reload/dump; 49 tests.
+- Small follow-ups: (a) kernel README should document + test mounting into another fiber's ctx from a foreign process (loader groups rely on it); (b) SDK-side oversize error is `{:error, "frame_too_large"}` (binary) vs kernel atom — normalize later; (c) `notify` O(N) index later.
+- Next P2.3: DSH pnpm install, custom `tenon` profile = dsh-base + `tenon-bridge` row, bridge mirrors services/events over the wire via sdk/ts.
