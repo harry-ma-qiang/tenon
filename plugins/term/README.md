@@ -55,10 +55,10 @@ outlive their supervisor are worse than a lost background job.
 ## No PTY
 
 There is no pty, no resize, no scrollback, no session multiplexing. `exec` and `spawn`
-here are plain pipes. The pty multiplexer is `vibe-term`'s job (the future `term-core`,
-see `../../../note.md` section B): when it lands it mounts as its own plugin and returns
-pty handles over this same wire. This crate exists so the bus has a native process runner
-today, and so the handle rule has a worked example.
+here are plain pipes. The pty multiplexer is a separate future plugin (`tenon-term` in the
+companion list of `../../NOTES.md` section 0): when it lands it mounts as its own plugin
+and returns pty handles over this same wire. This crate exists so the bus has a native
+process runner today, and so the handle rule has a worked example.
 
 ## Build and test
 

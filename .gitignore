@@ -10,9 +10,8 @@ bridge/dsh/dist/
 bridge/dsh/test/_build/
 bridge/dsh/test/deps/
 
-# Rust
+# Rust (Cargo.lock is committed: every crate here is a binary)
 target/
-Cargo.lock
 
 # BEAM / Elixir / Erlang
 _build/
@@ -31,6 +30,11 @@ kernel/_build/
 kernel/deps/
 loader/_build/
 loader/deps/
+cli/_build/
+cli/deps/
+cli/tenon
+sdk/test/_build/
+sdk/test/deps/
 tmp/
 
 # Disposable / Playground (safe from colliding with production sandbox)

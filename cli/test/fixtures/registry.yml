@@ -1,0 +1,8 @@
+probe:
+  cmd: /bin/true
+  args: []
+  env:
+    TENON_DEMO: "1"
+
+"tenon:policy":
+  cmd: /bin/true

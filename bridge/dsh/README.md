@@ -104,11 +104,15 @@ cd test && mix test
 The built launcher needs `build:lib:host` **and** `build:lib:client` in the DSH repo —
 three packages the profile loads (`typert-registry`, `api-gateway`, `client-connection`)
 are client-face bundles. The source launcher needs only the host build but must run with
-the DSH repo as cwd so `tsx/esm` resolves. `test/bridge_test.exs` mounts `test/guard.py`
-(a `sdk/py` plugin whose `tools/pre-execute` hook denies `rm -rf`) and then DSH, checks
-the `dsh` service and the mirror list, runs `tenon_echo` twice (allowed, then denied by
-the Tenon-side guard), checks that a `session/created` emit reaches the guard, and
-unmounts, asserting the Node process is gone.
+the DSH repo as cwd so `tsx/esm` resolves.
+
+6 tests. `test/bridge_test.exs` (5) mounts `test/guard.py` (a `sdk/py` plugin whose
+`tools/pre-execute` hook denies `rm -rf`) and then DSH, checks the `dsh` service and the
+mirror list, runs `tenon_echo` twice (allowed, then denied by the Tenon-side guard), checks
+that a `session/created` emit reaches the guard, and unmounts, asserting the Node process
+is gone. `test/dsh_loader_test.exs` (1) drives the loader's DSH collapse against the same
+live profile: a row added by `Tenon.Loader.reload/1` loads inside the running Node process,
+no restart.
 
 ## Deviations
 

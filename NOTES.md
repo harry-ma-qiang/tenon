@@ -214,3 +214,49 @@ Compat status: L1 config files (loader) yes; L2 DSH TS plugins unmodified yes (r
 Prereq for the built launcher: DSH `pnpm install`, `pnpm run build:lib:host` and `build:lib:client`. Loader-side collapse of dsh rows into the profile patch (writing `$DSH_HOME/profiles/tenon/cordis.patch.yml`) is the remaining L1 glue: P2.4.
 
 P2.4 done (commit 5c44981): built-in collapse target `Tenon.Loader.Dsh` writes `$DSH_HOME/profiles/<name>/{package.json,cordis.patch.yml}` (bridge row + harvested rows, `!!js` re-emitted) and mounts DSH as one fiber; reload is restart-free (DSH hot-reloads the profile patch), loader 64 tests + `bridge/dsh/test` 6.
+
+## 15. Status 2026-08-16 (push)
+
+Per project, source lines (`wc -l`, no tests) and green tests:
+
+| Project | LoC | Tests |
+|---|---|---|
+| `kernel/src/tenon.erl` | 989 | 61 (`tenon_test.exs` 43, `tenon_adversarial_test.exs` 18) |
+| `loader/lib` | 1023 (config 347, tree 404, dsh 155, loader 46, server 51, group 9, application 11) | 64 |
+| `cli/lib` | 295 (cli 169, registry 84, signals 42) | 6 |
+| `sdk/py/tenon.py` | 282 | 16 in `sdk/test` (py + ts + rs + plugins/term) |
+| `sdk/ts/tenon.ts` | 298 | same suite |
+| `sdk/rs/src/lib.rs` | 547 | same suite |
+| `plugins/term/src/main.rs` | 297 | same suite |
+| `bridge/dsh/src` | 460 (mirror 239, plugin 221) | 6 (`bridge_test.exs` 5, `dsh_loader_test.exs` 1) |
+
+153 tests total, all green. Gates green everywhere: kernel/loader/cli `mix compile` +
+`format --check-formatted` + `credo --strict` (loader, cli) + `mix test`; `sdk/test` and
+`bridge/dsh/test` `mix test`; `sdk/rs` and `plugins/term` `cargo build --release` +
+`clippy --all-targets -D warnings` + `fmt --check`; `sdk/ts` and `bridge/dsh` `tsc --noEmit`.
+
+Perf re-measured today (OTP 27.3, arm64): 100k emit x 3 hooks 107 ms (~930 k/s); 10k wire
+round trips to python3 353 ms (~28 k/s); 100k emit against a 10 003-row hooks table 131 ms
+vs 100 ms for a 3-row table; 100 provide/unprovide cycles over 10 001 fibers 176 ms.
+
+Compat status unchanged from §14: L1 config files yes (loader), L2 DSH TS plugins
+unmodified yes (real Cordis in one Node process, one fiber), L3 selected services/events on
+the Tenon bus yes (manifest-driven). Deviations per README.
+
+New in this pass: `cli/` — escript `tenon` with `start` (mount + stay alive, SIGHUP reload,
+SIGTERM graceful unmount), `dump` and `check` (compose only, exit 1 on a bad row), and a
+name registry from `.yml` / `.exs` / a module. SIGINT is not routable via `os:set_signal/2`,
+so Ctrl-C aborts the VM and plugins exit on wire EOF. `Cargo.lock` is now committed for
+`sdk/rs` and `plugins/term` (bin crates, mirrors the `mix.lock` decision of §0). Root
+README, AGENTS.md and every subproject README swept for stale numbers and terminology.
+
+§13 follow-ups are closed: (a) cross-fiber mount is invariant 10 of the kernel README and
+tested; (b) SDK oversize error is normalized at the kernel boundary to the atom
+`{:error, :frame_too_large}`; (c) `notify` uses the `deps` index, no fibers-table scan.
+
+Deferred, in rough order of value: wire v2 socket transport (UDS/TCP, same frames, remote
+plugins and nodes); ETF codec as one extra clause next to JSON; isolate realms (one
+registry/table set per realm) for `intercept` / `isolate`; graceful kernel stop (unmount the
+tree before closing ports, so `stop/1` is quiet with live external plugins); loader file
+watch for native rows (today `reload/1` is explicit; only DSH rows hot-reload through the
+profile patch); `mix release` packaging of kernel + loader + cli as one artifact.
