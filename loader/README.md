@@ -2,7 +2,8 @@
 
 An in-VM Tenon plugin that reads Cordis/DSH config files, composes one entry tree, and
 mounts it on the atom kernel as fibers (P2.2 of `../NOTES.md` section 12). The loader is a
-plugin like any other, so unmounting it unwinds everything it mounted.
+plugin like any other, so unmounting it unwinds everything it mounted. `../cli` is the
+command line front end for everything below (`tenon start`, `dump`, `check`).
 
 ```elixir
 {:ok, kernel} = :tenon.start_link()

@@ -4,9 +4,9 @@ One Erlang module (`src/tenon.erl`, ~990 lines, zero dependencies, OTP 27) that 
 whole Tenon microkernel: a plugin/service/hook registry with lifecycle, dependency
 gating, event dispatch, effect disposal, and a wire protocol for out-of-VM plugins.
 
-Everything else — config loader, YAML tree, schema validation, broker bridges, SDKs —
-is a plugin outside the kernel. The kernel has no comments by design; this file is the
-explanation.
+Everything else — config loader, YAML tree, schema validation, broker bridges, SDKs, the
+`tenon` CLI — is a plugin or a caller outside the kernel. The kernel has no comments by
+design; this file is the explanation.
 
 Design record and phase history: `../NOTES.md` (section 9 is the spec this implements).
 
@@ -326,10 +326,10 @@ From the smoke tests in `test/tenon_test.exs` (OTP 27.3, arm64, one core busy):
 
 | Workload | Result |
 |---|---|
-| 100 000 `emit` with 3 hooks | ~100 ms, ~1 000 000 emits/s |
-| 10 000 wire round trips (`svc` to a python3 plugin) | ~340 ms, ~29 000 round trips/s |
-| 100 000 `emit` with a 10 000-row hooks table | ~1.3x an empty table (~135 ms vs ~105 ms) |
-| 100 provide/unprovide cycles with 10 000 fibers | ~0.19 s (~0.52 s before the `deps` index) |
+| 100 000 `emit` with 3 hooks | ~107 ms, ~930 000 emits/s |
+| 10 000 wire round trips (`svc` to a python3 plugin) | ~353 ms, ~28 000 round trips/s |
+| 100 000 `emit` with a 10 000-row hooks table | ~1.3x a 3-row table (131 ms vs 100 ms) |
+| 100 provide/unprovide cycles with 10 000 fibers | ~0.18 s (~0.52 s before the `deps` index) |
 
 Dispatch cost is one `ets:select` on an ordered_set plus one `apply` per hook, in the
 caller process; nothing is serialised through the kernel. The wire number is dominated by
@@ -343,7 +343,7 @@ costs about 1.3x an empty one.
 did an `ets:tab2list` of the fibers table per changed name. The `deps` bag replaced that
 with one `ets:lookup` per name, so the cost is now O(dependents of that name). The
 adversarial scale test (`test/tenon_adversarial_test.exs`, 100 provide/unprovide cycles of
-one service with one real dependent among 10 001 fibers) went from **~520 ms to ~190 ms**
+one service with one real dependent among 10 001 fibers) went from **~520 ms to ~180 ms**
 — a 2.8x improvement on the whole mount/unmount cycle; what is left is the fiber spawn,
 load and settle, not the notification.
 
