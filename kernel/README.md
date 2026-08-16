@@ -195,6 +195,10 @@ Rules:
 
 ## Constraints
 
+- `stop/1` with live external plugins closes their ports abruptly; the OS may print a benign
+  EPIPE notice from the child. Unmount children first for a quiet shutdown (graceful kernel
+  stop is deferred).
+
 * **A hook must not synchronously call its own fiber.** Dispatch runs in the caller, so a
   hook that does `tenon:status(self_fiber)` or `tenon:svc/4` into its own fiber while
   that fiber is emitting will deadlock (with `call`/`bail`) or be caught and logged
