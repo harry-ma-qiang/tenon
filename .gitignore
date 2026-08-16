@@ -1,3 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Node / SDK build output
+sdk/ts/node_modules/
+sdk/ts/dist/
+
 # BEAM / Elixir / Erlang
 _build/
 cover/
