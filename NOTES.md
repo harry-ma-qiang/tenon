@@ -104,3 +104,14 @@ load/unload; disposer reverse order; `Process.exit(fiber, :kill)` leaves no hook
 - **Q3: Fiber process lifecycle on `:failed` (stay alive vs death + tombstone)?**
   * **Decision**: **Stay alive in `:failed` state**. Retains full inspectability in `Kernel.tree/1`, preserves the error stack trace, and allows clean manual/supervised retry via `Fiber.restart/1`.
 
+### Applied in P1 (2026-08-16)
+
+- Effect transport: registration from another process is `GenServer.call(fiber, {:effect, ref, d})`, from inside the fiber it is `send(self(), ...)`. Calling a disposer from inside its own fiber is likewise deferred to the next callback (a fiber cannot call itself); everywhere else it is a call. No process dictionary.
+- `Fiber.status/1` recomputes the epoch before replying, so it doubles as the settle point: kernel -> fiber stays cast-only, callers pull. `Ctx.plugin/4` uses it and returns only after the child settled.
+- Kernel waits on `DynamicSupervisor.start_child` (fiber `init/1` only, no user code, no kernel call); loading happens in `handle_continue`, so the kernel never calls a running fiber.
+- Parent unload runs disposers strictly in reverse effect order. A child is disposed at the position where it was mounted, not unconditionally first; effects registered after the child are disposed before it.
+- `apply/2` returning `{:error, reason}` or an unexpected shape fails the fiber exactly like a raise. Effects collected before the failure are kept and run on the next unload/restart.
+- Providing a name that is already live raises `ArgumentError` (Cordis throws).
+- Plugins `use Tenon.Plugin`, which imports `Kernel` except `apply/2` (BEAM name clash).
+- Kernel LoC came out at 765 (ctx 91, kernel 163, fiber 292, events 118, plugin 36, service 65), above the ~650 estimate; every file is well under the 600 limit.
+- `mix.exs` gained `elixirc_paths` so `test/support/plugins.ex` compiles in the test env.
