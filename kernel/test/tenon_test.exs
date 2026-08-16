@@ -689,4 +689,12 @@ defmodule TenonTest do
     IO.puts("perf: 10_000 wire round trips in #{ms} ms (#{div(10_000 * 1000, max(us, 1))} k/s)")
     assert ms < 60_000
   end
+
+  test "status on an unmounted fiber returns disposed" do
+    {:ok, k} = :tenon.start_link()
+    ctx = :tenon.root(k)
+    {:ok, f} = :tenon.mount(ctx, %{module: Tenon.Test.Db, config: %{impl: :x}})
+    :ok = :tenon.unmount(f)
+    assert :tenon.status(f) == :disposed
+  end
 end

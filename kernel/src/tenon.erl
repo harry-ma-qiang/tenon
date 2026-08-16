@@ -63,7 +63,11 @@ tree(Kernel) ->
 
 -spec status(pid()) -> status().
 status(Fiber) ->
-    gen_server:call(Fiber, status, infinity).
+    try
+        gen_server:call(Fiber, status, infinity)
+    catch
+        exit:{noproc, _} -> disposed
+    end.
 
 -spec mount(ctx(), spec()) -> {ok, pid()}.
 mount(#{kernel := Kernel, fiber := Owner}, Spec) ->
