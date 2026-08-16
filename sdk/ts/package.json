@@ -1,0 +1,19 @@
+{
+  "name": "@tenon/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist/tenon.js",
+  "types": "dist/tenon.d.ts",
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.9.2"
+  }
+}
