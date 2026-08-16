@@ -18,6 +18,13 @@ erl_crash.dump
 *.tar
 /tmp/
 
+# Mix build artefacts and ExUnit tmp_dir, in every umbrella-style subproject
+kernel/_build/
+kernel/deps/
+loader/_build/
+loader/deps/
+tmp/
+
 # Disposable / Playground (safe from colliding with production sandbox)
 playground/
 scratch/
