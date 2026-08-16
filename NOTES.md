@@ -120,3 +120,46 @@ load/unload; disposer reverse order; `Process.exit(fiber, :kill)` leaves no hook
 
 Commit `6ddb254` + fix. lib/tenon: plugin 36, ctx 91, kernel 163, fiber ~300, events 118, service 65 (~770 LoC). 51 tests (34 coder + 17 adversarial), 0 failures, stable across seeds 1/2/7/12/19/33.
 Adversarial findings: (1) FIXED root fiber not settled before `Kernel.init` returned -> `tree/1` flaky `:pending`; root (module nil) now mounts inside `init`. (2) `internal/plugin` fires on mount only, not dispose (documented, not symmetric). (3) provider withdraw deletes ETS row before dependents unload; dependents never see stale impl but unload is asynchronous vs Cordis's synchronous cascade. (4) a hook calling its own fiber synchronously gets `{:calling_self, _}` swallowed by `emit` isolation (logged, no hang). Constraint: hooks must not call fibers synchronously.
+
+## 9. Atom kernel spec (decision 2026-08-16, supersedes §6 layout)
+
+Goal: one Erlang module `kernel/src/tenon.erl` (< 1000 LoC, target ~800), one ExUnit test file `kernel/test/tenon_test.exs`, one `kernel/README.md`. Zero deps (OTP 27 `json` module). Everything else (loader, yml, config schema, SDKs, bridges to brokers) is a plugin outside the kernel. Elixir P1 (`lib/tenon/*`) is retired; its semantics and adversarial tests are the acceptance list.
+
+### 9.1 Keep / cut
+
+Keep: plugin+service+hook registry (ETS), lifecycle (mount/unmount/restart, inject gating, cascade on death), dispatch `emit` + `call` (waterfall) + `bail` (first non-null), effects with reverse-order disposal, `internal/plugin|status|service`, `tree`, multi-kernel per node, wire for external plugins, `code_change`.
+Cut: `parallel`, `serial` (= bail), Service sugar, Plugin `use` macro, Ctx struct (ctx is a map), `update` (= `restart(Fiber, Config)`).
+
+### 9.2 API (Erlang, in-VM plugins; Elixir calls it directly)
+
+- `tenon:start_link(Opts) -> {ok, K}`; `tenon:root(K) -> Ctx`; `tenon:tree(K)`; `tenon:status(Fiber)`.
+- Ctx = `#{kernel := pid(), tabs := map(), fiber := pid()}`.
+- `tenon:mount(Ctx, Spec) -> {ok, Fiber}`; Spec `#{module := M, config => C, id => Id}` or `#{cmd := Cmd, args => [..], env => [..], config => C, id => Id}` (external, Port). Child of Ctx fiber; settled before return.
+- `tenon:unmount(Fiber)`, `tenon:restart(Fiber)`, `tenon:restart(Fiber, Config)`.
+- `tenon:effect(Ctx, Fun) -> Disposer`; `tenon:on(Ctx, Event, Fun) / on(Ctx, Event, Fun, #{prepend => bool})` -> Disposer.
+- `tenon:emit(Ctx, Event, Args) -> ok` (hooks isolated, errors logged). `tenon:call(Ctx, Event, Args, Terminal) -> Result` (waterfall, hook `fun(A.., Next)`, `Next(A'..)` rewrites args, no Next = short-circuit; errors propagate). `tenon:bail(Ctx, Event, Args) -> Result | undefined`.
+- `tenon:provide(Ctx, Name, Impl) -> Disposer` (duplicate raises); `tenon:get(Ctx, Name) -> Impl | undefined`; `tenon:svc(Ctx, Name, Method, Args) -> Result` (Impl module -> `Impl:Method(Args..)`; fun -> `Impl(Method, Args)`; wire ref -> request to owning port).
+- Plugin module callbacks: `inject() -> [atom()]` (optional), `load(Ctx, Config) -> ok | {ok, Disposer} | {error, R}`.
+
+### 9.3 Process model
+
+- Kernel gen_server: mount/unmount, monitors fibers (trap_exit + start_link), DOWN sweep of hook/service/fiber rows by owner, inject re-evaluation via cast `refresh`. Never calls a fiber synchronously, never runs user code, never dispatches. Not in any hot path.
+- Fiber gen_server (same module, own state record): load/unload in-process, disposer stack, own status row. External fiber additionally owns the Port and a pending-request map; it never blocks on the wire.
+- Dispatch runs in the caller process straight from ETS (`hooks` ordered_set keyed `{Event, Seq}`, prepend = negative seq; `read_concurrency`). Wire-originated `emit`/`call` from a plugin is executed in a spawned worker, never in the port-owner fiber (no self-wait deadlock).
+- Root fiber (no module) mounts synchronously in `init`.
+
+### 9.4 Wire (external plugins)
+
+Transport: Erlang Port, `{packet, 4}`, binary, payload JSON (OTP `json`); ETF codec later as one clause. Socket transport later, same frames.
+Kernel -> plugin: `load{config}`, `unload`, `hook{req,event,args,mode: emit|call}`, `result{req,result}` (only if plugin asked `await`), `svc{req,method,args}`, `rep{id,result|error}`.
+Plugin -> kernel: `hello{inject:[..]}` (first frame), `on{hook,event,prepend}`, `off{hook}`, `provide{name}`, `unprovide{name}`, `emit{event,args}`, `call{id,event,args}`, `svc{id,name,method,args}`, `next{req,args,await}`, `rep{req,result|error}`.
+Rules: every request has a deadline (default 30 s, per-kernel option) -> `{error, timeout}`; plugin exit -> fiber `failed` with exit status, rows swept; unmount -> `unload` then port close (kill after grace 5 s). Control plane only: bulk data (PTY bytes, DOM) goes plugin-to-plugin over their own channel; kernel brokers discovery via services.
+
+### 9.5 Hot swap
+
+Single module: `c:l(tenon)` swaps kernel + all fibers atomically; state lives in ETS, records versioned in `code_change/3`. In-VM plugin code: `l(Mod)` then `tenon:restart(Fiber)`. External plugin: `restart` re-spawns the command. README documents the procedure.
+
+### 9.6 Acceptance
+
+All P1 tests translated (load/unload, reverse disposers, kill sweep, inject wait/lose/regain/swap, prepend, waterfall rewrite/short-circuit, cascade, failed->restart, internal events, two kernels, 500-fiber stress no leak) + wire: python3 test plugin (hello/on/provide/call/next+await/svc, exit -> failed, unmount closes port) + perf smoke (100k emit with 3 hooks, 10k wire round trips; assert generous bounds, print numbers).
+Gates: erlc warnings as errors, `mix format --check-formatted` (test), `mix test`. LoC: `wc -l src/tenon.erl` < 1000.
