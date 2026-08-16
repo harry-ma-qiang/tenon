@@ -40,4 +40,4 @@ was measured, and what was deliberately left out.
 
 - `git config core.hooksPath .githooks` is set for this clone; `.githooks/pre-commit` and `pre-push` run `scripts/scan-secrets.sh` (staged diff / pushed range). New clones must run `git config core.hooksPath .githooks` once.
 - `.gitignore` excludes `.env*`, `*.env.sh`, keys, pems, tokens, `secrets/`, `credentials*`. Real keys live only in the shell environment (e.g. `source ../deepseek.env.sh`), never in files under this repo.
-- Agents never `git push`; the human pushes. Full-history scan: `scripts/scan-secrets.sh range $(git rev-list --max-parents=0 HEAD) HEAD`.
+- Commits are authored by the human only (`Harry Ma <harry.ma.qiang@gmail.com>`), no Claude co-author trailers; pre-commit checks the identity, pre-push refuses foreign authors or Claude trailers. Agents never `git push`; the human pushes. Full-history scan: `scripts/scan-secrets.sh range $(git rev-list --max-parents=0 HEAD) HEAD`.

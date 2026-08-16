@@ -2,6 +2,7 @@
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 zero=0000000000000000000000000000000000000000
+owner="Harry Ma <harry.ma.qiang@gmail.com>"
 status=0
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   [ "$local_sha" = "$zero" ] && continue
@@ -11,5 +12,10 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     base="$remote_sha"
   fi
   "$root/scripts/scan-secrets.sh" range "$base" "$local_sha" || status=1
+  bad=$(git log --format='%an <%ae>%n%cn <%ce>' "$base..$local_sha" | sort -u | grep -v "^$owner$" || true)
+  if [ -n "$bad" ]; then printf 'pre-push: commits not authored by %s:\n%s\n' "$owner" "$bad" >&2; status=1; fi
+  if git log --format=%B "$base..$local_sha" | grep -Eqi '^Co-Authored-By:.*(claude|anthropic)'; then
+    echo "pre-push: Co-Authored-By Claude trailer found; rewrite before pushing" >&2; status=1
+  fi
 done
 exit $status

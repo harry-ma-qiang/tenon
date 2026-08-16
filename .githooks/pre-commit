@@ -1,2 +1,5 @@
 #!/usr/bin/env bash
+owner="Harry Ma <harry.ma.qiang@gmail.com>"
+me="$(git config user.name) <$(git config user.email)>"
+if [ "$me" != "$owner" ]; then echo "pre-commit: git identity is '$me', must be '$owner'" >&2; exit 1; fi
 exec "$(git rev-parse --show-toplevel)/scripts/scan-secrets.sh" staged
