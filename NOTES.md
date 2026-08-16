@@ -212,3 +212,5 @@ Steps:
 Proven end to end: a sdk/py plugin on the Tenon bus denies a DSH tool call (`rm -rf` -> denied with the python reason; `echo` -> ok) — no model turn needed. 5 tests green.
 Compat status: L1 config files (loader) yes; L2 DSH TS plugins unmodified yes (real Cordis inside Node); L3 selected services/events on the Tenon bus yes (manifest-driven). Deviations in bridge/dsh/README.md.
 Prereq for the built launcher: DSH `pnpm install`, `pnpm run build:lib:host` and `build:lib:client`. Loader-side collapse of dsh rows into the profile patch (writing `$DSH_HOME/profiles/tenon/cordis.patch.yml`) is the remaining L1 glue: P2.4.
+
+P2.4 done (commit 5c44981): built-in collapse target `Tenon.Loader.Dsh` writes `$DSH_HOME/profiles/<name>/{package.json,cordis.patch.yml}` (bridge row + harvested rows, `!!js` re-emitted) and mounts DSH as one fiber; reload is restart-free (DSH hot-reloads the profile patch), loader 64 tests + `bridge/dsh/test` 6.
