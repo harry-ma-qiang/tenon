@@ -59,6 +59,12 @@ state record (`#k{}` for the kernel, `#f{}` for a fiber).
   executed in a freshly spawned worker process, never in the port owner, so a plugin can
   call a service it provides itself without deadlocking its own fiber.
 
+**Lifetime.** A kernel is a `gen_server`, so one started with `start_link/0,1` dies with
+the process that started it. Supervise it: put `start_link` under a supervisor, where the
+supervisor is the long-lived parent. For scripts, tests and the shell, use `start/0,1`,
+which is unlinked and outlives its caller. Either way fibers stop when the kernel stops —
+they are linked to it and close their ports on the way out.
+
 ## Invariants
 
 1. The kernel never calls a fiber synchronously and never runs user code. Kernel to
@@ -90,7 +96,8 @@ Ctx is a plain map: `#{kernel := pid(), tabs := map(), fiber := pid()}`.
 
 | Function | Meaning |
 |---|---|
-| `start_link()` / `start_link(Opts)` | start a kernel. `Opts`: `deadline` (default 30000 ms), `grace` (default 5000 ms) |
+| `start_link()` / `start_link(Opts)` | start a kernel linked to the caller (supervised use). `Opts`: `deadline` (default 30000 ms), `grace` (default 5000 ms) |
+| `start()` / `start(Opts)` | same, unlinked: survives a short-lived caller (scripts, tests, shell) |
 | `stop(Kernel)` | stop the kernel; every fiber stops with it |
 | `root(Kernel) -> Ctx` | ctx of the root fiber |
 | `tree(Kernel) -> map()` | nested `#{pid, uid, id, parent, module, status, inject, epoch, error, children}` |
@@ -239,10 +246,19 @@ From the smoke tests in `test/tenon_test.exs` (OTP 27.3, arm64, one core busy):
 |---|---|
 | 100 000 `emit` with 3 hooks | ~100 ms, ~1 000 000 emits/s |
 | 10 000 wire round trips (`svc` to a python3 plugin) | ~340 ms, ~29 000 round trips/s |
+| 100 000 `emit` with a 10 000-row hooks table | ~1.3x an empty table (~135 ms vs ~105 ms) |
+| 100 provide/unprovide cycles with 10 000 fibers | ~0.5 s |
 
 Dispatch cost is one `ets:select` on an ordered_set plus one `apply` per hook, in the
 caller process; nothing is serialised through the kernel. The wire number is dominated by
 the JSON encode/decode and the pipe round trip in python.
+
+Dispatch scales with the number of *matching* hooks, not the table size: a partial-key
+select on an ordered_set seeks to the `{Event, _}` range, so a 10 000-row hooks table
+costs about 1.3x an empty one. `provide` / `unprovide` notification is the one O(total
+fibers) path — `notify/2` does an `ets:tab2list` of the fibers table per name — which is
+~0.5 s for 100 cycles at 10 000 fibers. Acceptable for a control plane that registers
+services at load time; index services-to-dependents if that ever becomes a hot path.
 
 ## Tests
 
@@ -274,7 +290,7 @@ smoke tests above.
    `{rep, Value}` envelope. Errors surface as `{error, Reason}` / `{error, timeout}`.
 3. **A `call` frame from a plugin uses an identity terminal** that returns the final
    (possibly rewritten) argument list, since the plugin cannot supply an Erlang fun.
-4. **Extra exports** beyond the section 9 list: `start_link/0` and `stop/1`. `effect/2`
+4. **Extra exports** beyond the section 9 list: `start/0,1`, `start_link/0` and `stop/1`. `effect/2`
    also accepts `nil` from the body so Elixir plugins read naturally.
 5. **Fibers stop when their kernel stops.** Fibers trap exits and are linked to the
    kernel, so a plain `EXIT` would have left them orphaned with dead ETS tables; they now
