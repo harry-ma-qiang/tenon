@@ -66,6 +66,30 @@ defmodule Tenon.CLITest do
     assert capture_io(:stderr, fn -> assert CLI.exec(["wat"]) == 1 end) =~ "usage:"
   end
 
+  test "--dsh-bundles becomes the profile bundle list" do
+    argv = [layer("tree.yml"), "--registry", @registry, "--dsh-home", @dsh_home]
+
+    assert {:ok, plain} = CLI.options(argv)
+    assert plain.dsh.profile == "tenon"
+    refute Map.has_key?(plain.dsh, :bundles)
+
+    assert {:ok, config} =
+             CLI.options(
+               argv ++
+                 [
+                   "--dsh-bundles",
+                   "@deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app,",
+                   "--profile",
+                   "web"
+                 ]
+             )
+
+    assert config.dsh.profile == "web"
+    assert config.dsh.bundles == ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]
+    assert {:error, message} = CLI.options(["nope.yml"])
+    assert message =~ "no such layer"
+  end
+
   test "the builtin registry carries the group name" do
     assert Registry.builtin()["cordis:group"] == %{module: Tenon.Loader.Group}
     assert {:error, message} = Registry.load("No.Such.Module")
