@@ -23,6 +23,7 @@ defmodule Tenon.Loader.MixProject do
     [
       {:tenon, path: "../kernel"},
       {:yaml_elixir, "~> 2.11"},
+      {:jason, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end

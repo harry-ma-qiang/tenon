@@ -16,6 +16,6 @@ defmodule TenonDshBridgeTest.MixProject do
   end
 
   defp deps do
-    [{:tenon, path: "../../../kernel"}]
+    [{:tenon, path: "../../../kernel"}, {:tenon_loader, path: "../../../loader"}]
   end
 end

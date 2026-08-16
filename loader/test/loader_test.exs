@@ -238,5 +238,45 @@ defmodule Tenon.LoaderTest do
       assert collapsed.status == :active
       assert "telemetry" in collapsed.rows
     end
+
+    @tag :tmp_dir
+    test "the built-in dsh target writes a profile and mounts one fiber", %{
+      ctx: ctx,
+      tmp_dir: dir
+    } do
+      home = Path.join(dir, "home")
+      source = write(dir, "cordis.yml", File.read!(fixture("dsh-collapse.yml")))
+
+      config = %{
+        layers: [source],
+        registry: %{"tenon:policy" => %{module: Tenon.Loader.Echo}},
+        dsh: %{
+          dsh_home: home,
+          launcher: [System.find_executable("python3"), fixture("wire_plugin.py")],
+          bridge: %{module_path: fixture("bridge.js")}
+        }
+      }
+
+      {:ok, loader} = mount(ctx, config)
+      dump = Loader.dump(loader)
+
+      assert Enum.map(dump, & &1.id) == ["policy", "dsh"]
+      dsh = row(dump, "dsh")
+      assert dsh.kind == :collapsed
+      assert dsh.status == :active
+      assert dsh.rows == ["session-title", "fs-local", "hello"]
+
+      patch = Path.join([home, "profiles", "tenon", "cordis.patch.yml"])
+      assert File.read!(patch) =~ "fallbackMaxWords: 3"
+      assert File.read!(Path.join([home, "profiles", "tenon", "package.json"])) =~ "dsh-base"
+
+      write(dir, "cordis.yml", String.replace(File.read!(source), "Words: 3", "Words: 7"))
+      :ok = Loader.reload(loader)
+
+      assert File.read!(patch) =~ "fallbackMaxWords: 7"
+      reloaded = row(Loader.dump(loader), "dsh")
+      assert reloaded.fiber == dsh.fiber
+      assert reloaded.status == :active
+    end
   end
 end

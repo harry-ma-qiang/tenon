@@ -240,4 +240,61 @@ defmodule Tenon.Loader.ConfigTest do
       assert warnings == [~s(patch: entry "ghost" not found)]
     end
   end
+
+  describe "emit" do
+    test "a shipped dsh composition round-trips through emit" do
+      rows = Config.read(fixture("dsh-cordis.yml"))
+      assert Config.parse!(Config.emit([%{"insert" => rows}])) == [%{"insert" => rows}]
+    end
+
+    test "a !!js scalar is emitted back as a !!js scalar" do
+      rows = [%{"config" => %{"cwd" => %{"__jsExpr" => "process.cwd()"}}}]
+
+      assert Config.emit(rows) == "- config:\n    cwd: !!js process.cwd()\n"
+      assert Config.parse!(Config.emit(rows)) == rows
+    end
+
+    test "a !!js expression that the capture would mangle is quoted" do
+      exprs = [
+        "process.env.X || 'a'",
+        "x # not a comment",
+        "\"quoted\"",
+        "'single'",
+        "a\nb",
+        ""
+      ]
+
+      rows = Enum.map(exprs, &%{"e" => %{"__jsExpr" => &1}})
+      assert Config.parse!(Config.emit(rows)) == rows
+    end
+
+    test "scalars, empties and nesting round-trip" do
+      rows = [
+        %{
+          "id" => "a",
+          "name" => "@scope/pkg",
+          "disabled" => false,
+          "config" => %{
+            "n" => 42,
+            "f" => 1.5,
+            "nil" => nil,
+            "yes" => "yes",
+            "num" => "42",
+            "quote" => "it's",
+            "multi" => "one\ntwo",
+            "empty_map" => %{},
+            "empty_list" => [],
+            "list" => [1, "two", %{"deep" => [%{"x" => true}]}]
+          }
+        }
+      ]
+
+      assert Config.parse!(Config.emit(rows)) == rows
+    end
+
+    test "an empty patch list is an empty yaml list" do
+      assert Config.emit([]) == "[]\n"
+      assert Config.parse!(Config.emit([])) == []
+    end
+  end
 end

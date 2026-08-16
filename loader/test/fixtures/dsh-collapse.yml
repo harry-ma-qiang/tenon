@@ -1,0 +1,20 @@
+# Mixed tree: one native Elixir row plus DSH rows harvested by prefix and by tag.
+
+- id: policy
+  name: tenon:policy
+  config:
+    mode: strict
+
+- id: session-title
+  tenon: dsh
+  config:
+    fallbackMaxWords: 3
+
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.cwd()
+
+- id: hello
+  tenon: dsh
+  name: ./plugins/hello.mjs

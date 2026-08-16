@@ -4,6 +4,8 @@ defmodule Tenon.Loader.Config do
   @js_key "__jsExpr"
   @js_line ~r/^(?<pre>.*?[:\-][ \t]+)!!js[ \t]+(?<rest>.*)$/
   @blocks ["", "|", ">", "|-", ">-", "|+", ">+"]
+  @key_order ["insert", "id", "name", "group", "disabled", "config"]
+  @reserved ~w(true false null yes no on off y n)
 
   @type row :: %{optional(String.t()) => term()}
   @type layer :: String.t() | {:entries | :patch, String.t() | [row()]}
@@ -71,6 +73,101 @@ defmodule Tenon.Loader.Config do
 
   @spec normalize([row()]) :: [row()]
   def normalize(rows), do: assign_ids(rows, "")
+
+  @spec emit([row()]) :: String.t()
+  def emit([]), do: "[]\n"
+  def emit(rows) when is_list(rows), do: IO.iodata_to_binary(seq(rows, ""))
+
+  @spec emit_js(String.t()) :: String.t()
+  def emit_js(expr), do: "!!js " <> js_text(expr)
+
+  defp seq(items, indent), do: Enum.map(items, &entry(&1, indent))
+
+  defp entry(item, indent) do
+    if is_map(item) and map_size(item) > 0 and not js_expr?(item) do
+      [[first_key, first_value] | rest] = pairs(item)
+      child = indent <> "  "
+
+      [
+        [indent, "- ", first_key, ":", inline(first_value, child <> "  ")]
+        | Enum.map(rest, fn [k, v] -> [child, k, ":", inline(v, child <> "  ")] end)
+      ]
+    else
+      [indent, "-", inline(item, indent <> "  ")]
+    end
+  end
+
+  defp pairs(map) do
+    map
+    |> Enum.map(fn {k, v} -> {to_string(k), v} end)
+    |> Enum.sort_by(fn {k, _v} -> {Enum.find_index(@key_order, &(&1 == k)) || 99, k} end)
+    |> Enum.map(fn {k, v} -> [scalar(k), v] end)
+  end
+
+  defp inline(value, indent) do
+    cond do
+      js_expr?(value) ->
+        [" ", emit_js(Map.fetch!(value, @js_key)), "\n"]
+
+      value == %{} ->
+        " {}\n"
+
+      is_map(value) ->
+        [
+          "\n",
+          Enum.map(pairs(value), fn [k, v] -> [indent, k, ":", inline(v, indent <> "  ")] end)
+        ]
+
+      value == [] ->
+        " []\n"
+
+      is_list(value) ->
+        ["\n", seq(value, indent)]
+
+      true ->
+        [" ", scalar(value), "\n"]
+    end
+  end
+
+  defp scalar(nil), do: "null"
+  defp scalar(true), do: "true"
+  defp scalar(false), do: "false"
+  defp scalar(value) when is_integer(value) or is_float(value), do: to_string(value)
+  defp scalar(value) when is_atom(value), do: scalar(Atom.to_string(value))
+
+  defp scalar(value) when is_binary(value) do
+    cond do
+      String.match?(value, ~r/[\x00-\x1f\x7f]/) -> dquote(value)
+      plain?(value) -> value
+      true -> "'" <> String.replace(value, "'", "''") <> "'"
+    end
+  end
+
+  defp plain?(value) do
+    String.match?(value, ~r|^[A-Za-z_][A-Za-z0-9_./-]*$|) and
+      String.downcase(value) not in @reserved
+  end
+
+  defp js_text(expr) do
+    if expr == "" or expr != String.trim(expr) or String.starts_with?(expr, ["\"", "'"]) or
+         String.match?(expr, ~r/[\x00-\x1f\x7f]|\s#/) do
+      dquote(expr)
+    else
+      expr
+    end
+  end
+
+  defp dquote(value) do
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+      |> String.replace("\n", "\\n")
+      |> String.replace("\t", "\\t")
+      |> String.replace("\r", "\\r")
+
+    "\"" <> escaped <> "\""
+  end
 
   defp rows_of(rows) when is_list(rows), do: rows
   defp rows_of(path) when is_binary(path), do: read(path)
