@@ -1,0 +1,19 @@
+- insert:
+    - id: tenon-hello
+      name: ./plugins/hello.mjs
+    - id: tenon-bridge
+      name: ../../../../bridge/dsh/dist/plugin.js
+      config:
+        demoTool: tenon_echo
+        services:
+          - name: dsh
+        events:
+          - name: session/created
+            mode: emit
+            pick: [id]
+          - name: session/event
+            mode: emit
+            pick: [id, type]
+          - name: tools/pre-execute
+            mode: call
+            pick: [name, arguments, callId]

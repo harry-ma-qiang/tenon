@@ -5,6 +5,10 @@ __pycache__/
 # Node / SDK build output
 sdk/ts/node_modules/
 sdk/ts/dist/
+bridge/dsh/node_modules/
+bridge/dsh/dist/
+bridge/dsh/test/_build/
+bridge/dsh/test/deps/
 
 # BEAM / Elixir / Erlang
 _build/
