@@ -636,6 +636,7 @@ dependencies = [
  "anyhow",
  "flate2",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -407,3 +407,38 @@ already fails `mix format --check-formatted` on `main`, untouched here — see d
 
 P3.1 remainder: the sandbox trait with `oci` and `landlock` backends and the conformance
 suite (the other half of the P3.1 row). The worker as a resident process is P3.2.
+
+## 19. P3.0 adversarial: 4 defects fixed (2026-08-18)
+
+An uncommitted adversarial suite (`rs/cli/tests/adversarial/`, 19 tests) found four defects in
+the P3.0 Rust base; all four are fixed, and one Elixir line changed to carry a token.
+
+- Double start not refused: `run/base.lock` holds an exclusive `flock` for the base's
+  lifetime; a second `start` prints `already running (pid N)` and exits non-zero without
+  touching the running instance; a crashed base's lock has no holder so the next start takes
+  it over and cleans stale `run/base.sock` / `run/base.ready`; `run/base.ready` is now written
+  atomically (temp file + rename).
+- SIGTERM/SIGINT during boot orphaned nodes: signal handlers are installed before any node is
+  spawned; a signal mid-boot kills already-spawned nodes with a short grace (300 ms, shorter
+  than `stop_grace_ms` since an unregistered node has nothing to protect) then SIGKILL, and
+  removes `run/` files before the process exits.
+- `reset` never restored `state.sqlite`: at boot and at every `reset`, base runs `PRAGMA
+  integrity_check` (unopenable or zero-length also counts as corrupt); a corrupt file is
+  replaced from `lkg/state.sqlite` and a `state.restored` event is logged; a healthy file is
+  left untouched so recent events are never discarded.
+- Unauthenticated `node.register`: base generates a random 32-byte token per spawned node in
+  `TENON_NODE_TOKEN`; `node.register` must carry that token and the exact spawned pid or base
+  rejects it and logs `node.register_rejected`; `Tenon.Beam.Link.Server` now sends the token
+  from its own environment (one line); a forged registration from the CLI socket always fails.
+
+Gates, full last lines: rs `cargo build --release` Finished, `cargo clippy --all-targets -- -D
+warnings` Finished with no output, `cargo fmt --check` exit 0, `cargo test` run three times,
+stable: 1 (token) + 19 (adversarial) + 7 (boot.rs) + 7 (storage/sandbox/harness/worker unit)
+= 34 passed, 0 failed each run. beam `mix compile --warnings-as-errors` clean, `mix credo
+--strict` "110 mods/funs, found no issues", `mix test` "14 tests, 0 failures", `MIX_ENV=prod
+mix release` assembled. `mix format --check-formatted` still fails only on the pre-existing,
+out-of-scope `beam/test/link_test.exs` noted in §18.5 — untouched here.
+
+Deviation: `rs/base/Cargo.toml` gained a direct `rusqlite` dependency (already resolved via
+`tenon-storage` in the workspace lock) so the boot/reset integrity check can run `PRAGMA
+integrity_check` from `rs/base/src/integrity.rs`.

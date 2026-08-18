@@ -66,6 +66,18 @@ impl Home {
         self.run().join("base.ready")
     }
 
+    pub fn ready_tmp_file(&self) -> PathBuf {
+        self.run().join("base.ready.tmp")
+    }
+
+    pub fn lock_file(&self) -> PathBuf {
+        self.run().join("base.lock")
+    }
+
+    pub fn lkg_state_file(&self) -> PathBuf {
+        self.lkg().join("state.sqlite")
+    }
+
     pub fn lkg(&self) -> PathBuf {
         self.root.join("lkg")
     }

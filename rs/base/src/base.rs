@@ -11,6 +11,8 @@ use tenon_sandbox::{Instance, Sandbox, Spec};
 use tenon_storage::Store;
 use tokio::sync::{mpsc, oneshot};
 
+const BOOT_ABORT_GRACE_MS: u64 = 300;
+
 pub enum Cmd {
     Boot {
         reply: oneshot::Sender<Result<(), String>>,
@@ -20,6 +22,8 @@ pub enum Cmd {
         role: String,
         env: String,
         pid: i64,
+        token: String,
+        reply: oneshot::Sender<Result<Value, String>>,
     },
     Snapshot {
         reply: oneshot::Sender<Snapshot>,
@@ -33,6 +37,9 @@ pub enum Cmd {
         reply: oneshot::Sender<Result<Value, String>>,
     },
     Stop {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    AbortBoot {
         reply: oneshot::Sender<Result<Value, String>>,
     },
     Subscribe {
@@ -76,6 +83,7 @@ struct Node {
     peer: Option<Peer>,
     sandbox: Option<Instance>,
     exited: Option<oneshot::Receiver<Option<i32>>>,
+    token: String,
 }
 
 pub struct Base {
@@ -162,7 +170,9 @@ impl Base {
                 role,
                 env,
                 pid,
-            } => self.on_register(peer, role, env, pid),
+                token,
+                reply,
+            } => self.on_register(peer, role, env, pid, token, reply),
             Cmd::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
             }
@@ -177,6 +187,10 @@ impl Base {
             Cmd::Stop { reply } => {
                 let _ = reply.send(Ok(json!({"ok": true})));
                 self.stop().await;
+            }
+            Cmd::AbortBoot { reply } => {
+                let _ = reply.send(Ok(json!({"ok": true})));
+                self.abort_boot().await;
             }
             Cmd::Subscribe { peer, env, reply } => {
                 let last = self.store.last_event_id().unwrap_or(0);
@@ -204,7 +218,8 @@ impl Base {
     fn start(&mut self, role: &str, env: &str) -> Result<(), String> {
         self.generation += 1;
         let generation = self.generation;
-        let spec = node::spec(&self.config, &self.home, role, env);
+        let token = crate::token::generate();
+        let spec = node::spec(&self.config, &self.home, role, env, token.clone());
         let running = node::spawn(
             &spec,
             &self.config,
@@ -227,6 +242,7 @@ impl Base {
                 peer: None,
                 sandbox,
                 exited: running.exited,
+                token,
             },
         );
         let _ = self
@@ -262,19 +278,42 @@ impl Base {
             .map_err(|error| error.to_string())
     }
 
-    fn on_register(&mut self, peer: Peer, role: String, env: String, pid: i64) {
+    fn on_register(
+        &mut self,
+        peer: Peer,
+        role: String,
+        env: String,
+        pid: i64,
+        token: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    ) {
         let Some(node) = self.nodes.get_mut(&env) else {
+            self.emit(
+                "node.register_rejected",
+                Some(&env),
+                json!({"reason": "unknown_env"}),
+            );
+            let _ = reply.send(Err("unknown_env".to_string()));
             return;
         };
+        if node.token != token || node.pid != Some(pid as i32) {
+            self.emit(
+                "node.register_rejected",
+                Some(&env),
+                json!({"role": role, "pid": pid}),
+            );
+            let _ = reply.send(Err("unauthorized".to_string()));
+            return;
+        }
         node.peer = Some(peer);
         node.registered = true;
-        node.pid = Some(pid as i32);
         let _ = self.store.put_env(&env, &role, Some(pid), "up");
         self.emit(
             "node.register",
             Some(&env),
             json!({"role": role, "pid": pid}),
         );
+        let _ = reply.send(Ok(json!({"ok": true})));
         if self.ready() && !self.promoted {
             self.promoted = true;
             let _ = self.store.checkpoint();
@@ -339,6 +378,10 @@ impl Base {
         if env == GUARDIAN {
             return Err("the guardian is not resettable".to_string());
         }
+        if !self.nodes.contains_key(env) {
+            return Err(format!("unknown env {env}"));
+        }
+        self.ensure_state_integrity();
         let Some(node) = self.nodes.get_mut(env) else {
             return Err(format!("unknown env {env}"));
         };
@@ -361,10 +404,49 @@ impl Base {
         Ok(json!({"ok": true, "env": env, "pid": fresh, "lkg": restored}))
     }
 
+    fn ensure_state_integrity(&mut self) {
+        let path = self.home.state_file();
+        let lkg = self.home.lkg_state_file();
+        match crate::integrity::restore_if_corrupt(&path, &lkg) {
+            Ok(false) => {}
+            Ok(true) => match Store::open(&path) {
+                Ok(store) => {
+                    self.store = store;
+                    self.emit("state.restored", None, json!({"from_lkg": lkg.is_file()}));
+                }
+                Err(error) => self.emit(
+                    "state.restore_failed",
+                    None,
+                    json!({"error": error.to_string()}),
+                ),
+            },
+            Err(error) => self.emit(
+                "state.restore_failed",
+                None,
+                json!({"error": error.to_string()}),
+            ),
+        }
+    }
+
     async fn stop(&mut self) {
         self.stopping = true;
         self.emit("base.stop", None, json!({"ok": true}));
-        let grace = Duration::from_millis(self.config.stop_grace_ms);
+        self.stop_nodes(Duration::from_millis(self.config.stop_grace_ms))
+            .await;
+    }
+
+    async fn abort_boot(&mut self) {
+        self.stopping = true;
+        self.emit(
+            "base.stop",
+            None,
+            json!({"ok": true, "reason": "boot_aborted"}),
+        );
+        self.stop_nodes(Duration::from_millis(BOOT_ABORT_GRACE_MS))
+            .await;
+    }
+
+    async fn stop_nodes(&mut self, grace: Duration) {
         let order: Vec<String> = self
             .nodes
             .keys()

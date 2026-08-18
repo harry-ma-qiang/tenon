@@ -71,9 +71,38 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `profiles/guardian/` | an empty entry list; G mounts only barebone plugins |
 | `erts/<version>-<sha>/` | the extracted BEAM release, read-only to base and to the nodes |
 | `run/base.sock` | the front door |
-| `run/base.ready` | holds the base pid while it is up; how `tenon start` waits |
+| `run/base.lock` | an exclusive `flock`, held for the life of the base process; guards against a second `start` |
+| `run/base.ready` | holds the base pid while it is up; how `tenon start` waits. Written atomically (temp file + rename) |
 | `run/{base,guardian,root}.log` | stdout and stderr of base and of each node |
 | `lkg/` | `config.yml`, `profiles/`, `state.sqlite` copied at every successful boot |
+
+## Double start, boot signals, state integrity, node auth
+
+Four properties an adversarial suite (`cli/tests/adversarial/`) checks beyond the happy path:
+
+- **One base per home.** `tenon start` takes an exclusive `flock` on `run/base.lock` before
+  touching anything else. A second `start` against a live home fails fast: it reads the pid
+  out of the lock file, prints `already running (pid N)` and exits non-zero without removing
+  the first base's socket or ready file. A lock left by a crashed base has no holder, so the
+  OS releases it the moment the crashed process is gone; the next `start` takes it over and
+  removes the stale `run/base.sock` and `run/base.ready` before doing anything else.
+- **SIGTERM/SIGINT during boot cleans up.** Signal handlers are installed before the guardian
+  or the root env is spawned, not after `base.ready` is written. A signal that lands while
+  base is still waiting on `node.register` kills whatever nodes are already up (SIGTERM, a
+  short grace, SIGKILL — shorter than `stop_grace_ms` since an unregistered node has no
+  connections worth protecting) and removes `run/base.sock` and `run/base.ready` before the
+  process exits.
+- **`state.sqlite` is checked, not just copied.** At boot and at every `reset`, base runs
+  `PRAGMA integrity_check` against `state.sqlite` (an unopenable or zero-length file counts as
+  corrupt too). A healthy file is left alone — recent events are never discarded. A corrupt
+  file is replaced from `lkg/state.sqlite` and a `state.restored` event is logged; without an
+  LKG copy to fall back on (first boot) the file is simply removed so a fresh schema is
+  created.
+- **`node.register` needs a token.** Base generates a random 32-byte token per spawned node and
+  passes it in `TENON_NODE_TOKEN`; the node's `node.register` must carry that token and the
+  exact OS pid base recorded for that role/env, or base rejects it with an error frame and logs
+  `node.register_rejected`. A registration from a plain CLI socket connection, which never has
+  the token, always fails this check.
 
 `config.yml`:
 
@@ -116,7 +145,7 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 
 | Method | From | What |
 |---|---|---|
-| `node.register{role,env,pid}` | node | the node is up; base records the OS pid it will signal |
+| `node.register{role,env,pid,token}` | node | the node is up; `token` must match the one base put in `TENON_NODE_TOKEN` for that role/env and `pid` must be the exact OS pid base spawned, or the request is rejected |
 | `health{env}` | guardian, CLI | forwarded to that env's node |
 | `tree{env}` | CLI | forwarded; the node's kernel tree |
 | `reload{env}` | CLI | forwarded; `Tenon.Loader.reload/1` in that node |
@@ -148,14 +177,25 @@ cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt 
 cargo test
 ```
 
-14 tests. `cli/tests/boot.rs` (7) drives the real binary against a temp `TENON_HOME`: the
-role stubs, a missing base, boot (both nodes registered, the guardian tree carrying
-`guardian` and `link`, the root tree carrying the demo plugin, the LKG written), `reset` (new
-pid for A, unchanged pid for G, the old process gone), `kill -9` base (both nodes gone inside
-5 s), `stop` (base and both nodes gone, socket and ready file removed) and an unexpected
-`SIGKILL` of A (base brings it back with `restarts: 1`). Without a release they print a skip
-line naming how to build one and pass. The unit tests are `storage` (3: append order,
-env upsert, the day-one pragmas), `sandbox` (2), `harness` and `worker` (1 each).
+14 tests plus a 19-test adversarial suite. `cli/tests/boot.rs` (7) drives the real binary
+against a temp `TENON_HOME`: the role stubs, a missing base, boot (both nodes registered, the
+guardian tree carrying `guardian` and `link`, the root tree carrying the demo plugin, the LKG
+written), `reset` (new pid for A, unchanged pid for G, the old process gone), `kill -9` base
+(both nodes gone inside 5 s), `stop` (base and both nodes gone, socket and ready file removed)
+and an unexpected `SIGKILL` of A (base brings it back with `restarts: 1`). Without a release
+they print a skip line naming how to build one and pass. The unit tests are `storage` (3:
+append order, env upsert, the day-one pragmas), `sandbox` (2), `harness`, `worker` and
+`base::token` (1 each).
+
+`cli/tests/adversarial/` (19, same skip-without-a-release rule) is the P3.0 hardening suite:
+double start refusal and survival of the first base, a crashed base's stale `run/` files
+recovered by the next start, a five-round reset storm with no orphaned pids, `stop` racing a
+`reset`, SIGTERM during boot leaving no zombie or orphaned BEAM process, twenty parallel
+`status` calls during a `reset`, a corrupt `profile` and a corrupt `state.sqlite` each
+restored from LKG on `reset`, guardian/env crash and restart-limit scenarios, a frozen agent
+reset by the guardian without SIGCONT confusing base afterwards, two `attach` subscribers and
+`--exit-on-detach`, and RPC abuse (garbage bytes, an oversized frame header, an unknown
+method, a half-open connection, a forged `node.register` from the CLI socket).
 
 ## Deviations from the RFC
 

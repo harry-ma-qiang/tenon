@@ -57,7 +57,8 @@ defmodule Tenon.Beam.Link.Server do
       "t" => "node.register",
       "role" => state.role,
       "env" => state.env,
-      "pid" => os_pid()
+      "pid" => os_pid(),
+      "token" => System.get_env("TENON_NODE_TOKEN", "")
     })
 
     {:reply, :ok, state}
