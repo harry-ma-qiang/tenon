@@ -413,3 +413,109 @@ async fn pre_execute_may_rewrite_the_arguments() {
         .collect();
     assert_eq!(waterfalls, vec!["tools/pre-execute", "tools/post-execute"]);
 }
+
+#[tokio::test]
+async fn every_step_writes_an_episode_with_its_action_and_cost() {
+    let server = fake::spawn(vec![
+        Say::Tool("bash".to_string(), json!({"cmd": "echo one"})),
+        Say::Text("done".to_string()),
+    ])
+    .await
+    .unwrap();
+    let world = world(&server.base_url);
+    world
+        .bus
+        .service("worker", "bash", Ok(json!({"status": 0, "tail": "one"})));
+    let id = session(&world).await;
+    world
+        .agent
+        .call(
+            "session.prompt",
+            &[json!({"session_id": id, "text": "run one"})],
+        )
+        .await
+        .unwrap();
+    support::settle("turn/end", || !world.log.of("turn/end").is_empty()).await;
+    let episodes = world.log.episodes();
+    assert_eq!(episodes.len(), 2, "one episode per step: {episodes:?}");
+    assert_eq!(episodes[0].session, id);
+    assert_eq!(episodes[0].step, 1);
+    assert_eq!(episodes[0].action[0]["name"], json!("bash"));
+    assert_eq!(episodes[0].verifier_score, 1.0);
+    assert_eq!(episodes[0].cost["total"], json!(18));
+    assert!(episodes[0].user_event > 0);
+    assert_eq!(episodes[1].step, 2);
+    assert_eq!(episodes[1].action, json!("respond"));
+    let rows = world.log.tools();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "bash");
+    assert_eq!(rows[0].status, "ok");
+    assert!(rows[0].blob_hash.is_none(), "a short output stays inline");
+    assert!(rows[0].event_id > 0);
+}
+
+#[tokio::test]
+async fn a_large_tool_output_goes_to_a_blob_the_row_references() {
+    let server = fake::spawn(vec![
+        Say::Tool("bash".to_string(), json!({"cmd": "spew"})),
+        Say::Text("done".to_string()),
+    ])
+    .await
+    .unwrap();
+    let world = world(&server.base_url);
+    let spew = "x".repeat(20_000);
+    world
+        .bus
+        .service("worker", "bash", Ok(json!({"status": 0, "tail": spew})));
+    let id = session(&world).await;
+    world
+        .agent
+        .call(
+            "session.prompt",
+            &[json!({"session_id": id, "text": "spew"})],
+        )
+        .await
+        .unwrap();
+    support::settle("turn/end", || !world.log.of("turn/end").is_empty()).await;
+    let stored = world.log.blobs.lock().unwrap().clone();
+    assert_eq!(stored.len(), 1, "the whole output is one blob");
+    assert!(stored[0].len() > 20_000);
+    let rows = world.log.tools();
+    assert_eq!(rows[0].blob_hash, Some(format!("blob{}", stored[0].len())));
+    let result = world.log.of("tool/result").pop().unwrap();
+    assert_eq!(result["blob"], json!(rows[0].blob_hash));
+    assert!(
+        result["text"].as_str().unwrap().len() < stored[0].len(),
+        "the model still sees the cut view, not the blob"
+    );
+}
+
+#[tokio::test]
+async fn a_denied_call_scores_the_step_zero() {
+    let server = fake::spawn(vec![
+        Say::Tool("bash".to_string(), json!({"cmd": "rm -rf /"})),
+        Say::Text("blocked".to_string()),
+    ])
+    .await
+    .unwrap();
+    let world = world(&server.base_url);
+    world
+        .bus
+        .hook("tools/pre-execute", json!({"deny": "not on my watch"}));
+    let id = session(&world).await;
+    world
+        .agent
+        .call(
+            "session.prompt",
+            &[json!({"session_id": id, "text": "delete it"})],
+        )
+        .await
+        .unwrap();
+    support::settle("turn/end", || !world.log.of("turn/end").is_empty()).await;
+    let rows = world.log.tools();
+    assert_eq!(rows[0].status, "denied");
+    assert!(rows[0].blob_hash.is_none());
+    let episodes = world.log.episodes();
+    assert_eq!(episodes[0].verifier_score, 0.0);
+    assert_eq!(episodes[1].verifier_score, 1.0);
+}

@@ -19,7 +19,7 @@ tenon start                      the base process
 | Crate | What |
 |---|---|
 | `base` | home layout, config, UDS RPC server, the node supervisor actor, LKG, release payload |
-| `storage` | `state.sqlite`: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, `events`, `envs` |
+| `storage` | the state files: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, versioned schema, `events`, `envs`, `packs`, `snapshots`, `tool_results`, `blobs`, `episodes`, `memory_*`, `embeddings`, `approvals`, retention |
 | `sandbox` | the `Sandbox` trait plus `none`, `oci` (podman/docker) and `landlock` backends; `krun` is a P3.6 placeholder |
 | `harness` | the `tenon harness` role (P3.3): the agent loop, the llm adapter, the session log, the tools bus and the management tools, one host process per env |
 | `worker` | the `tenon worker` role (P3.2): one resident process inside the sandbox serving `bash`, `pty.*`, `fs.*` and `snap.*` over the wire |
@@ -75,7 +75,7 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `run/base.ready` | holds the base pid while it is up; how `tenon start` waits. Written atomically (temp file + rename) |
 | `run/{base,guardian,root}.log` | stdout and stderr of base and of each node |
 | `run/gw-<env>/gateway.sock` | that env's `TENON_GATEWAY` unix socket. One directory per env, because the oci backend bind-mounts the socket's **directory**: a shared `run/` would put base's front door and every sibling's gateway inside every sandbox |
-| `state-<env>.sqlite` | that env's state file: the `packs` table of workspace snapshots pulled off its worker, and the `events` table its harness appends the session log to |
+| `state-<env>.sqlite` | that env's state file: the `events` session log its harness appends to, the `packs`/`snapshots` of workspace snapshots pulled off its worker, and the `tool_results`, `blobs`, `episodes` and `approvals` the loop records beside them (see "Storage and the control plane") |
 | `profiles/<env>/harness.yml` | that env's harness overlay: provider, model, the *name* of the key variable, `max_steps`, `approval`. Written with defaults on first start, patched through `config.patch` |
 | `config-snapshots/<env>/harness-<ms>.yml` | the copy `config.patch` takes before every change |
 | `run/harness-<env>.log` | stdout and stderr of that env's harness process |
@@ -131,6 +131,11 @@ envs:
   max_total: 8             # agent environments alive at once, the whole tree
   max_depth: 3             # root is depth 0, so a depth-4 spawn is refused
   ram_mb: 512              # per-env sandbox memory cap for spawned children
+retention:
+  keep_steps: 40           # newest snapshot steps state.retain keeps
+  milestone_every: 10      # plus every Mth step, forever
+  keep_events: 0           # 0 = keep the whole session log; N = keep the last N rows
+  blob_grace_ms: 60000     # an unreferenced blob younger than this is left alone
 ```
 
 The default profile mounts `plugins/term`'s release binary if it is built, otherwise
@@ -325,6 +330,75 @@ worker  --snap.pack{since}-->  base  -->  state-<env>.sqlite  packs(step, ref, b
   checks the newest ref out. Committed files come back; uncommitted and ignored ones do
   not, by design.
 - `snap.list{env}` on the front door shows what the host holds (step, ref, size, time).
+
+## Storage and the control plane (P3.4)
+
+One SQLite file per env (plus the barebone's own), one writer, every table of RFC section 9
+in it. The harness never opens sqlite: it sends frames to base, which owns the file. `G` and
+the CLI read the same rows.
+
+| Table | Columns | Written by |
+|---|---|---|
+| `schema_version` | `version, at` | `Store::open`, forward only |
+| `events` | `id, at, kind, env, data` | base (`emit`) and the harness (`events.append`); the session log, the version history |
+| `envs` | `name, role, pid, status, at, parent, depth` | base, on every node state change |
+| `packs` | `step, ref, bytes, created_at` | base, per `snap.pull` off that env's worker |
+| `snapshots` | `step, ref, created_at` | base, with every pack: the same index without the payload |
+| `tool_results` | `id, event_id, name, status, duration_ms, blob_hash, created_at` | the harness, one row per tool call |
+| `blobs` | `sha256, bytes, size, created_at` | the harness (large tool outputs), deduplicated by hash |
+| `episodes` | `id, session_id, step, state_hash, action, verifier_score, cost, created_at` | the harness, one row per step |
+| `approvals` | `id, env, reason, status, created_at, decided_at` | base, on every `approval.request` |
+| `memory_nodes` | `id, kind, text, confidence, outcomes, created_at, updated_at` | nobody yet (P5) |
+| `memory_edges` | `src, dst, rel, confidence` | nobody yet (P5) |
+| `embeddings` | `node_id, model, vector, dims` | nobody yet (P5) |
+
+**Versioning is forward only.** `schema_version` holds the highest step applied; a file
+written before it existed reports 0 and is walked through every step on the next `open`.
+Every step is `create table if not exists`, so replaying step 1 over a P3.2 file only
+stamps the row; the two columns P3.2 added to `envs` are still `alter table` attempts whose
+duplicate-column error means "already there". `state.sqlite` and every `state-<env>.sqlite`
+share one schema — the barebone uses three of the tables, an env uses all of them.
+
+**Blobs are the escape hatch for size.** `put(bytes)` hashes with sha256 and inserts or
+ignores, so the same output stored twice is one row; `get` reads the whole thing and
+`open{offset, len}` is SQLite's `blob_open`, a window read that never materialises the row.
+A tool output between 4 KB and 700 KB goes to a blob whole and the `tool_results` row
+carries its hash, while the model keeps seeing the tools bus's cut view of it (8000
+characters plus `[truncated]`) — the blob is for a reader that wants the rest, not for the
+context window. The upper bound is the frame cap: base64 inflates by a third and a base
+frame is 1 MiB, so a larger result keeps its `tool_results` row and loses only the blob. The
+worker spills its own oversized outputs to files well below that, so nothing observed here
+reaches the bound.
+
+**Episodes are written by the loop from day one** so the navigator (P5/P6) has data before
+it exists. One row per step, with:
+
+- `state_hash` — 16 hex chars of `sha256(newest snapshot ref : id of the user message being
+  answered)`. Base computes it, because base is what holds the workspace history.
+- `action` — the tool calls of that step (`[{name, arguments}]`), or `"respond"`.
+- `verifier_score` — **a placeholder**: 1.0 when every tool call of the step came back ok
+  (a step that only answers counts as ok), 0.0 otherwise. A real verifier is P5/P6 work.
+- `cost` — that step's token usage, as the llm adapter reported it.
+
+**Retention is `state.retain{env}`**, running the `retention:` block of `config.yml` against
+one env's file: keep the newest `keep_steps` snapshot steps, every `milestone_every`-th step
+and whatever the newest ref (the LKG proxy) points at; drop the rest of `packs` and
+`snapshots`; if `keep_events` is non-zero, keep only that many of the newest events and drop
+the `tool_results` rows whose event is gone; then drop every blob nothing references any
+more that is older than `blob_grace_ms`; then `pragma incremental_vacuum`. `keep_events` is
+0 by default: the log is the version history, and a bounded file is a choice. `episodes` are
+never pruned. New files are created with `auto_vacuum=INCREMENTAL`, so the vacuum gives
+pages back without ever rewriting the file; a file created before P3.4 keeps whatever it was
+created with and needs a full `vacuum` once for that to take.
+
+```
+harness                         base                       state-<env>.sqlite
+  tool call --> events.append -----> events (id N)
+            --> blobs.put ---------> blobs (sha256)          (only when > 4 KB)
+            --> tool_results.append -> tool_results (event N, hash)
+  step done --> episodes.append ---> episodes (state_hash, action, score, cost)
+  reader    <-- episodes.tail{n} / blobs.get{hash,offset?,len?} / state.retain
+```
 
 ## The environment tree (`runtime.spawn`)
 
@@ -524,6 +598,13 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `session.create{env}` / `session.prompt{env,session_id,text}` / `session.status` / `session.history` / `session.resume` | CLI | forwarded to that env's harness as `svc{name: "loop"}`; how `tenon run` drives the agent |
 | `events.append{env,kind,data}` | harness | one row in `state-<env>.sqlite`'s `events`, fanned out to every subscriber as an `{"t":"event","scope":"env"}` frame. Base is that file's only writer |
 | `events.tail{env,after?,limit?}` | harness, CLI | that env's session log from `after` on |
+| `episodes.append{env,session_id,step,action,verifier_score?,cost,user_event?,state_hash?}` | harness | one `episodes` row; the state hash is computed here from the newest snapshot ref and `user_event` unless one is given |
+| `episodes.tail{env,n?}` | CLI, plugins | the newest `n` episodes (default 200, capped at 5000), oldest first |
+| `tool_results.append{env,event_id,name,status,duration_ms,blob_hash?}` | harness | one `tool_results` row against a `tool/result` event |
+| `tool_results.tail{env,n?}` | CLI, plugins | the newest `n` tool result rows |
+| `blobs.put{env,data}` | harness | store base64 `data`; answers `{hash, size}`, deduplicated by content |
+| `blobs.get{env,hash,offset?,len?}` | harness, CLI | the blob as base64; with `offset`/`len` it is an incremental window read |
+| `state.retain{env}` | CLI, plugins | run the `retention:` policy against that env's file; answers `{removed, left}` and emits `state.retain` |
 | `config.get{env}` | harness, CLI | the env's harness overlay plus the paths it lives at |
 | `config.patch{env,patch}` | harness, CLI | snapshot `profiles/<env>/harness.yml` into `config-snapshots/<env>/`, merge the patch, ask the node to `reload`; answers `{snapshot, harness, reload}` |
 | `approval.request{env,reason}` | harness, CLI | the P3.5 stub: `{status: "denied", reason: "approvals not enabled"}` unless the env's overlay says `approval: auto` |
@@ -566,13 +647,36 @@ cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt 
 TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test
 ```
 
-91 tests: `sandbox` unit 5, `boot.rs` 8, `storage` 5, `base` unit 2
+104 tests in the crates below (`cargo test` prints 128: `rs/ui` brings its own 24, covered by
+its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 2
 (`token`, and `home::hash` — stable per home, distinct across homes), the 20-test
 adversarial suite, `sandbox`'s 2-test conformance suite, the 1-test gateway gate, the
 P3.2 worker suites (`worker/tests/fs_test.rs` 9, `snap_test.rs` 9, `pty_test.rs` 10,
 `cli/tests/worker_wire.rs` 3), the two P3.2 gates (`cli/tests/worker_boot.rs` 1,
-`cli/tests/spawn_gate.rs` 1) and the P3.3 suites (`harness/tests/llm_test.rs` 5,
-`loop_test.rs` 8, `cli/tests/harness_gate.rs` 1, `harness_model.rs` 1).
+`cli/tests/spawn_gate.rs` 1), the P3.3 suites (`harness/tests/llm_test.rs` 5,
+`loop_test.rs` 11, `cli/tests/harness_gate.rs` 1, `harness_model.rs` 1) and the P3.4 gate
+(`cli/tests/storage_gate.rs` 1).
+
+`storage` (14) is one test per table plus two the phase is about: `retain` over 100 packs
+keeping exactly the newest five, every tenth and one LKG ref (and dropping the 85 others
+with their snapshot rows), and a file built by hand in the pre-`schema_version` shape that
+comes back migrated with its old rows intact and its new tables usable. The rest are round
+trips: events in order, env upserts and the parent/depth tree, packs by step with their
+snapshot index, blob dedup plus a windowed `open` past the end of the row, episodes queried
+by session and as a tail, memory nodes/edges/embeddings (including the f32 round trip and
+the cascade when a node is dropped), approvals from pending to a verdict and to expired, and
+the day-one pragmas including `auto_vacuum=INCREMENTAL`.
+
+`cli/tests/storage_gate.rs` (1, skipped without oci or a release) is the P3.4 gate: one
+`tenon run` against a fake model whose scripted `bash` prints 20 000 characters, then four
+assertions on what the loop recorded. `episodes.tail` shows one episode per step — step 1
+with the `bash` action, step 2 with `"respond"`, both with the step's token cost and a
+16-char state hash; the `tool_results` row for the call carries a `blob_hash`, `blobs.get`
+returns the whole 20 KB and `blobs.get{offset, len}` the same bytes as a window, while the
+`tool/result` event carries only the cut view; `session.history` matches a fold over
+`events.tail` row for row; and after 100 recorded steps and a dozen real worker packs,
+`state.retain` leaves exactly the pack steps the test computes from the policy itself, the
+last 50 events, no blob whose tool result was pruned, and all 102 episodes. 17 s here.
 `cli/tests/boot.rs` (8)
 drives the real binary against a temp `TENON_HOME`: `tenon harness` without a
 `TENON_BASE_SOCK` (exit 2, the reason on stderr), a `tenon
@@ -728,11 +832,13 @@ accumulate across CI runs.
 4. **`reset` answers as soon as the old node is dead and the new one is spawned**, not when
    it has registered. That keeps the answer inside the requesting node's deadline and keeps
    the actor free; `status` reports `registered: false` until the node is back.
-5. **`events`, `envs` and `packs` exist.** `packs(step, ref, bytes, created_at)` arrived with
-   P3.2 and lives in the **per-env** `state-<env>.sqlite`, not in the barebone's
+5. **The schema is complete and versioned.** `packs(step, ref, bytes, created_at)` arrived
+   with P3.2 and lives in the **per-env** `state-<env>.sqlite`, not in the barebone's
    `state.sqlite`; `envs` gained `parent` and `depth` (migrated with `alter table` for homes
-   written before P3.2). `tool_results`, `snapshots`, `blobs`, `memory_*`, `embeddings` and
-   `episodes` still arrive with the phases that write them (P3.3-P3.4).
+   written before P3.2). P3.4 added `schema_version` and the rest of RFC section 9:
+   `tool_results`, `snapshots`, `blobs`, `episodes`, `approvals`, `memory_nodes`,
+   `memory_edges`, `embeddings`. Both files get the same schema; which tables an env
+   actually uses is what differs.
 6. **The sandbox is on the boot path already.** Base resolves `config.sandbox` and spawns one
    instance per env through the trait, so P3.1 replaces a backend rather than adding a seam.
    The `none` backend hands back a `Direct` endpoint and is not isolation of any kind.
@@ -854,3 +960,40 @@ accumulate across CI runs.
     `Tenon.Beam.Registry.spec/1` appends `{"TENON_GATEWAY", false}` to every spawned
     plugin's env; `Link` also answers `svc` and `plugin` requests from a spawned process now,
     so a minute-long tool call cannot block the guardian's health probes.
+
+27. **Retention prunes the event log only when asked.** `keep_events` defaults to 0, so
+    `state.retain` touches `packs`, `snapshots` and unreferenced `blobs` and leaves `events`
+    alone. RFC section 9 makes `events` the version history and RFC section 8 only asks for
+    growth control over the workspace history; a host that wants a bounded file sets the
+    knob, and only then are the `tool_results` rows of dropped events (and the blobs they
+    were the last reference to) dropped with them. `episodes` are never pruned at all: they
+    are the navigator's training data and they are tiny.
+28. **Blobs travel base64 over the front door.** The frame protocol is JSON, so `blobs.put`
+    takes and `blobs.get` answers base64 rather than raw bytes; the harness encodes once per
+    oversized tool output. `blobs.get{offset, len}` is the incremental read, so a reader that
+    wants a 100 MB blob pages it rather than decoding it whole.
+29. **Base computes `episodes.state_hash`, not the harness.** The hash folds the newest
+    snapshot ref and the id of the user message being answered, and base is what holds both;
+    computing it in the harness would cost a `snap.list` round trip per step. The harness may
+    still send an explicit `state_hash` and base will store that instead.
+30. **`verifier_score` is a documented placeholder.** 1.0 when every tool call of the step
+    came back ok, 0.0 otherwise. It is not a judgement of whether the step helped; the real
+    verifier is P5/P6 work and the column is here so the rows exist before it does.
+31. **The seven P3.4 methods share one `Cmd::Records` variant.** `episodes.*`,
+    `tool_results.*`, `blobs.*` and `state.retain` are all "one env's state file, one
+    accessor, one JSON answer"; spelling each as its own `Cmd` would be seven identical
+    shapes for no extra safety. The front door still names them individually.
+32. **The model sees the head of a large tool result, not its tail.** The RFC's phrasing
+    ("the model still sees the tail") is about the model keeping a bounded excerpt while the
+    whole output goes to a blob. What the tools bus has cut since P3.3 is the head — the
+    first 8000 characters plus `[truncated]` — and P3.4 did not change that, so a `bash`
+    call's beginning is what reaches the context and `blobs.get{hash}` is what reaches the
+    rest. Making the excerpt a tail (or both ends) is a one-line change in `Outcome::text`
+    whenever a task shows it matters.
+33. **`state.retain` runs on demand, not on a timer.** `keep_packs` already bounds `packs`
+    per pull, so nothing grows unbounded between calls; the policy pass is a frame the CLI,
+    a plugin or (from P3.7) the change protocol sends. A timer would be four lines in base
+    and is deliberately not there until something needs it.
+34. **`memory_nodes`, `memory_edges` and `embeddings` have accessors and tests but no
+    writer.** They are P5's tables; creating them now is what keeps that plugin a reader of
+    an existing file rather than a migration of a live one.

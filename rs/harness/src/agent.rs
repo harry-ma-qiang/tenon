@@ -1,4 +1,4 @@
-use crate::bus::{Answer, Bus, Log};
+use crate::bus::{Answer, Bus, EpisodeRow, Log, ToolRow};
 use crate::llm::{self, Client, Reply, Usage};
 use crate::prompt::Prompt;
 use crate::tools::Tools;
@@ -9,6 +9,18 @@ use std::sync::{Arc, Mutex};
 
 const HISTORY_LIMIT: i64 = 5_000;
 
+/// A tool output longer than this goes to `blobs` whole and is referenced from
+/// the `tool_results` row by hash. The model keeps seeing the truncated view
+/// the tools bus produces, not the blob.
+const BLOB_MIN: usize = 4_096;
+
+/// Base64 inflates by a third and a base frame is capped at 1 MiB, so anything
+/// above this could not be put in one frame. The worker spills its own big
+/// outputs to files well below that, which is what keeps this unreachable in
+/// practice; a result that still lands here keeps its `tool_results` row and
+/// loses only the blob.
+const BLOB_MAX: usize = 700_000;
+
 #[derive(Default)]
 struct Session {
     messages: Vec<Value>,
@@ -18,6 +30,7 @@ struct Session {
     steps: u64,
     usage: Usage,
     last: String,
+    user_event: i64,
 }
 
 /// The agent loop as a plugin (seam 8): one turn per prompt, one step per model
@@ -152,15 +165,19 @@ impl Agent {
         let events = self.log.tail(0, HISTORY_LIMIT).await?;
         let mut messages: Vec<Value> = Vec::new();
         let mut turns = 0u64;
+        let mut user_event = 0i64;
         for event in events {
             if event.data.get("session").and_then(Value::as_str) != Some(id) {
                 continue;
             }
             match event.kind.as_str() {
-                "user/message" => messages.push(json!({
-                    "role": "user",
-                    "content": event.data.get("text").cloned().unwrap_or(json!("")),
-                })),
+                "user/message" => {
+                    user_event = event.id;
+                    messages.push(json!({
+                        "role": "user",
+                        "content": event.data.get("text").cloned().unwrap_or(json!("")),
+                    }));
+                }
                 "assistant/message" => {
                     if let Some(message) = event.data.get("message") {
                         messages.push(message.clone());
@@ -180,6 +197,7 @@ impl Agent {
         let session = sessions.entry(id.to_string()).or_default();
         session.messages = messages;
         session.turns = turns;
+        session.user_event = user_event;
         Ok(json!({"session_id": id, "messages": count, "turns": turns}))
     }
 
@@ -197,7 +215,10 @@ impl Agent {
             session.running = true;
             start
         };
-        self.event(id, "user/message", json!({"text": text})).await;
+        let event = self.event(id, "user/message", json!({"text": text})).await;
+        if let Some(session) = self.sessions.lock().expect("session lock").get_mut(id) {
+            session.user_event = event;
+        }
         if start {
             let agent = self.clone();
             let id = id.to_string();
@@ -269,8 +290,9 @@ impl Agent {
             let reply = self.step(id, step).await?;
             answer = reply.content.clone();
             let calls = reply.tool_calls.clone();
+            let mut all_ok = true;
             for call in &calls {
-                self.tool(id, call).await;
+                all_ok &= self.tool(id, call).await;
             }
             self.event(
                 id,
@@ -278,6 +300,8 @@ impl Agent {
                 json!({"turn": turn, "step": step, "tool_calls": calls.len()}),
             )
             .await;
+            self.episode(id, step as i64, &calls, all_ok, reply.usage.json())
+                .await;
             if calls.is_empty() && self.stopping(id, turn, step, &answer).await {
                 return Ok(answer);
             }
@@ -364,7 +388,11 @@ impl Agent {
         Ok(reply)
     }
 
-    async fn tool(&self, id: &str, call: &Value) {
+    /// Returns whether the call succeeded, which is what the step's episode
+    /// scores. The whole output goes to `blobs` when it is large; the model
+    /// still sees the tools bus's truncated view of it.
+    async fn tool(&self, id: &str, call: &Value) -> bool {
+        let started = std::time::Instant::now();
         let call_id = call["id"].as_str().unwrap_or_default().to_string();
         let name = call["function"]["name"]
             .as_str()
@@ -383,18 +411,51 @@ impl Agent {
         .await;
         let outcome = self.tools.execute(&name, args, Some(call_id.clone())).await;
         let text = outcome.text();
-        self.event(
-            id,
-            "tool/result",
-            json!({
-                "id": call_id,
-                "name": name,
-                "ok": outcome.ok,
-                "denied": outcome.denied,
-                "text": text,
-            }),
-        )
-        .await;
+        let whole = outcome.body();
+        let hash = match (BLOB_MIN..=BLOB_MAX).contains(&whole.len()) {
+            true => match self.log.blob(whole.into_bytes()).await {
+                Ok(hash) => Some(hash),
+                Err(error) => {
+                    self.bus
+                        .log(format!("tenon harness: output not stored: {error}"));
+                    None
+                }
+            },
+            false => None,
+        };
+        let event = self
+            .event(
+                id,
+                "tool/result",
+                json!({
+                    "id": call_id,
+                    "name": name,
+                    "ok": outcome.ok,
+                    "denied": outcome.denied,
+                    "text": text,
+                    "blob": hash,
+                }),
+            )
+            .await;
+        let status = match (outcome.ok, outcome.denied) {
+            (_, true) => "denied",
+            (true, _) => "ok",
+            (false, _) => "error",
+        };
+        if let Err(error) = self
+            .log
+            .tool_result(ToolRow {
+                event_id: event,
+                name: name.clone(),
+                status: status.to_string(),
+                duration_ms: started.elapsed().as_millis() as i64,
+                blob_hash: hash,
+            })
+            .await
+        {
+            self.bus
+                .log(format!("tenon harness: tool result not recorded: {error}"));
+        }
         let mut sessions = self.sessions.lock().expect("session lock");
         if let Some(session) = sessions.get_mut(id) {
             session.messages.push(json!({
@@ -402,6 +463,46 @@ impl Agent {
                 "tool_call_id": call_id,
                 "content": text,
             }));
+        }
+        outcome.ok && !outcome.denied
+    }
+
+    /// One `episodes` row per step, written from day one so the navigator has
+    /// data before it exists. The verifier is a placeholder: 1.0 when every
+    /// tool call of the step came back ok (a step that only answers counts as
+    /// ok), 0.0 otherwise. A real verifier arrives with P5/P6.
+    async fn episode(&self, id: &str, step: i64, calls: &[Value], all_ok: bool, cost: Value) {
+        let action = match calls.is_empty() {
+            true => json!("respond"),
+            false => json!(calls
+                .iter()
+                .map(|call| json!({
+                    "name": call["function"]["name"],
+                    "arguments": call["function"]["arguments"],
+                }))
+                .collect::<Vec<Value>>()),
+        };
+        let user_event = self
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(id)
+            .map(|session| session.user_event)
+            .unwrap_or(0);
+        let row = EpisodeRow {
+            session: id.to_string(),
+            step,
+            action,
+            verifier_score: match all_ok {
+                true => 1.0,
+                false => 0.0,
+            },
+            cost,
+            user_event,
+        };
+        if let Err(error) = self.log.episode(row).await {
+            self.bus
+                .log(format!("tenon harness: episode not recorded: {error}"));
         }
     }
 
@@ -432,13 +533,19 @@ impl Agent {
         true
     }
 
-    async fn event(&self, id: &str, kind: &str, mut data: Value) {
+    /// Answers with the row id the log gave the event, which is what a
+    /// `tool_results` row points at and what an episode's state hash folds in.
+    async fn event(&self, id: &str, kind: &str, mut data: Value) -> i64 {
         if let Some(object) = data.as_object_mut() {
             object.insert("session".to_string(), json!(id));
         }
-        if let Err(error) = self.log.append(kind, data).await {
-            self.bus
-                .log(format!("tenon harness: event {kind} not logged: {error}"));
+        match self.log.append(kind, data).await {
+            Ok(row) => row,
+            Err(error) => {
+                self.bus
+                    .log(format!("tenon harness: event {kind} not logged: {error}"));
+                0
+            }
         }
     }
 }

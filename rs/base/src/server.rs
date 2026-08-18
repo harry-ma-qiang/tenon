@@ -100,6 +100,23 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             })
             .await
         }
+        "episodes.append"
+        | "episodes.tail"
+        | "tool_results.append"
+        | "tool_results.tail"
+        | "blobs.put"
+        | "blobs.get"
+        | "state.retain" => {
+            let params = body.clone();
+            let method = method.to_string();
+            ask(cmds, |reply| Cmd::Records {
+                env,
+                method,
+                params,
+                reply,
+            })
+            .await
+        }
         "config.get" => ask(cmds, |reply| Cmd::ConfigGet { env, reply }).await,
         "config.patch" => {
             let patch = body.get("patch").cloned().unwrap_or_else(|| json!({}));

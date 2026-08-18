@@ -20,5 +20,6 @@ tenon-harness = { path = "../harness" }
 tenon-worker = { path = "../worker" }
 
 [dev-dependencies]
+base64.workspace = true
 libc.workspace = true
 tenon-harness = { path = "../harness" }

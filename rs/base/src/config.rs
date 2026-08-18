@@ -20,6 +20,21 @@ pub struct Worker {
     pub keep_packs: i64,
 }
 
+/// RFC section 8's growth control, as the host's own knob. `keep_events` is 0
+/// by default: the event log is the version history and a bounded file is a
+/// choice, not the default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Retention {
+    #[serde(default = "keep_steps")]
+    pub keep_steps: i64,
+    #[serde(default = "milestone_every")]
+    pub milestone_every: i64,
+    #[serde(default = "keep_events")]
+    pub keep_events: i64,
+    #[serde(default = "blob_grace_ms")]
+    pub blob_grace_ms: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Envs {
     #[serde(default = "max_total")]
@@ -50,6 +65,8 @@ pub struct Config {
     pub worker: Worker,
     #[serde(default)]
     pub envs: Envs,
+    #[serde(default)]
+    pub retention: Retention,
 }
 
 fn root_env() -> String {
@@ -86,6 +103,22 @@ fn pull_interval_ms() -> u64 {
 
 fn keep_packs() -> i64 {
     40
+}
+
+fn keep_steps() -> i64 {
+    40
+}
+
+fn milestone_every() -> i64 {
+    10
+}
+
+fn keep_events() -> i64 {
+    0
+}
+
+fn blob_grace_ms() -> i64 {
+    60_000
 }
 
 fn max_total() -> usize {
@@ -127,6 +160,17 @@ impl Default for Worker {
     }
 }
 
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            keep_steps: keep_steps(),
+            milestone_every: milestone_every(),
+            keep_events: keep_events(),
+            blob_grace_ms: blob_grace_ms(),
+        }
+    }
+}
+
 impl Default for Envs {
     fn default() -> Self {
         Self {
@@ -149,6 +193,7 @@ impl Default for Config {
             guardian: Guardian::default(),
             worker: Worker::default(),
             envs: Envs::default(),
+            retention: Retention::default(),
         }
     }
 }

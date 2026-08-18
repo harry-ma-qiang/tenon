@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tenon_harness::bus::{Answer, BoxFut, Bus, Event, Log};
+use tenon_harness::bus::{Answer, BoxFut, Bus, EpisodeRow, Event, Log, ToolRow};
 
 #[derive(Default)]
 pub struct FakeBus {
@@ -72,6 +72,9 @@ impl Bus for FakeBus {
 #[derive(Default)]
 pub struct MemLog {
     pub rows: Mutex<Vec<Event>>,
+    pub episodes: Mutex<Vec<EpisodeRow>>,
+    pub tools: Mutex<Vec<ToolRow>>,
+    pub blobs: Mutex<Vec<Vec<u8>>>,
 }
 
 impl MemLog {
@@ -106,11 +109,39 @@ impl MemLog {
     }
 }
 
+impl MemLog {
+    pub fn episodes(&self) -> Vec<EpisodeRow> {
+        self.episodes.lock().unwrap().clone()
+    }
+
+    pub fn tools(&self) -> Vec<ToolRow> {
+        self.tools.lock().unwrap().clone()
+    }
+}
+
 impl Log for MemLog {
     fn append<'a>(&'a self, kind: &str, data: Value) -> BoxFut<'a, Result<i64, String>> {
         self.seed(kind, data);
         let id = self.rows.lock().unwrap().len() as i64;
         Box::pin(async move { Ok(id) })
+    }
+
+    fn episode<'a>(&'a self, row: EpisodeRow) -> BoxFut<'a, Result<i64, String>> {
+        self.episodes.lock().unwrap().push(row);
+        let id = self.episodes.lock().unwrap().len() as i64;
+        Box::pin(async move { Ok(id) })
+    }
+
+    fn tool_result<'a>(&'a self, row: ToolRow) -> BoxFut<'a, Result<i64, String>> {
+        self.tools.lock().unwrap().push(row);
+        let id = self.tools.lock().unwrap().len() as i64;
+        Box::pin(async move { Ok(id) })
+    }
+
+    fn blob<'a>(&'a self, bytes: Vec<u8>) -> BoxFut<'a, Result<String, String>> {
+        let hash = format!("blob{}", bytes.len());
+        self.blobs.lock().unwrap().push(bytes);
+        Box::pin(async move { Ok(hash) })
     }
 
     fn tail<'a>(&'a self, after: i64, limit: i64) -> BoxFut<'a, Result<Vec<Event>, String>> {
