@@ -918,3 +918,122 @@ untouched.
 
 P3.4: the storage crate and the rest of the schema — `tool_results`, `snapshots`, `blobs`,
 `episodes` written by the loop from day one, so the navigator has data before it exists.
+
+## 24. P3.4 result: the storage schema, blobs, episodes and retention (2026-08-18)
+
+The P3.4 row of the plan. `rs/storage` was 358 lines holding three tables; it is now nine
+files holding all of RFC section 9, with a versioned schema, content-addressed blobs, a
+retention policy and typed accessors for every table. The loop writes an `episodes` row per
+step and a `tool_results` row per tool call from day one, through base, so the navigator
+that does not exist yet will find data when it arrives.
+
+### Lines
+
+| Part | LoC |
+|---|---|
+| `rs/storage/src/{lib,schema,events,packs,blobs,episodes,memory,approvals,retain}.rs` | 91+151+133+179+121+90+178+93+98 = 1134 |
+| `rs/storage/src/tests.rs` | 410 |
+| `rs/base/src/{envrpc,config,rpc,server,base}.rs` (touched) | 424+218+175+333+573 |
+| `rs/harness/src/{agent,api,bus,tools}.rs` (touched) | 551+212+81+426 |
+| `rs/cli/tests/storage_gate.rs` | 443 |
+| `rs/harness/tests/{loop_test,support}.rs` (touched) | 521+183 |
+
+New this phase: ~1050 lines of storage (against the RFC's 0.5k estimate for the crate, which
+counted the three tables it already had), ~240 of base RPC, ~110 of harness write paths and
+~640 of tests. Every file is under the 600-line ceiling; storage stayed there by splitting
+per table rather than growing one `lib.rs`.
+
+### The schema is one file for two roles
+
+`state.sqlite` (the barebone's) and `state-<env>.sqlite` (per env) get the same schema.
+Which tables each uses differs — base writes `events`, `envs`, `packs`, `snapshots` and
+`approvals`; the harness writes `events`, `tool_results`, `blobs` and `episodes` — but one
+migration path is one thing to get right. `schema_version` is forward only: a file written
+before it existed reports 0 and is walked through every step, and every step is `create
+table if not exists`, so replaying step 1 over a P3.2 file only stamps the row. The two
+columns P3.2 added to `envs` stay `alter table` attempts whose duplicate-column error means
+"already there". A unit test builds a pre-P3.4 file by hand, opens it, and asserts the old
+rows survive while the new tables work.
+
+### Blobs, and the two bounds around them
+
+`put(bytes)` is sha256 plus `insert or ignore`, so the same output twice is one row. `get`
+reads it whole; `open{offset, len}` is SQLite's `blob_open`, the window read that never
+materialises the row — the reason RFC section 9 says "no blob directories" and means it.
+A tool output goes to a blob when it is over 4 KB and under 700 KB: the lower bound is what
+makes it worth a row, the upper is the 1 MiB frame cap and base64's third of inflation. The
+worker already spills its own oversized outputs to files below that, so the upper bound is
+unreachable in practice; a result that reached it would keep its `tool_results` row and lose
+only the blob. The model keeps seeing the tools bus's cut view either way.
+
+### Episodes, and an honest placeholder
+
+One row per step: `state_hash`, `action`, `verifier_score`, `cost`. Base computes the state
+hash (16 hex chars of `sha256(newest snapshot ref : id of the user message being answered)`)
+because base is what holds the workspace history — computing it in the harness would cost a
+`snap.list` round trip per step. `action` is the step's tool calls or `"respond"`. `cost` is
+that step's token usage as the llm adapter reported it. `verifier_score` is a **placeholder
+and is documented as one**: 1.0 when every tool call of the step came back ok, 0.0
+otherwise. It says nothing about whether the step helped. Writing the column now is the
+point — P5/P6 replace the function, not the schema.
+
+### Retention: what a policy is allowed to delete
+
+`state.retain{env}` runs the `retention:` block of `config.yml` against one env's file:
+keep the newest `keep_steps` snapshot steps, every `milestone_every`-th step and whatever
+the newest ref points at; drop the rest of `packs` and `snapshots`; if `keep_events` is
+non-zero keep only that many newest events and drop the `tool_results` rows whose event is
+gone; drop every blob nothing references any more that is older than `blob_grace_ms`; then
+`pragma incremental_vacuum`. Three deliberate choices: `keep_events` is 0 by default because
+`events` is the version history and a bounded log is a decision, not a default; `episodes`
+are never pruned because they are the training data and they are tiny; and the blob grace
+period exists because the harness puts a blob in one frame and writes the row referencing it
+in the next, so a retention pass in between must not win that race. New files are created
+with `auto_vacuum=INCREMENTAL`; an older file keeps what it was created with and needs one
+full `vacuum` for the pragma to take, which is stated rather than papered over.
+
+### The harness still never opens sqlite
+
+Seven new front-door methods — `episodes.append/tail`, `tool_results.append/tail`,
+`blobs.put/get`, `state.retain` — carry everything the loop records. They share one
+`Cmd::Records` variant inside base rather than seven identical ones. Blobs travel base64,
+which is what a JSON frame protocol allows; `blobs.get{offset, len}` is the incremental read
+for anything a reader does not want whole.
+
+### Gates
+
+`cargo build --release`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+clean. `TENON_RELEASE_DIR=... cargo test`: 128 green, 0 failed — 104 in these crates (from 91 at the
+end of P3.3) plus the 24 `rs/ui` landed beside this phase —
+storage 5 -> 14 (one per table plus the migration and the retention math), `loop_test` 8 ->
+11 (an episode per step with its action and cost, a 20 KB output going to a blob the row
+references, a denied call scoring the step 0.0), and the new `cli/tests/storage_gate.rs`
+(1, skipped without oci or a release, 7-17 s here depending on image warmth): one turn whose two steps are two
+episodes with cost and a 16-char state hash, a 20 KB `bash` output stored as a blob the
+`tool_results` row points at and fetched back whole and as a window, `session.history`
+compared row for row with a fold over `events.tail`, and then 100 recorded steps plus a
+dozen real packs bounded by `state.retain` — the surviving pack steps compared against the
+policy computed independently in the test, the event window at exactly 50, the blobs of
+pruned tool results gone, the 102 episodes untouched. No BEAM change this phase. The live
+user demo was left untouched.
+
+### Deviations
+
+1. Retention prunes `events` only when `keep_events` is set (0 by default); `episodes` are
+   never pruned.
+2. Base computes `episodes.state_hash`, not the harness, to avoid a round trip per step.
+3. `verifier_score` is a placeholder (all tool calls ok -> 1.0, else 0.0).
+4. Blobs travel base64 over the front door, bounded by the 1 MiB frame cap.
+5. The model still sees the **head** of a large tool result (8000 chars plus `[truncated]`),
+   not its tail; the whole output is in the blob. Changing which end is one line in
+   `Outcome::text` if a task ever shows it matters.
+6. The seven new methods share one `Cmd::Records` variant in base.
+7. `state.retain` runs on demand, not on a timer; `keep_packs` already bounds `packs`.
+8. `memory_nodes`, `memory_edges` and `embeddings` have accessors and unit tests but no
+   writer: they are P5's tables, created now so that plugin reads an existing file.
+
+### Next
+
+P3.5: the built-in ASCII UI (`rs/ui`, `attach --ui`, `serve --http`), hard rules, budgets,
+the kill switch and the approval queue that finally owns the `approvals` table this phase
+started writing.
