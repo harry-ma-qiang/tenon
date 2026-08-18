@@ -1,6 +1,6 @@
 # RFC P3 — Minimal complete harness on the Tenon kernel (v4, consolidated)
 
-Author: Fable. 2026-08-18. Status: draft v4 for Gemini/human review. Supersedes v1-v3.6 (history in
+Author: Fable. 2026-08-18. Status: draft v4.1 (AGY review folded in) for human sign-off. Supersedes v1-v3.6 (history in
 git). Numbering P{m}.{n}: P0 toolchain, P1 kernel, P2 loader/SDKs/bridge are done; this is P3.
 
 ## 0. Scope in one paragraph
@@ -114,9 +114,16 @@ worker, storage, sandbox, wire (sdk/rs moves here); one bin target. TUI is P4.
   `upgrade.propose/status`, `runtime.spawn`, `approval.request`; failures return the reason to the
   agent. A "how to extend Tenon" prompt section documents them.
 - Gateway (BEAM plugin in node A, ~200 lines) + kernel socket-backed external fiber spec
-  (`%{socket: S}`, ~80 lines Erlang): the in-sandbox registration path; two ports, two processes
-  (base UDS vs gateway port); killing the sandbox or the gateway leaves base untouched.
-- Worker: default built-in; replaceable by any wire-speaking worker (P3.7 formalizes).
+  (`%{socket: S}`, ~80 lines Erlang): the in-sandbox registration path. One well-known, configurable
+  gateway port (vsock in krun, TCP/UDS in oci/landlock; default 10000); every in-sandbox process
+  (the worker included, in VM mode) connects there and each connection is one fiber — no channel
+  multiplexing in the frames. fd 3/4 stays the path when the host spawns a plugin directly
+  (oci/landlock, host-side plugins). Two ports, two processes (base UDS vs gateway); killing the
+  sandbox or the gateway leaves base untouched.
+- Worker: one resident async process per sandbox; pty sessions (ring buffer + spill), fs, edit,
+  grep/glob and git-snap are in-process library calls, never a fork per tool call (the spike's
+  `Command::new` per dispatch is not the model). Default built-in; replaceable by any wire-speaking
+  worker (P3.7 formalizes).
 - DSH long tail (compaction, subagents, skills, LSP, web UI) stays behind the bridge, opt-in.
 
 ## 7. Sandbox
@@ -159,7 +166,9 @@ implementation detail.
 ## 9. Storage and control plane
 
 - Host files: `config`, `state.sqlite` (barebone) and `state-<env>.sqlite` per env; optional
-  `workspace-<env>.img`. No blob directories: SQLite is the application file format (BLOBs up to 1 GB,
+  `workspace-<env>.img`. Every state file has one writer (its env's harness, or base for the barebone
+  file); G and the CLI open read-only connections. Day-one pragmas: `journal_mode=WAL`,
+  `synchronous=NORMAL`, `busy_timeout=5000`. No blob directories: SQLite is the application file format (BLOBs up to 1 GB,
   `blob_open`, `incremental_vacuum`); large tool outputs and per-step packs are BLOB rows with a
   retention policy. gix is used only inside the worker.
 - Tables: `events` (append-only session log), `tool_results`, `snapshots` (step -> ref), `packs`
@@ -194,7 +203,11 @@ safe path blue/green kernels (base starts N+1, health-checks, moves the front do
 owns the socket). "Better" is measurable: contract suites + task metrics from `episodes`; promotion
 only if it beats LKG on the benchmark set. The barebone holds LKG and the judge, never evolves.
 
-## 11. Attach, detach, exit, replay
+## 11. Attach, detach, exit, replay, approvals
+
+Approvals (two channels, no file sprawl): while attached in the foreground the CLI prompts `[y/N]`
+inline; otherwise the pending request is a row in the `approvals` table, surfaced as a banner on the
+next `tenon attach`, answered by `tenon approve <id>` or a UDS frame; G owns the queue and timeouts.
 
 `tenon attach [env]` like vibe-term. Early setting `exit-on-detach`: exit -> every runtime stops
 gracefully (drain, push packs, write log) -> start -> base rebuilds sandboxes, restores the latest
@@ -207,7 +220,7 @@ snapshot, not re-executing steps; long-running guest processes are not restored.
 |---|---|---|
 | P3.0 | Cargo workspace `tenon/rs/`; `~/.tenon/` layout; base extracts BEAM and starts G + root env node A; `tenon start/attach/stop/reset`; UDS front door | boots from a profile; kill -9 base -> nodes stop; `reset` restarts A from LKG while G stays up |
 | P3.1 | sandbox trait + oci + landlock; conformance suite; kernel socket-fiber + gateway plugin | worker tests pass on both backends; a python plugin started inside the sandbox registers through the gateway; killing sandbox/gateway leaves base untouched |
-| P3.2 | worker (pty/fs/edit + step git-snap, .gitignore, packs to host, expiry); `runtime.spawn` prototype (child env as external fiber, config = parent + patch, per-env state file, parent-death prunes, limits) | round trips, spill, PGID kill, snapshot/restore/expiry, 500 steps no leak; A spawns B, `tree` shows A->B, killing A removes B, B cannot reach A's RPC |
+| P3.2 | worker as one resident process (in-process tools, pty ring buffers + spill, step git-snap, .gitignore, packs to host, expiry; registers via gateway in VM mode, fd 3/4 otherwise); `runtime.spawn` prototype (child env as external fiber, config = parent + patch, per-env state file, parent-death prunes, limits) | round trips, spill, PGID kill, snapshot/restore/expiry, 500 steps no leak; A spawns B, `tree` shows A->B, killing A removes B, B cannot reach A's RPC |
 | P3.3 | harness (host, key) + seams + management tools + docs prompt section | real model turn; resume from log; guard denies; single authority; the agent mounts a plugin through the tools and sees it in `tree` |
 | P3.4 | storage crate + schema; episodes written by the loop | replay a session from SQLite; episodes grow |
 | P3.5 | hard rules v1, budgets, kill switch, approval RPC (`approval.request/answer`, `tenon approve`), runtime contract + `runtime.register`, probes, OS supervision, state copies at LKG, manifests, per-env privilege drop, exit-on-detach/replay | violation -> stop + rollback + notice; budget hard stop; kill -9 base -> supervisor restarts, A resumes from LKG; corrupted state replaced by LKG copy |
@@ -231,10 +244,10 @@ tree with limits and pruning.
 ## 14. Open questions
 
 1. Day-one hard-rule list and who may change it (signed config; hardware key later).
-2. Human gate UX before the TUI: CLI prompt vs approval file vs web.
-3. DSH bridge in the default profile or on demand.
-4. Benchmark task set for the promotion gate.
-5. Egress allowlist mechanics per backend.
+2. DSH bridge in the default profile or on demand.
+3. Benchmark task set for the promotion gate.
+4. Egress allowlist mechanics per backend.
+(Approval UX: decided, section 11.)
 
 ## 15. Explicitly not doing now
 
