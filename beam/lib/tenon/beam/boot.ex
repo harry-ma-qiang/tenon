@@ -1,0 +1,83 @@
+defmodule Tenon.Beam.Boot do
+  @moduledoc """
+  Turns the four boot environment variables into one running node.
+
+  `TENON_ROLE` (`guardian` or `agent`), `TENON_ENV` (the env name), `TENON_BASE_SOCK`
+  (the base front door) and `TENON_PROFILE` (the yml entry list). It starts one kernel,
+  mounts `Tenon.Loader` on the profile, mounts `Tenon.Beam.Link`, and mounts
+  `Tenon.Beam.Guardian` as well when the role is `guardian`.
+  """
+
+  use GenServer
+
+  require Logger
+
+  alias Tenon.Beam.Guardian
+  alias Tenon.Beam.Link
+  alias Tenon.Beam.Registry
+  alias Tenon.Loader
+
+  @spec node?() :: boolean()
+  def node?, do: System.get_env("TENON_ROLE") != nil
+
+  @spec start_link(term()) :: GenServer.on_start()
+  def start_link(_args), do: GenServer.start_link(__MODULE__, :boot, name: __MODULE__)
+
+  @spec state() :: map()
+  def state, do: GenServer.call(__MODULE__, :state)
+
+  @impl GenServer
+  def init(:boot) do
+    Process.flag(:trap_exit, true)
+    role = System.get_env("TENON_ROLE", "agent")
+    env = System.get_env("TENON_ENV", "root")
+    {:ok, kernel} = :tenon.start_link()
+    ctx = :tenon.root(kernel)
+    {:ok, loader} = :tenon.mount(ctx, %{module: Loader, id: "loader", config: profile()})
+
+    {:ok, link} =
+      :tenon.mount(ctx, %{module: Link, id: "link", config: link(role, env, kernel, loader)})
+
+    guardian = if role == "guardian", do: mount_guardian(ctx, env), else: nil
+    Logger.info("tenon node: role #{role}, env #{env}, os pid #{System.pid()}")
+    {:ok, %{kernel: kernel, loader: loader, link: link, guardian: guardian, role: role, env: env}}
+  end
+
+  @impl GenServer
+  def handle_call(:state, _from, state), do: {:reply, state, state}
+
+  defp profile do
+    path = System.get_env("TENON_PROFILE")
+    registry = Registry.load(path && Path.join(Path.dirname(path), "registry.yml"))
+    %{layers: List.wrap(path), registry: registry}
+  end
+
+  defp link(role, env, kernel, loader) do
+    %{
+      sock: System.get_env("TENON_BASE_SOCK"),
+      role: role,
+      env: env,
+      kernel: kernel,
+      loader: loader
+    }
+  end
+
+  defp mount_guardian(ctx, env) do
+    config = %{
+      target: System.get_env("TENON_GUARDIAN_TARGET", "root"),
+      interval: number("TENON_GUARDIAN_INTERVAL_MS", 2_000),
+      failures: number("TENON_GUARDIAN_FAILURES", 6)
+    }
+
+    Logger.info("tenon guardian: watching #{config.target} from #{env}")
+    {:ok, fiber} = :tenon.mount(ctx, %{module: Guardian, id: "guardian", config: config})
+    fiber
+  end
+
+  defp number(name, default) do
+    case Integer.parse(System.get_env(name, "")) do
+      {value, _rest} when value > 0 -> value
+      _other -> default
+    end
+  end
+end

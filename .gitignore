@@ -33,6 +33,8 @@ loader/deps/
 cli/_build/
 cli/deps/
 cli/tenon
+beam/_build/
+beam/deps/
 sdk/test/_build/
 sdk/test/deps/
 tmp/
