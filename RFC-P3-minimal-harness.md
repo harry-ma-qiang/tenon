@@ -99,8 +99,13 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 - Model-facing tools are POSIX only (view/edit/write/bash + snapshot/time_travel). Single authority.
 - Snapshots are step-granular, not per syscall: the worker commits the workspace tree with gix at each
   tool-step boundary (post-execute hook) and before risky operations; GIT_DIR lives inside the image.
-  Rollback/diff/time-travel/CoW hypothesis workspaces are git operations inside the guest. Host reads
-  snapshots through the worker (bundle over the wire) or by loop-mounting the image when stopped.
+  Rollback/diff/time-travel/CoW hypothesis workspaces are git operations inside the guest.
+- Coherence and durability: single writer at a time (only the guest touches the image while the VM
+  runs; the host never loop-mounts a live image). After each snapshot commit the worker fsyncs
+  (`core.fsync=all` + `sync`; virtio-blk flush maps to host fsync), so a guest crash loses at most the
+  in-flight step. The per-step packfile is pushed to the host over the wire and stored in
+  `state.sqlite`; the guest git is a cache, the host copy is the truth for LKG and reset, so a
+  destroyed image can be rebuilt.
 - Growth control: expiry policy (keep last N steps, LKG, tagged, and one milestone every M steps;
   `gc --prune` the rest) plus periodic trim. No transparent git filesystem: none is production-proven
   in Rust and per-write commits would be far too slow.
@@ -109,13 +114,15 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 
 ## 6. Storage: SQLite + gix ODB, and how memory/navigator land on it
 
-- Host state is small and boring: `state.sqlite` (rusqlite bundled, WAL) + `blobs/` (content-
-  addressed files, sha256 names) + `config` + `workspace.img`. gix is not used on the host.
+- Host state is three files: `config`, `state.sqlite`, `workspace.img`. No blob directories: SQLite
+  is the application file format (BLOBs up to 1 GB per row, incremental read via `blob_open`,
+  `incremental_vacuum` to shrink); large tool outputs and per-step snapshot packs are BLOB rows with a
+  retention policy. gix is not used on the host.
 - SQLite tables: `events` (session log, append-only), `tool_results` (index, blob hash), `snapshots`
   (step -> ref inside the image), `memory_nodes`, `memory_edges` (triples, confidence, outcomes),
   `embeddings` (blob; brute-force cosine at our scale; sqlite-vec later), `episodes` (state hash,
-  action, verifier score, cost) for the navigator. Large tool outputs go to `blobs/`, referenced by
-  hash. SQLite is not stored inside git and git is not used as a query engine.
+  action, verifier score, cost) for the navigator, `blobs` (sha256 -> bytes), `packs` (step -> git
+  packfile). SQLite is not stored inside git and git is not used as a query engine.
 - Rules: model-visible == logged (DSH law) applies to `events`; memory writes are commit-verified
   (explore in the working tree, commit only outcomes confirmed by verifiers); episodes are written by
   the loop for free from day one, so the navigator has data before it exists.
@@ -160,7 +167,8 @@ then the harness (what makes it a harness), then storage, then the hard rules, t
 - Names: base, guardian node, agent node, worker, harness, memory graph, navigator, snapshot,
   workspace image, verifier.
 - Two BEAM nodes (guardian G read-only, agent A writable) from one payload; VM by default; host state =
-  config + state.sqlite + blobs/ + workspace.img; gix only inside the worker; DSH long tail opt-in.
+  config + state.sqlite + workspace.img (three files, no directories); gix only inside the worker;
+  per-step packs pushed to the host; DSH long tail opt-in.
 
 ## 8b. Change protocol, mutability tiers, always-online
 
