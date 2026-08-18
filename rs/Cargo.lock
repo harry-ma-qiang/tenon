@@ -1767,6 +1767,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tenon-ui"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "tenon-worker"
 version = "0.1.0"
 dependencies = [
