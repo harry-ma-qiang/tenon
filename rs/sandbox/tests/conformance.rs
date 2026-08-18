@@ -3,11 +3,14 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tenon_sandbox::{backend, Policy, Spec};
 
-fn workspace(tag: &str) -> PathBuf {
-    let suffix = SystemTime::now()
+fn unique_suffix() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos();
+        .as_nanos()
+}
+
+fn workspace(tag: &str, suffix: u128) -> PathBuf {
     std::env::temp_dir().join(format!("tenon-conformance-{tag}-{suffix}"))
 }
 
@@ -26,16 +29,20 @@ fn check(name: &str) {
             return;
         }
     };
-    let workspace = workspace(name);
+    let suffix = unique_suffix();
+    let workspace = workspace(name, suffix);
     std::fs::create_dir_all(&workspace).unwrap();
+    let home_hash = format!("conf{suffix:x}");
     let spec = Spec {
-        env: format!("conf-{name}"),
+        env: format!("conf-{name}-{suffix}"),
         image: None,
         workspace: workspace.clone(),
         gateway: None,
         env_passthrough: vec![],
         policy: Policy::default(),
         caps: vec![],
+        home_hash: home_hash.clone(),
+        base_pid: std::process::id() as i32,
     };
     let instance = sandbox.spawn(&spec).expect("spawn");
 
@@ -89,7 +96,7 @@ fn check(name: &str) {
 
     instance.destroy().expect("destroy");
     if name == "oci" {
-        assert_no_leaked_container(&spec.env);
+        assert_no_leaked_container(&spec.env, &home_hash);
     }
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -131,7 +138,7 @@ fn check_read_only_escape(instance: &dyn tenon_sandbox::Instance) {
     let _ = std::fs::remove_file("/etc/tenon-landlock-should-fail");
 }
 
-fn assert_no_leaked_container(env: &str) {
+fn assert_no_leaked_container(env: &str, home_hash: &str) {
     let Some(cli) = find_cli() else {
         return;
     };
@@ -141,6 +148,8 @@ fn assert_no_leaked_container(env: &str) {
             "-a",
             "--filter",
             &format!("label=tenon.env={env}"),
+            "--filter",
+            &format!("label=tenon.home={home_hash}"),
             "--format",
             "{{.ID}}",
         ])

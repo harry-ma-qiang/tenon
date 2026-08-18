@@ -108,6 +108,18 @@ impl Fixture {
         }
         panic!("{env} never came back after {old}\n{}", self.log());
     }
+
+    /// `killing_base_takes_every_node_down` leaks its sandbox container by
+    /// design (nothing runs `destroy` across a killed base, and this home
+    /// never boots again); sweep it with the human `--all` reap on teardown.
+    fn reap_all_containers(&self) {
+        let _ = Command::new(BIN)
+            .arg("--home")
+            .arg(&self.home)
+            .args(["sandbox", "reap", "--all"])
+            .env("TENON_RELEASE_DIR", &self.release)
+            .output();
+    }
 }
 
 impl Drop for Fixture {
@@ -116,6 +128,7 @@ impl Drop for Fixture {
             let _ = self.run(&["stop"]);
             std::thread::sleep(Duration::from_millis(500));
         }
+        self.reap_all_containers();
         let _ = std::fs::remove_dir_all(&self.home);
     }
 }

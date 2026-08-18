@@ -6,6 +6,10 @@ use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
+pub fn alive(pid: i32) -> bool {
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
 pub fn run(mut command: Command, timeout: Duration) -> Result<ExecOutcome> {
     let mut child = command
         .stdin(Stdio::null())

@@ -38,6 +38,8 @@ pub struct Spec {
     pub env_passthrough: Vec<String>,
     pub policy: Policy,
     pub caps: Vec<String>,
+    pub home_hash: String,
+    pub base_pid: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -67,8 +69,11 @@ pub trait Sandbox: Send + Sync {
     fn backend(&self) -> &'static str;
     fn spawn(&self, spec: &Spec) -> Result<Arc<dyn Instance>>;
 
-    fn reap(&self, _env: &str) -> Result<()> {
-        Ok(())
+    /// Remove containers left over from a dead base of this home. `all` skips the
+    /// liveness check and removes every match regardless of whether its owning base
+    /// pid is still alive; returns the number reaped.
+    fn reap(&self, _home_hash: &str, _all: bool) -> Result<usize> {
+        Ok(0)
     }
 }
 
@@ -152,6 +157,8 @@ mod tests {
             env_passthrough: vec![],
             policy: Policy::default(),
             caps: vec![],
+            home_hash: "deadbeef0000".to_string(),
+            base_pid: std::process::id() as i32,
         }
     }
 

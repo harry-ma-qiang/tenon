@@ -34,7 +34,11 @@ enum Command {
         env: Option<String>,
     },
     /// Stop every environment, then the guardian, then the base
-    Stop,
+    Stop {
+        /// Also sweep this home's stale sandbox containers whose base is dead
+        #[arg(long)]
+        all: bool,
+    },
     /// Restart one environment from its last known good profile
     Reset {
         #[arg(long, value_name = "NAME")]
@@ -42,6 +46,11 @@ enum Command {
     },
     /// One JSON document with every node, its environment and its fiber tree
     Status,
+    /// Sandbox backend maintenance for humans
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
     /// Agent loop, llm adapter and session log, one per environment
     Harness {
         #[arg(trailing_var_arg = true)]
@@ -51,6 +60,17 @@ enum Command {
     Worker {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SandboxCommand {
+    /// Remove stale containers for this home; works whether or not base is up.
+    /// Without --all, only containers whose recorded base pid is dead are
+    /// touched; with it, every container for this home goes regardless.
+    Reap {
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -98,12 +118,21 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             .await
         }
         Command::Attach { env } => tenon_base::attach(home, env).await,
-        Command::Stop => tenon_base::rpc(home, "stop", json!({})).await,
+        Command::Stop { all } => {
+            let code = tenon_base::rpc(home.clone(), "stop", json!({})).await?;
+            if all {
+                tenon_base::sandbox_reap(home, false).await?;
+            }
+            Ok(code)
+        }
         Command::Reset { env } => {
             let params = env.map(|env| json!({ "env": env })).unwrap_or(json!({}));
             tenon_base::rpc(home, "reset", params).await
         }
         Command::Status => tenon_base::rpc(home, "status", json!({})).await,
+        Command::Sandbox { command } => match command {
+            SandboxCommand::Reap { all } => tenon_base::sandbox_reap(home, all).await,
+        },
         Command::Harness { .. } | Command::Worker { .. } => unreachable!("handled before"),
     }
 }

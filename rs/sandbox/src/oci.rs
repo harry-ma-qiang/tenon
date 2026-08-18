@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_IMAGE: &str = "python:3.12-alpine";
-const LABEL: &str = "tenon.env";
+const ENV_LABEL: &str = "tenon.env";
+const HOME_LABEL: &str = "tenon.home";
+const BASE_LABEL: &str = "tenon.base";
 const STOP_GRACE_SECS: &str = "2";
 const EXEC_GRACE: Duration = Duration::from_secs(3);
 
@@ -54,14 +56,18 @@ impl Sandbox for Oci {
         std::fs::create_dir_all(&spec.workspace)
             .with_context(|| format!("create workspace {}", spec.workspace.display()))?;
         let image = spec.image.as_deref().unwrap_or(DEFAULT_IMAGE);
-        let name = container_name(&spec.env);
+        let name = container_name(&spec.env, &spec.home_hash);
         let mut args: Vec<String> = vec![
             "run".to_string(),
             "-d".to_string(),
             "--name".to_string(),
             name.clone(),
             "--label".to_string(),
-            format!("{LABEL}={}", spec.env),
+            format!("{ENV_LABEL}={}", spec.env),
+            "--label".to_string(),
+            format!("{HOME_LABEL}={}", spec.home_hash),
+            "--label".to_string(),
+            format!("{BASE_LABEL}={}", spec.base_pid),
             "--memory".to_string(),
             format!("{}m", spec.policy.ram_mb),
             "--pids-limit".to_string(),
@@ -109,24 +115,28 @@ impl Sandbox for Oci {
         }))
     }
 
-    fn reap(&self, env: &str) -> Result<()> {
+    fn reap(&self, home_hash: &str, all: bool) -> Result<usize> {
         let mut command = Command::new(self.cli);
         command.args([
             "ps",
             "-a",
             "--filter",
-            &format!("label={LABEL}={env}"),
+            &format!("label={HOME_LABEL}={home_hash}"),
             "--format",
             "{{.ID}}",
         ]);
         let outcome = proc::run(command, Duration::from_secs(15))?;
+        let mut reaped = 0usize;
         for id in String::from_utf8_lossy(&outcome.stdout).lines() {
             let id = id.trim();
-            if !id.is_empty() {
-                let _ = self.run_orphan(id);
+            if id.is_empty() {
+                continue;
+            }
+            if (all || !self.base_alive(id)) && self.run_orphan(id).is_ok() {
+                reaped += 1;
             }
         }
-        Ok(())
+        Ok(reaped)
     }
 }
 
@@ -136,9 +146,33 @@ impl Oci {
         command.args(["rm", "-f", id]);
         proc::run(command, Duration::from_secs(15))
     }
+
+    /// True unless the container names a `tenon.base` pid we can positively prove
+    /// is gone. Any failure to read the label, or a label that does not parse,
+    /// counts as alive so a reap pass never removes something it cannot judge.
+    fn base_alive(&self, id: &str) -> bool {
+        let mut command = Command::new(self.cli);
+        command.args([
+            "inspect",
+            id,
+            "--format",
+            &format!("{{{{ index .Config.Labels \"{BASE_LABEL}\" }}}}"),
+        ]);
+        let Ok(outcome) = proc::run(command, Duration::from_secs(10)) else {
+            return true;
+        };
+        if outcome.status != 0 {
+            return true;
+        }
+        let text = String::from_utf8_lossy(&outcome.stdout);
+        match text.trim().parse::<i32>() {
+            Ok(pid) => proc::alive(pid),
+            Err(_) => true,
+        }
+    }
 }
 
-fn container_name(env: &str) -> String {
+fn container_name(env: &str, home_hash: &str) -> String {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -147,7 +181,7 @@ fn container_name(env: &str) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
         .collect();
-    format!("tenon-{clean}-{suffix}")
+    format!("tenon-{home_hash}-{clean}-{suffix}")
 }
 
 impl OciInstance {
@@ -202,10 +236,16 @@ impl Instance for OciInstance {
         if self.destroyed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // Graceful stop first (grace, then the engine's own SIGKILL); `rm -f` after
+        // is the unconditional kill-and-remove fallback regardless of what state
+        // stop left the container in, so a container that is already gone (never
+        // started, raced with another reaper) is not treated as a failure.
         let _ = self.run(&["stop", "-t", STOP_GRACE_SECS, &self.id]);
-        let outcome = self.run(&["rm", "-f", &self.id])?;
+        let Ok(outcome) = self.run(&["rm", "-f", &self.id]) else {
+            return Ok(());
+        };
         if outcome.status != 0 {
-            let text = String::from_utf8_lossy(&outcome.stderr);
+            let text = String::from_utf8_lossy(&outcome.stderr).to_lowercase();
             if !text.contains("no such") && !text.contains("does not exist") {
                 bail!("{} rm failed: {text}", self.cli);
             }
