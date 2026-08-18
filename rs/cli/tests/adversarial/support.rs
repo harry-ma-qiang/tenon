@@ -202,6 +202,20 @@ impl Fixture {
         pids_by_home(&self.home)
     }
 
+    /// A test scenario that killed base with -9 leaks that boot's sandbox
+    /// container by design (nothing runs `destroy` across a killed process);
+    /// the fixture's own home never boots again to trigger the next-start
+    /// reap, so teardown sweeps it directly with the human `--all` reap
+    /// rather than leaving it for the box's `podman ps -a` to accumulate.
+    pub fn reap_all_containers(&self) {
+        let _ = Command::new(BIN)
+            .arg("--home")
+            .arg(&self.home)
+            .args(["sandbox", "reap", "--all"])
+            .env("TENON_RELEASE_DIR", &self.release)
+            .output();
+    }
+
     pub fn all_pids(&self) -> Vec<i64> {
         let mut pids = self.node_pids();
         pids.extend(self.base_pids());
@@ -222,6 +236,7 @@ impl Drop for Fixture {
                 kill(pid, "-9");
             }
         }
+        self.reap_all_containers();
         let _ = std::fs::remove_dir_all(&self.home);
     }
 }

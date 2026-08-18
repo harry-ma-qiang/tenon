@@ -22,7 +22,9 @@ use crate::signals::Signals;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tenon_sandbox::Sandbox;
 use tenon_storage::Store;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
@@ -75,11 +77,12 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         eprintln!("tenon: state.sqlite was corrupt, restored from lkg");
     }
     let store = Store::open(&home.state_file())?;
-    let sandbox = tenon_sandbox::backend(&config.sandbox)?;
+    let sandbox: Arc<dyn Sandbox> = Arc::from(tenon_sandbox::backend(&config.sandbox)?);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
 
     let (cmds, cmd_rx) = mpsc::unbounded_channel();
     let (exits, exit_rx) = mpsc::unbounded_channel();
+    spawn_reap(sandbox.clone(), home.hash(), cmds.clone());
     let state = base::Base::new(
         home.clone(),
         config.clone(),
@@ -128,6 +131,17 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         let _ = rx.await;
     });
     Ok(actor.await.unwrap_or(1))
+}
+
+/// Sweeps stale sandbox containers for this home on a blocking-pool thread, never
+/// the actor's own task, so a slow `podman ps`/`inspect`/`rm -f` round trip can
+/// never delay `Cmd::Boot` or a boot-time signal. Fire-and-forget: the result
+/// reaches the actor as a `Cmd` once it is ready, whenever that is.
+fn spawn_reap(sandbox: Arc<dyn Sandbox>, home_hash: String, cmds: mpsc::UnboundedSender<Cmd>) {
+    tokio::task::spawn_blocking(move || {
+        let count = sandbox.reap(&home_hash, false).unwrap_or(0);
+        let _ = cmds.send(Cmd::SandboxReaped { count });
+    });
 }
 
 async fn boot_until_ready(cmds: &mpsc::UnboundedSender<Cmd>, timeout: Duration) -> Result<()> {
@@ -186,6 +200,28 @@ pub async fn rpc(home: Option<PathBuf>, method: &str, params: Value) -> Result<i
     let mut client = Client::connect(&home.sock()).await?;
     let result = client.call(method, params).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(0)
+}
+
+/// The human-facing reap: works whether or not base is running, since it opens
+/// the sandbox backend directly rather than going through the actor. `all`
+/// removes every container for this home regardless of whether its `tenon.base`
+/// pid is alive; without it only containers whose base is confirmed dead go.
+pub async fn sandbox_reap(home: Option<PathBuf>, all: bool) -> Result<i32> {
+    let home = Home::resolve(home)?;
+    let config = if home.config_file().is_file() {
+        Config::load(&home.config_file())?
+    } else {
+        Config::default()
+    };
+    let sandbox = tenon_sandbox::backend(&config.sandbox)?;
+    let count = tokio::task::spawn_blocking(move || sandbox.reap(&home.hash(), all))
+        .await
+        .map_err(|error| anyhow::anyhow!(error))??;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"reaped": count}))?
+    );
     Ok(0)
 }
 

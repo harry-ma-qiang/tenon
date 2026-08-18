@@ -162,11 +162,31 @@ plugin connecting to `TENON_GATEWAY` from inside sees the same path as the host;
 `tcp:` gateway is passed through unchanged with `--network host` added (Linux-only,
 documented here rather than attempted cross-platform). `TENON_SANDBOX_ENV` is a
 comma-separated list of host env var names forwarded into the container (`-e NAME=value`
-for each that is actually set on base). Every container carries `--label
-tenon.env=<env>`, so `podman/docker ps -a --filter label=tenon.env=<env>` always finds
-(or fails to find) an env's containers, crash or no crash. `destroy` runs `stop -t 2`
-then `rm -f`; `Drop` on the instance calls `destroy` again as a safety net (idempotent
-via an atomic flag) in case something skipped the explicit call.
+for each that is actually set on base). Every container carries three labels —
+`tenon.env=<env>`, `tenon.home=<sha256(home)[..12]>` and `tenon.base=<base pid>` — and
+its name embeds the home hash too, so two homes that both mount an env called `root`
+(every adversarial test fixture does) never share a container identity; a leak from one
+home's crashed base can never be mistaken for another's. `destroy` runs `stop -t 2` then
+`rm -f`, tolerating an "already gone" container as success rather than an error; `Drop`
+on the instance calls `destroy` again as a safety net (idempotent via an atomic flag) in
+case something skipped the explicit call.
+
+**Reap.** `Sandbox::reap(home_hash, all)` lists containers carrying that home's
+`tenon.home` label and removes each one whose `tenon.base` pid is confirmed dead (via
+`podman/docker inspect` + `kill(pid, 0)`), or every one of them regardless of liveness
+when `all` is set; it returns the count removed. Base kicks this off once per boot, on a
+`tokio::task::spawn_blocking` thread — never the actor's own task — right after the
+sandbox backend is built and before the actor even starts processing `Cmd::Boot`; the
+result reaches the actor later as `Cmd::SandboxReaped{count}`, logged as a
+`sandbox.reaped` event. This is deliberately decoupled: an earlier attempt that ran the
+equivalent `podman ps`/`rm -f` synchronously inside `enter_sandbox` (on the actor thread,
+during `Cmd::Boot`) made the P3.0 `sigterm_during_boot_leaves_no_zombies` test flaky by
+blocking the actor's single task behind a container-backlog round trip; a background
+thread with the result delivered as an ordinary `Cmd` sidesteps that entirely. Humans get
+the same operation via `tenon sandbox reap [--all]` (works whether or not base is up —
+it opens the backend directly) and `tenon stop --all` (stop, then reap this home's dead
+leftovers). See "What base does when something dies" below for why a reap is normally
+unnecessary and only a `kill -9` of base needs it.
 
 **landlock.** No persistent process: `spawn` just records the workspace and gateway
 socket directory; `exec` restricts the *forked child* (via `Command::pre_exec`, before
@@ -190,9 +210,10 @@ may pair it with cgroups for that.
 |---|---|
 | `tenon start [--foreground] [--exit-on-detach] [--release-dir DIR] [--home DIR]` | boot G, boot the root env, open the front door. Without `--foreground` it re-execs itself detached (`setsid`), waits for `run/base.ready` and prints the pid |
 | `tenon attach [--env NAME]` | print the status document, then stream the event log until Ctrl-C |
-| `tenon stop` | stop every env, then G, then base |
+| `tenon stop [--all]` | stop every env, then G, then base; `--all` also reaps this home's dead-base sandbox leftovers afterward |
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon status` | one JSON document: base, both nodes, and each node's fiber tree |
+| `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
 | `tenon harness` / `tenon worker` | print `not implemented in P3.0`, exit 2 |
 
 `--exit-on-detach` stops everything when the last **subscriber** disconnects. `status` and
@@ -224,18 +245,18 @@ queues behind a `reset`. `reset` and `stop` do run inside it, for at most `stop_
 task, not inside the actor, so a slow container exec never stalls `status`/`health`.
 
 `status`'s per-node `sandbox` field is now an object rather than a bare id string:
-`{"backend":"oci","id":"tenon-root-171...","attach":"unix:/home/x/.tenon/run/gateway-root.sock"}`,
+`{"backend":"oci","id":"tenon-6af3f8eda318-root-171...","attach":"unix:/home/x/.tenon/run/gateway-root.sock"}`,
 or `null` for the guardian.
 
 ## What base does when something dies
 
 | Event | Base |
 |---|---|
-| `kill -9` base | nothing — the nodes notice their socket closing and stop themselves (~1.1 s) |
-| SIGTERM/SIGINT base | graceful `stop`: envs first, then G, then exit |
-| an env node dies | log `node.exit`, restore its LKG profile, restart it, up to `max_restarts` |
+| `kill -9` base | nothing — the nodes notice their socket closing and stop themselves (~1.1 s). Any sandbox instance base owned keeps running too; nothing survives a SIGKILL to call `destroy`. There is nothing to do about this *at* the moment of the kill — the next `tenon start` (or `tenon sandbox reap`) of the same home reaps it, since the leaked container still carries this boot's `tenon.base` pid and that pid is now provably dead |
+| SIGTERM/SIGINT base | graceful `stop`: envs first (each env's sandbox instance is `destroy`ed as part of stopping it), then G, then exit. The RPC reply for `stop` (and `AbortBoot`, its during-boot equivalent) is held until this full teardown — env kill, sandbox destroy, all of it — actually completes, not sent the moment shutdown starts; a caller that trusts "ok" and force-kills base shortly after (a test fixture's teardown, an impatient supervisor) would otherwise race an in-flight `podman stop`/`rm -f` and orphan the container anyway, the same failure mode as the row above, just self-inflicted |
+| an env node dies | log `node.exit`, restore its LKG profile, restart it, up to `max_restarts`. The old sandbox instance is `destroy`ed before the new one is spawned |
 | G dies | the same, plus a loud line on stderr; the env keeps running |
-| the guardian sees N bad health answers | it sends `reset{env}`; base performs it |
+| the guardian sees N bad health answers | it sends `reset{env}`; base performs it (old sandbox instance destroyed, new one spawned, same as an env restart) |
 
 ## Tests
 
@@ -247,9 +268,11 @@ cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt 
 TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test
 ```
 
-39 tests: 14 as before P3.1 (now `sandbox` unit tests are 5, `boot.rs` is still 7, plus
-`storage` 3, `harness` 1, `worker` 1, `base::token` 1) plus the 19-test adversarial suite,
-`sandbox`'s 2-test conformance suite and the 1-test gateway gate. `cli/tests/boot.rs` (7)
+42 tests: `sandbox` unit 5, `boot.rs` 7, `storage` 3, `harness` 1, `worker` 1, `base` unit 2
+(`token`, and `home::hash` — stable per home, distinct across homes), the 20-test
+adversarial suite (19 as before P3.1's container hygiene pass, plus
+`reap::a_leaked_container_with_a_dead_base_is_reaped_on_next_start`), `sandbox`'s 2-test
+conformance suite and the 1-test gateway gate. `cli/tests/boot.rs` (7)
 drives the real binary against a temp `TENON_HOME`: the role stubs, a missing base, boot
 (both nodes registered, the guardian tree carrying `guardian` and `link`, the root tree
 carrying the demo plugin, the LKG written, and — since `sandbox` now defaults to `auto`
@@ -263,10 +286,13 @@ print a skip line naming how to build one and pass.
 `krun` is not implemented and `none` runs no sandboxed exec by design) spawns, execs
 `echo`, writes a file inside and reads it back from the host, runs a command past its
 timeout and asserts it was killed, and asserts `destroy` leaves no container behind
-(`oci`, via the `tenon.env` label) or that a write outside the workspace is denied
-(`landlock`, which has no persistent container to check). `oci` additionally reads
-`/sys/fs/cgroup/memory.max` from inside and asserts it matches the configured cap. Each
-backend prints `skipping <name>: <reason>` and returns (not fails) if unavailable.
+(`oci`, filtered by **both** `tenon.env` and a per-run fabricated `tenon.home` label, and
+with a nanosecond-suffixed env name — so a parallel `cargo test` run or a leftover from a
+previous one can never make this assertion see someone else's container) or that a write
+outside the workspace is denied (`landlock`, which has no persistent container to check).
+`oci` additionally reads `/sys/fs/cgroup/memory.max` from inside and asserts it matches
+the configured cap. Each backend prints `skipping <name>: <reason>` and returns (not
+fails) if unavailable.
 
 `cli/tests/gateway_gate.rs` (1) is the P3.1 gate itself: start base with `sandbox: oci`
 (skipped if neither podman nor docker is on `PATH`); once the root env's sandbox instance
@@ -280,15 +306,29 @@ and assert that fiber goes away (fails, or is unmounted) while `status` keeps an
 tears down and remounts the gateway along with everything else in that node) and assert
 `status` still answers afterward with the root node registered again.
 
-`cli/tests/adversarial/` (19, same skip-without-a-release rule) is the P3.0 hardening suite:
-double start refusal and survival of the first base, a crashed base's stale `run/` files
-recovered by the next start, a five-round reset storm with no orphaned pids, `stop` racing a
-`reset`, SIGTERM during boot leaving no zombie or orphaned BEAM process, twenty parallel
-`status` calls during a `reset`, a corrupt `profile` and a corrupt `state.sqlite` each
-restored from LKG on `reset`, guardian/env crash and restart-limit scenarios, a frozen agent
-reset by the guardian without SIGCONT confusing base afterwards, two `attach` subscribers and
-`--exit-on-detach`, and RPC abuse (garbage bytes, an oversized frame header, an unknown
-method, a half-open connection, a forged `node.register` from the CLI socket).
+`cli/tests/adversarial/` (20, same skip-without-a-release rule) is the P3.0/P3.1 hardening
+suite: double start refusal and survival of the first base, a crashed base's stale `run/`
+files recovered by the next start, a five-round reset storm with no orphaned pids, `stop`
+racing a `reset`, SIGTERM during boot leaving no zombie or orphaned BEAM process (stayed
+green across the container-hygiene changes below — the boot-time reap never touches the
+actor thread, so it cannot reintroduce the flakiness that kept it unwired before), twenty
+parallel `status` calls during a `reset`, a corrupt `profile` and a corrupt `state.sqlite`
+each restored from LKG on `reset`, guardian/env crash and restart-limit scenarios, a frozen
+agent reset by the guardian without SIGCONT confusing base afterwards, two `attach`
+subscribers and `--exit-on-detach`, RPC abuse (garbage bytes, an oversized frame header, an
+unknown method, a half-open connection, a forged `node.register` from the CLI socket), and
+`reap::a_leaked_container_with_a_dead_base_is_reaped_on_next_start`: hand-creates a
+container carrying this home's `tenon.home` label and a pid from an already-reaped child
+process (guaranteed dead) as its `tenon.base` label, then asserts a fresh `tenon start` of
+that same home removes it while the real root env still comes up normally.
+
+Every fixture across `boot.rs`, `gateway_gate.rs` and the adversarial suite also sweeps its
+own home with `tenon sandbox reap --all` on teardown (`Drop`), independent of whatever the
+test itself asserted — several of these tests deliberately `kill -9` base to test its
+resilience, which leaks that boot's container by design (see "What base does when
+something dies" above) and this home will never `start` again to trigger the ordinary
+reap, so the fixture reaps it directly instead of leaving it for `podman ps -a` to
+accumulate across CI runs.
 
 ## Deviations from the RFC
 
@@ -320,25 +360,41 @@ method, a half-open connection, a forged `node.register` from the CLI socket).
    That is Linux only, which this box is.
 10. **`sandbox` defaults to `auto`, per the P3.1 plan**, which on this box means the default
     profile's root env now boots a real `oci` container instead of the `none` no-op — the
-    P3.0 boot/adversarial suites still pass (39/39, run three times) but take noticeably
-    longer (adversarial: ~95 s here, was near-instant with `none`) since every `reset` and
-    node restart spawns and tears down a container.
-11. **A `kill -9` of base leaks that boot's oci container(s).** Nothing survives a SIGKILL
-    of base to call `destroy`, and `Drop` never runs across a killed process — this is the
-    same tradeoff the RFC already accepts for base itself ("nothing — the nodes notice
-    their socket closing and stop themselves"), just visible here as an idle
-    `sleep infinity` container instead of a silently-reaped BEAM node. `Sandbox::reap(env)`
-    (list + remove every container carrying `tenon.env=<env>`) exists on the trait and is
-    exercised by `sandbox/tests/conformance.rs`'s cleanup assertion, but is deliberately
-    **not** wired into the boot path: doing so made `enter_sandbox` block the single-threaded
-    base actor on a `podman ps` + N `podman rm -f` round trip before an already-running
-    node's `Cmd::Boot` could be answered, which broke the P3.0
-    `sigterm_during_boot_leaves_no_zombies` adversarial test under container backlog. A
-    real fix is OS-supervised base (P3.5) sweeping stale containers on the next clean
-    start, or a background reaper task that never shares the actor's queue; out of scope
-    here. `podman/docker ps -a --filter label=tenon.env` finds anything left behind.
-12. **`sandbox.exec`/`sandbox.destroy` are base RPCs, not CLI subcommands.** Nothing in
-    `tenon`'s `clap` surface calls them; they exist for `sandbox/tests/conformance.rs`,
-    `cli/tests/gateway_gate.rs` and any other test or tool that already speaks the frame
-    protocol via `tenon_base::client::Client`. P3.2's worker tools supersede them for
-    agent-facing use.
+    P3.0 boot/adversarial suites still pass (42/42, run three times) but take noticeably
+    longer (adversarial: ~105-190 s here depending on how many tests in the run stop a
+    live sandboxed env, was near-instant with `none`) since every `reset`, node restart and
+    `stop` spawns and tears down a container — `stop` now waits for that teardown to finish
+    before answering (deviation 11's `Cmd::Stop` reordering), which is why it varied run to
+    run more than the earlier `none`-backed number did.
+11. **A `kill -9` of base still leaks that boot's oci container(s) — this is now handled,
+    not merely documented.** Nothing survives a SIGKILL of base to call `destroy`, and
+    `Drop` never runs across a killed process — the same tradeoff the RFC already accepts
+    for base itself ("nothing — the nodes notice their socket closing and stop
+    themselves"), just visible here as an idle `sleep infinity` container instead of a
+    silently-reaped BEAM node. What changed in the P3.1 container-hygiene pass:
+    `Sandbox::reap(home_hash, all)` now filters by a `tenon.home` label (in addition to
+    `tenon.env`) and only removes a container once it has positively confirmed the
+    `tenon.base` pid recorded on it is dead (`kill(pid, 0)`), never merely by env name —
+    the earlier single-label scheme could not tell one home's `root` env container from
+    another's, which is exactly what made `sandbox/tests/conformance.rs`'s own leak
+    assertion flaky under parallel test homes. And reap now *is* wired into the boot path,
+    just never on the actor thread: `spawn_reap` (in `base/src/lib.rs`) fires once per
+    `foreground()` boot on a `tokio::task::spawn_blocking` thread, fully decoupled from the
+    actor's `Cmd` queue, and reports back later as an ordinary `Cmd::SandboxReaped{count}`
+    the actor processes whenever it gets to it. This is what made wiring it safe: the
+    earlier attempt ran the equivalent `podman ps`/`rm -f` round trip synchronously inside
+    `enter_sandbox`, which is called from `on_cmd` while handling `Cmd::Boot` — on the
+    actor's own task — and blocked it long enough under container backlog to make
+    `sigterm_during_boot_leaves_no_zombies` flaky. A background thread whose result arrives
+    as a message sidesteps that structurally rather than by tuning a timeout.
+    `podman/docker ps -a --filter label=tenon.home=<hash>` finds anything left behind for
+    one home; `--filter label=tenon.home` (no value) finds it across all of them.
+12. **`sandbox.exec`/`sandbox.destroy` are base RPCs, not CLI subcommands; `sandbox reap`
+    is the one exception.** Nothing in `tenon`'s `clap` surface calls `sandbox.exec` or
+    `sandbox.destroy` — they exist for `sandbox/tests/conformance.rs`, `cli/tests/gateway_gate.rs`
+    and any other test or tool that already speaks the frame protocol via
+    `tenon_base::client::Client`; P3.2's worker tools supersede them for agent-facing use.
+    `tenon sandbox reap [--all]` breaks that pattern deliberately: it is a maintenance
+    operation a human runs *because* base might not be reachable (a home whose base was
+    `kill -9`'d and nobody has restarted), so it talks to the sandbox backend directly
+    rather than through an RPC that presupposes a live base.

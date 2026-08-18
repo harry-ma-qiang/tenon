@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const DEMO_ID: &str = "demo";
@@ -100,6 +101,17 @@ impl Home {
 
     pub fn lkg(&self) -> PathBuf {
         self.root.join("lkg")
+    }
+
+    /// The first 12 hex chars of sha256(home path); a short, filesystem-safe id
+    /// that ties every sandbox instance this home ever spawns back to it, so a
+    /// reap pass never touches a container that belongs to a different home.
+    pub fn hash(&self) -> String {
+        let sum = Sha256::digest(self.root.display().to_string().as_bytes());
+        sum.iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     pub fn scaffold(&self) -> Result<()> {
@@ -274,4 +286,26 @@ fn copy_tree(from: &Path, into: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_is_stable_and_distinguishes_homes() {
+        let a = Home {
+            root: PathBuf::from("/tmp/tenon-home-a"),
+        };
+        let again = Home {
+            root: PathBuf::from("/tmp/tenon-home-a"),
+        };
+        let b = Home {
+            root: PathBuf::from("/tmp/tenon-home-b"),
+        };
+        assert_eq!(a.hash(), again.hash());
+        assert_ne!(a.hash(), b.hash());
+        assert_eq!(a.hash().len(), 12);
+        assert!(a.hash().chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

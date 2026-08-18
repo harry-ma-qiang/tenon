@@ -92,12 +92,24 @@ impl Fixture {
     }
 }
 
+impl Fixture {
+    fn reap_all_containers(&self) {
+        let _ = Command::new(BIN)
+            .arg("--home")
+            .arg(&self.home)
+            .args(["sandbox", "reap", "--all"])
+            .env("TENON_RELEASE_DIR", &self.release)
+            .output();
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         if self.home.join("run/base.ready").is_file() {
             let _ = self.run(&["stop"]);
             std::thread::sleep(Duration::from_millis(500));
         }
+        self.reap_all_containers();
         let _ = std::fs::remove_dir_all(&self.home);
     }
 }

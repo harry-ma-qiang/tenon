@@ -619,6 +619,33 @@ sdk: `cd sdk/test && mix test` — "16 tests, 0 failures" (unaffected fd-3/4 pat
    not `tenon` CLI subcommands** — deliberately, per the task's "test aid" framing; adding
    CLI surface for something P3.2's worker tools supersede felt like scope creep.
 
+## 21. P3.1c result: container hygiene fix (2026-08-18)
+
+Closed the two gaps deviation 11 (`rs/README.md`) had left open. Containers now carry
+`tenon.home=<sha256(home)[..12]>` and `tenon.base=<base pid>` alongside `tenon.env`, and
+the container name embeds the home hash, so two homes both running a `root` env (every
+test fixture does exactly that) can never be mistaken for each other's leftovers —
+this is what made `sandbox/tests/conformance.rs`'s own leak assertion flaky under
+parallel test runs before. `Sandbox::reap(home_hash, all)` now actually runs, once per
+`base::foreground()` boot, on a `tokio::task::spawn_blocking` thread that reports back to
+the actor as an ordinary `Cmd::SandboxReaped{count}` (a `sandbox.reaped` event) rather
+than on the actor's own task, which is exactly what made an earlier synchronous attempt
+break `sigterm_during_boot_leaves_no_zombies` under container backlog. A second bug
+surfaced while auditing this: `Cmd::Stop`/`Cmd::AbortBoot` were replying "ok" to the
+caller *before* `stop_nodes()` had actually destroyed each env's sandbox instance, so a
+caller that trusted the reply and force-killed base a moment later (every adversarial
+test fixture's `Drop` does exactly this) could interrupt an in-flight `podman
+stop`/`rm -f` and orphan the container anyway — reordering both to reply only after
+teardown completes fixed it. Humans get `tenon sandbox reap [--all]` and `tenon stop
+--all` for the same operation outside a test. Gates: `cargo build --release`, `cargo
+clippy --all-targets -- -D warnings`, `cargo fmt --check` all clean; `TENON_RELEASE_DIR=...
+cargo test` green three consecutive full runs, 42/42 each time (two new: `base::home::hash`
+unit test and `reap::a_leaked_container_with_a_dead_base_is_reaped_on_next_start`
+adversarial test); `podman ps -a --filter label=tenon.home` showed 0 leftover containers
+after every run, and the live user demo (`cli/tenon start
+playground/web/tenon.yml`, a separate Elixir-side process that never touches `rs/`'s
+sandbox at all) was left running throughout and never signaled.
+
 ### Next
 
 P3.2: the worker as one resident process (in-process tools, pty ring buffers, step

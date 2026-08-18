@@ -38,6 +38,9 @@ pub enum Cmd {
         env: String,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    SandboxReaped {
+        count: usize,
+    },
     Stop {
         reply: oneshot::Sender<Result<Value, String>>,
     },

@@ -32,7 +32,7 @@ pub struct Base {
     config: Config,
     store: Store,
     release: PathBuf,
-    sandbox: Box<dyn Sandbox>,
+    sandbox: Arc<dyn Sandbox>,
     exit_on_detach: bool,
     nodes: BTreeMap<String, Node>,
     subs: BTreeMap<u64, (Peer, Option<String>)>,
@@ -78,7 +78,7 @@ impl Base {
         config: Config,
         store: Store,
         release: PathBuf,
-        sandbox: Box<dyn Sandbox>,
+        sandbox: Arc<dyn Sandbox>,
         exit_on_detach: bool,
         exits: mpsc::UnboundedSender<Exit>,
     ) -> Self {
@@ -155,13 +155,20 @@ impl Base {
                 reply,
             } => self.sandbox_exec(env, cmd, args, timeout_ms, reply),
             Cmd::SandboxDestroy { env, reply } => self.sandbox_destroy(&env, reply),
+            Cmd::SandboxReaped { count } => {
+                self.emit("sandbox.reaped", None, json!({"count": count}));
+            }
             Cmd::Stop { reply } => {
-                let _ = reply.send(Ok(json!({"ok": true})));
+                // Destroy every env's sandbox instance before answering, so a
+                // caller that trusts "ok" and force-kills base a moment later
+                // (a test fixture's teardown, a supervisor's own timeout) never
+                // races an in-flight `podman stop`/`rm -f` and orphans it.
                 self.stop().await;
+                let _ = reply.send(Ok(json!({"ok": true})));
             }
             Cmd::AbortBoot { reply } => {
-                let _ = reply.send(Ok(json!({"ok": true})));
                 self.abort_boot().await;
+                let _ = reply.send(Ok(json!({"ok": true})));
             }
             Cmd::Subscribe { peer, env, reply } => {
                 let last = self.store.last_event_id().unwrap_or(0);
@@ -248,6 +255,8 @@ impl Base {
             env_passthrough: sandbox_env_passthrough(),
             policy: Default::default(),
             caps: vec![],
+            home_hash: self.home.hash(),
+            base_pid: std::process::id() as i32,
         };
         self.sandbox
             .spawn(&spec)
