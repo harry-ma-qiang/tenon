@@ -58,6 +58,9 @@ enum Command {
     },
     /// Resident tool process inside the sandbox
     Worker {
+        /// The workspace it serves; defaults to $TENON_WORKSPACE, then /workspace
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -89,7 +92,15 @@ fn run() -> Result<i32> {
     let cli = Cli::parse();
     match cli.command {
         Command::Harness { args } => Ok(tenon_harness::run(&args)),
-        Command::Worker { args } => Ok(tenon_worker::run(&args)),
+        Command::Worker { workspace, args } => {
+            let mut argv = Vec::new();
+            if let Some(dir) = workspace {
+                argv.push("--workspace".to_string());
+                argv.push(dir.display().to_string());
+            }
+            argv.extend(args);
+            Ok(tenon_worker::run(&argv))
+        }
         command => runtime()?.block_on(dispatch(cli.home, command)),
     }
 }

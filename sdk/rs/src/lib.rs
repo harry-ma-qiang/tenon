@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
-use std::os::fd::FromRawFd;
+use std::net::TcpStream;
+use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::unix::net::UnixStream;
 use std::process;
 use std::rc::Rc;
 
@@ -123,10 +125,59 @@ pub struct Plugin {
     stopped: bool,
 }
 
+/// The two wire ends of a plugin: fd 3/4 when the host spawned us directly,
+/// a connection to `TENON_GATEWAY` when we were started inside a sandbox and
+/// have to dial the gateway plugin in our node instead (RFC section 6).
+pub fn wires() -> Result<(File, File)> {
+    match std::env::var("TENON_GATEWAY") {
+        Ok(address) if !address.trim().is_empty() => connect(address.trim()),
+        _ => Ok(unsafe {
+            (
+                File::from_raw_fd(WIRE_IN_FD),
+                File::from_raw_fd(WIRE_OUT_FD),
+            )
+        }),
+    }
+}
+
+pub fn connect(address: &str) -> Result<(File, File)> {
+    let fd = if let Some(path) = address.strip_prefix("unix:") {
+        UnixStream::connect(path)
+            .map_err(|error| Error::Wire(format!("connect {path}: {error}")))?
+            .into_raw_fd()
+    } else if let Some(rest) = address.strip_prefix("tcp:") {
+        TcpStream::connect(rest)
+            .map_err(|error| Error::Wire(format!("connect {rest}: {error}")))?
+            .into_raw_fd()
+    } else {
+        return Err(Error::Wire(format!("bad TENON_GATEWAY address: {address}")));
+    };
+    let write = unsafe { libc::dup(fd) };
+    if write < 0 {
+        return Err(Error::Wire("dup of the gateway socket failed".to_string()));
+    }
+    Ok(unsafe { (File::from_raw_fd(fd), File::from_raw_fd(write)) })
+}
+
 impl Plugin {
+    /// Panics only through `exit(1)`: a plugin that cannot reach its wire has
+    /// nothing to report to and nobody to report it to but stderr.
     pub fn new(inject: &[&str]) -> Self {
-        let reader = unsafe { File::from_raw_fd(WIRE_IN_FD) };
-        let writer = unsafe { File::from_raw_fd(WIRE_OUT_FD) };
+        match Self::try_new(inject) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                eprintln!("tenon: no wire: {error}");
+                process::exit(1)
+            }
+        }
+    }
+
+    pub fn try_new(inject: &[&str]) -> Result<Self> {
+        let (reader, writer) = wires()?;
+        Ok(Self::with_wires(inject, reader, writer))
+    }
+
+    pub fn with_wires(inject: &[&str], reader: File, writer: File) -> Self {
         Plugin {
             inject: inject.iter().map(|name| name.to_string()).collect(),
             max_frame: env_int("TENON_MAX_FRAME", DEFAULT_MAX_FRAME as u64) as usize,
