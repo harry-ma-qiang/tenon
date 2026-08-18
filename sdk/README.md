@@ -121,7 +121,7 @@ brokers discovery through services. `../plugins/term` is the worked example: out
 64 KiB becomes `{"handle": path, "bytes": n}` and the caller pages it back with
 `term.read`.
 
-## TENON_GATEWAY socket mode (python)
+## TENON_GATEWAY socket mode (python and rust)
 
 Wire v1.1 (fd 3/4) is how the host spawns a plugin directly. Inside a P3.1 sandbox
 (`oci`, `landlock`) nothing spawns the plugin process with those descriptors wired up —
@@ -146,9 +146,23 @@ kernel treats a socket-backed fiber exactly like a port-backed one. Without
 `TENON_GATEWAY` set, behavior is unchanged: fd 3/4, as before. Passing `wire_in`/`wire_out`
 explicitly (tests, `example.py`) always wins over both.
 
-Typescript and rust do not have this mode yet — only python plugins are expected to run
-disposably inside a sandbox in P3.1; the other two SDKs stay fd 3/4-only until a runtime
-needs them there too.
+`rs/src/lib.rs` does the same since P3.2, because `tenon worker` is a rust plugin that
+runs inside the sandbox:
+
+```rust
+let mut plugin = tenon_sdk::Plugin::try_new(&[])?;   // or Plugin::new(&[]), which
+plugin.on_load(|config, next| { ... });              // exits 1 with the reason instead
+plugin.run()
+```
+
+`wires()` reads `TENON_GATEWAY` (`unix:<path>` or `tcp:<host>:<port>`); on a match it
+connects a `UnixStream`/`TcpStream`, `dup`s the descriptor and hands back the two `File`
+ends the `Plugin` already expects, so nothing downstream of the transport changes. Without
+the variable it is fd 3/4 exactly as before. `Plugin::with_wires(inject, reader, writer)`
+takes the two ends directly (tests, a host that wires its own pipes) and always wins.
+
+Typescript does not have this mode yet; it stays fd 3/4-only until a runtime needs it
+there too.
 
 ## Frame cap
 
