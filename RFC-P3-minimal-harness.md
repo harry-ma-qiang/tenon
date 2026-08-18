@@ -1,9 +1,14 @@
 # RFC P3 — Minimal complete harness in Rust on the Tenon kernel (draft for review)
 
-Author: Fable, 2026-08-18. Status: draft v3.4 (after readiness review), for Gemini/human review. Numbering:
+Author: Fable, 2026-08-18. Status: draft v3.5, for Gemini/human review. Numbering:
 P{m}.{n} from here on (P0 toolchain, P1 kernel, P2 loader/sdk/bridge are done; this is P3).
 v2 changes: one Rust binary; harness in Rust with the seam checklist; krun-only VM; change protocol,
 blue/green kernels and LKG added; qemu-tcg dropped.
+v3.5 changes: barebone vs runtime vocabulary + runtime contract (any runtime, even DSH, may
+replace the default one while the barebone keeps watching); gateway plugin + kernel socket-fiber
+instead of a kernel listener; hard rules reduced to boundary + budgets + kill switch + host-affecting
+human gates; guardian probe parameters and pluggable probes; attach/detach, exit-on-detach, replay
+semantics; SQLite versioning stance; context overflow deferred to the memory/navigator stage.
 v3.4 changes: readiness review (section 10) — wire v2 socket listener, worker as a replaceable
 plugin, model-facing management tools + config API + docs section, approval RPC, minimal truncation,
 harness on host (keys never enter the VM), OS-level supervision of base, LKG backup of state.sqlite,
@@ -41,13 +46,24 @@ Responsibilities (the `tenon` binary in base role + the Erlang kernel it launche
 3. Snapshot and rollback: git-snap of plugin dirs + config + workspace per step; `refs/tenon/lkg`
    (last known good); `tenon rollback` restores LKG and restarts; the base never mounts code from an
    agent-writable path without a snapshot first.
-4. Hard rules (few, simple, verifiable, enforced at the boundary, not inside the agent):
-   - deny list: base binary/config paths, credential files, `rm -rf /`-class commands
-   - egress allowlist (domains) for workers
-   - budgets with hard stop
-   - human gates for irreversible actions (git push, payments, deletes outside workspace, publishing)
-   - immutable base: base runs outside the sandbox as a distinct OS user; agents run inside
-     VM/container/landlock; the base holds the hypervisor/container handles
+4. Hard rules, v1 (inside the sandbox everything is allowed; the rules live at the boundary):
+   - the sandbox boundary itself (no host access, keys stay on the host)
+   - budgets with hard stop (tokens, money, wall time, processes)
+   - kill switch (file/socket/signal)
+   - human gates only for host-affecting actions (push-out of the workspace, publishing, changing
+     base config); no deny lists inside the VM
+   - immutable barebone: base runs outside the sandbox as a distinct OS user and holds the
+     hypervisor/container handles
+4b. Vocabulary. Barebone = base + guardian node G + the built-in kernel copy + the built-in worker
+   (LKG fallback): fixed by design, changed only by human releases. Runtime = agent node A + harness
+   + worker + gateway: replaceable as a whole. Runtime contract: a runtime registers with base over
+   the base RPC (manifest name/version/hash, health endpoint, event/approval channel), answers probes,
+   writes the event log. Any runtime that meets the contract can replace the default one — the
+   agent's own, or DSH mounted as the runtime — while the barebone keeps the old kernel watching, the
+   kill switch and LKG. Guardian probes and reset: VM dead, wedged waits, health failures over N
+   (configurable, default 6) or service gone -> reset (kill runtime, restore LKG, restart). Core
+   probes are fixed in G; extra probe plugins may be added from a signed/human-approved directory
+   listed in config (pluggable, not agent-mutable).
 5. Two kernels, one implementation: base starts two BEAM nodes from the same payload. Node G
    (guardian): embedded mode, read-only code path, code loading disabled; runs the watchdog tree
    (health/budget/hard-rule probes over the wire, notifier, approval gate, `reset`). Node A (agent):
@@ -134,6 +150,10 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
   directories: SQLite is the application file format (BLOBs up to 1 GB per row, incremental read via
   `blob_open`, `incremental_vacuum` to shrink); large tool outputs and per-step snapshot packs are
   BLOB rows with a retention policy. gix is not used on the host.
+- Versioning stance: the "git underneath" need is met without changing stores — `events` is the
+  version history (state = fold(events)), `packs` is the workspace version history, LKG promotion
+  copies the DB; if row-level DB time-travel is ever wanted, SQLite session changesets store a
+  per-step diff. No Kafka-style store, no Dolt-style DB (none mature in Rust).
 - Why SQLite and not something else: append-heavy small rows, transactions, FTS5, vectors later
   (sqlite-vec), single file, mature. DuckDB is columnar/analytical and weak at many small writes; it
   can read the SQLite file directly for episode analytics later, so nothing is lost by not choosing it
@@ -154,11 +174,11 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 | Step | Deliverable | Test gate |
 |---|---|---|
 | P3.0 | Cargo workspace `tenon/rs/` (crates: base, worker, harness, storage, sandbox, sdk moved from sdk/rs); release layout `~/.tenon/`; base extracts the BEAM release and starts two nodes (guardian G read-only, agent A), `tenon start/attach/stop/reset` | base boots G + A from a profile; kill -9 base -> both nodes stop; `tenon reset` restarts A from LKG while G stays up |
-| P3.1 | sandbox trait + `oci` + `landlock` backends; conformance suite; wire v2 socket listener in the kernel (UDS/vsock accept) so plugins born inside the sandbox can register | same worker tests pass on both; egress/deny policy enforced; a python plugin started inside the sandbox registers a service |
+| P3.1 | sandbox trait + `oci` + `landlock` backends; conformance suite; kernel socket-backed external fiber (`%{socket: S}` spec, ~80 lines Erlang) + `gateway` plugin in node A: listens on one configurable port (HTTP/WS/SSE carrier; vsock/UDS same frames), each connection is mounted as a real fiber, disconnect = fiber gone; two ports, two processes (base UDS vs gateway) | same worker tests pass on both; a python plugin started inside the sandbox registers a service through the gateway; killing the VM or the gateway leaves base untouched |
 | P3.2 | worker: pty/fs/edit + step-granular git-snap inside `workspace.img`; folds playground spike + plugins/term; wire fd 3/4 and UDS/vsock; expiry policy | tool round trips, spill, PGID kill, snapshot/restore/expiry, 500 steps no leak, image grows then trims |
-| P3.3 | harness (runs on the host, holds the model key; only tool calls cross into the sandbox): llm + loop + session log + tools bus + policy hooks + budget-based truncation; model-facing management tools (`plugin.list/mount/unmount/restart`, `config.get/patch`, `snapshot.list/restore`, `upgrade.propose/status`, `approval.request`) + a "how to extend Tenon" prompt section | real model turn; resume from log; guard denies; tools single authority (DSH rows disabled when ours mounted); the agent mounts a new plugin through the tools and sees it in `tree` |
+| P3.3 | harness (runs on the host, holds the model key; only tool calls cross into the sandbox): llm + loop + session log + tools bus + policy hooks (context overflow handling deferred to the memory/navigator stage; v1 lets the model API error fail the turn gracefully); model-facing management tools (`plugin.list/mount/unmount/restart`, `config.get/patch`, `snapshot.list/restore`, `upgrade.propose/status`, `approval.request`) + a "how to extend Tenon" prompt section | real model turn; resume from log; guard denies; tools single authority (DSH rows disabled when ours mounted); the agent mounts a new plugin through the tools and sees it in `tree` |
 | P3.4 | storage crate + schema; episodes written by loop | replay a session from SQLite; episodes count grows |
-| P3.5 | hard rules + budgets + LKG rollback + kill switch; approval RPC (`approval.request/answer`, `tenon approve`); guardian probe list (A alive, tree healthy, worker responsive, budgets, hard-rule violations in the log); OS-level supervision (systemd --user / launchd unit; base runs no user code, panic = abort); `state.sqlite` copied at every LKG promotion; plugin + LKG manifests (name/version/hash) | violation -> stop + rollback + human notice; budget hard stop; kill -9 base -> supervisor restarts it and A resumes from LKG; a corrupted state file is replaced by the LKG copy |
+| P3.5 | hard rules v1 (boundary, budgets, kill switch, host-affecting human gates) + LKG rollback; runtime contract + `runtime.register`; attach/detach (`tenon attach` like vibe-term; `exit-on-detach` for early use: all runtimes stop gracefully — drain, push packs, write log; on start base rebuilds the VM, restores the latest snapshot and the harness resumes sessions from the event log; long-running guest processes are not restored by design); approval RPC (`approval.request/answer`, `tenon approve`); guardian probe list (A alive, tree healthy, worker responsive, budgets, hard-rule violations in the log); OS-level supervision (systemd --user / launchd unit; base runs no user code, panic = abort); `state.sqlite` copied at every LKG promotion; plugin + LKG manifests (name/version/hash) | violation -> stop + rollback + human notice; budget hard stop; kill -9 base -> supervisor restarts it and A resumes from LKG; a corrupted state file is replaced by the LKG copy |
 | P3.6 | `krun` backend (Mac HVF / CI KVM) + release CI (Linux x64/arm64, macOS) producing the single `tenon` binary | krun passes the same conformance suite; fresh machine: download one file, `tenon run` works |
 | P3.7 | change protocol + blue/green kernels (section 8b): `harness.upgrade`, `kernel.upgrade`, LKG promotion, benchmark gate; contract suite shipped as `tenon check kernel` (runtime artifact); worker declared a replaceable plugin (built-in worker = LKG fallback) | agent upgrades a plugin, a worker and the kernel without downtime; a bad upgrade auto-rolls back with the reason returned to the agent |
 
