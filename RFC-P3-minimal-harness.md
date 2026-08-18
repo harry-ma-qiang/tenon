@@ -59,7 +59,7 @@ Responsibilities (the `tenon` binary in base role + the Erlang kernel it launche
 | S3 | harness | `tenon harness` role, Rust plugin process | llm adapter (DeepSeek/OpenAI-compatible, streaming, retry), agent loop (turn/step, tool calls), session log (append-only, replay/resume), tools bus (aggregate catalogs, single authority), policy/approval hooks, compaction stub |
 | S4 | worker | `tenon worker` role (same file, inside sandbox) | pty/bash (tail + spill + PGID ladder), fs (view/edit/write/grep/glob), git-snap (snapshot/restore/diff), speaks wire over fd 3/4 or vsock/UDS |
 | S5 | sandbox | Rust in base | trait + backends (section 4) |
-| S6 | storage | Rust crate | SQLite (log/index/graph) + gix ODB (blobs/trees/snapshots) (section 6) |
+| S6 | storage | Rust crate | `state.sqlite` (events, index, memory, episodes, blobs, snapshot packs); gix only inside the worker (section 6) |
 | S7 | front door | CLI first; TUI = P4 | `tenon run "task"`, `tenon attach`, `tenon rollback` |
 | S8 | DSH bridge | TS (done) | long tail of DSH stays available as one plugin |
 
