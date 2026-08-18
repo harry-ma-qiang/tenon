@@ -8,7 +8,9 @@ defmodule Tenon.Beam.LinkTest do
     {base, path} = Base.start(self())
     {:ok, kernel} = :tenon.start()
     ctx = :tenon.root(kernel)
-    {:ok, loader} = :tenon.mount(ctx, %{module: Tenon.Loader, id: "loader", config: %{layers: []}})
+
+    {:ok, loader} =
+      :tenon.mount(ctx, %{module: Tenon.Loader, id: "loader", config: %{layers: []}})
 
     config = %{
       sock: path,
