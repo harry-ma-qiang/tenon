@@ -343,3 +343,67 @@ Full list with reasoning in `rs/README.md` and `beam/README.md`. The load-bearin
 
 P3.1: sandbox trait with oci and landlock backends, the conformance suite, the kernel
 socket-backed external fiber spec and the gateway plugin in node A.
+
+## 18. P3.1a result: kernel socket-backed fibers + gateway plugin (2026-08-18)
+
+`kernel/src/tenon.erl`: 989 -> 997 lines (+8 net; 42 insertions/34 deletions). A transport
+tag `{port, Port} | {socket, Sock} | undefined` replaces the bare `Port` field so
+send/close/`handle_info` share one code path for a spawned OS process and an
+already-connected socket; `kind/1` treats a `socket` key exactly like `cmd` (both are
+`external`); `mount/2` claims a passed socket's controlling process itself. New:
+`kernel/test/tenon_socket_test.exs` (192 lines, 5 tests). `beam/lib/tenon/beam/gateway.ex`
+(23 lines) + `gateway/server.ex` (121 lines) = 144 lines; `beam/test/gateway_test.exs` (108
+lines, 4 tests); `beam/lib/tenon/beam/boot.ex` +25 lines (mounts `Gateway` in agent-role
+nodes, alongside `Link` and the guardian-role `Guardian`).
+
+### Lines and tests
+
+| Part | LoC | Tests |
+|---|---|---|
+| `kernel/src/tenon.erl` | 997 (was 989, +8) | 66 (was 61; +5 socket tests) |
+| `beam/lib/tenon/beam/gateway*` | 144 (`gateway.ex` 23, `gateway/server.ex` 121) | 4 (`gateway_test.exs`) |
+| `beam/lib/tenon/beam/boot.ex` | 108 (was 83, +25) | exercised by `gateway_test.exs` + existing `link`/`guardian` tests |
+
+Gates, full last lines: kernel `mix compile` clean (erlc `warnings_as_errors`), `mix format
+--check-formatted` clean, `mix test` "66 tests, 0 failures". beam `mix compile
+--warnings-as-errors` clean, every file this task touched formatted (`test/link_test.exs`
+already fails `mix format --check-formatted` on `main`, untouched here — see deviation 5),
+`mix credo --strict` "139 mods/funs, found no issues", `mix test` "18 tests, 0 failures",
+`MIX_ENV=prod mix release` assembled.
+
+### Deviations
+
+1. **`mount(Ctx, %{socket => Sock})` does not require `Sock` to already be `{active,
+   true}`.** `mount/2` runs in the caller's own process — the socket's real owner at that
+   point — so it transfers control to the new fiber and only then flips `active` on, both
+   from that one process. Activating before the transfer is a race OTP's own docs call out:
+   a message can be delivered to the old owner in the gap. `Tenon.Beam.Link.Server` already
+   uses this exact sequence for the base connection; the gateway's acceptor mirrors it.
+2. A handful of the smallest new kernel dispatch clauses (`connect_external/1`, `tx_send/2`,
+   the socket clause of `close_port/1`, several `handle_info` heads) are one line per clause
+   to keep `tenon.erl` under the 1000-line ceiling; every other new clause matches the
+   file's existing multi-line style. Two pre-existing clauses (`close_port`'s port case, the
+   frame-cap check now factored into `handle_incoming/2`) were reformatted onto fewer lines
+   for the same reason — no logic changed, confirmed by the full test suite before and after.
+3. **Restarting a socket fiber fails it with `socket_unavailable`** instead of trying to
+   reopen the socket — `restart/1,2`, and a refresh after a lost-then-regained dependency,
+   go through `spawn_or_load/1`, which has nothing to respawn a closed socket with, per the
+   RFC. The very first mount is unaffected: it is dispatched through a separate
+   `connect_external/1`, not through the restart path.
+4. **The gateway's acceptor hands each accepted socket to a short-lived process before
+   calling `:tenon.mount/2`**, rather than mounting inline in the accept loop. `mount/2`
+   blocks its caller until the fiber settles (`hello` arrives, or the deadline fires), so
+   mounting inline would let one slow or silent client stall every other connection from
+   being accepted.
+5. A pre-existing, low-frequency (roughly 1 in 3-5 runs, reproduces identically on
+   unmodified `tenon.erl` from `main`) benign crash log — `ets:select` on a hooks table that
+   no longer exists, from a fiber processing a stray exit message after its kernel has
+   already torn down during test cleanup — surfaces in both the kernel and beam suites. It
+   never fails a test and is not introduced by this work; left alone as out of scope.
+   `beam/test/link_test.exs` being unformatted on `main` is the same kind of pre-existing,
+   out-of-scope condition, left untouched rather than reformatted as a drive-by fix.
+
+### Next
+
+P3.1 remainder: the sandbox trait with `oci` and `landlock` backends and the conformance
+suite (the other half of the P3.1 row). The worker as a resident process is P3.2.
