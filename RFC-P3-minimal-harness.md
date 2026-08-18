@@ -1,6 +1,6 @@
 # RFC P3 — Minimal complete harness on the Tenon kernel (v4, consolidated)
 
-Author: Fable. 2026-08-18. Status: draft v4.1 (AGY review folded in) for human sign-off. Supersedes v1-v3.6 (history in
+Author: Fable. 2026-08-18. Status: v4.2 (built-in ASCII UI added) — in execution. Supersedes v1-v3.6 (history in
 git). Numbering P{m}.{n}: P0 toolchain, P1 kernel, P2 loader/SDKs/bridge are done; this is P3.
 
 ## 0. Scope in one paragraph
@@ -126,6 +126,20 @@ worker, storage, sandbox, wire (sdk/rs moves here); one bin target. TUI is P4.
   worker (P3.7 formalizes).
 - DSH long tail (compaction, subagents, skills, LSP, web UI) stays behind the bridge, opt-in.
 
+## 6b. Built-in ASCII UI (the barebone's own face)
+
+One dependency-free renderer, two carriers. `rs/ui`: `render(state, cols, rows) -> text`, pure
+function over the event log, envs, kernel tree and approvals; pure ASCII (`+-|` borders), folding as
+text markers. Responsive by columns: <80 one column (tree, transcript, events stacked), 80-140 two
+(tree | transcript), >140 three (tree | transcript | event tail); rows size the tails. Terminal
+carrier: `tenon attach --ui` (terminal size, ANSI clear + redraw on events; keys p prompt, a
+approve, r rollback, q). Web carrier: optional `tenon serve --http 127.0.0.1:<port>` in base
+(feature-gated axum): `GET /` returns a `<pre>` page (`?cols=`; works without JS; a few inline lines
+may report viewport width and open SSE for refresh), `<form>` POSTs `/prompt`, `/approve/<id>`,
+`/rollback`; CGI-like: every request renders once, no UI state on the server; localhost only. Served
+by base, so it works when the runtime is broken — the guardian's window and the human gate UX. Does
+not replace the P4 TUI or the DSH web app (still plugins). ~1-1.5k Rust.
+
 ## 7. Sandbox
 
 ```
@@ -205,7 +219,7 @@ only if it beats LKG on the benchmark set. The barebone holds LKG and the judge,
 
 ## 11. Attach, detach, exit, replay, approvals
 
-Approvals (two channels, no file sprawl): while attached in the foreground the CLI prompts `[y/N]`
+Approvals (two channels, no file sprawl): while attached the ASCII UI (or the plain CLI) prompts
 inline; otherwise the pending request is a row in the `approvals` table, surfaced as a banner on the
 next `tenon attach`, answered by `tenon approve <id>` or a UDS frame; G owns the queue and timeouts.
 
@@ -223,7 +237,7 @@ snapshot, not re-executing steps; long-running guest processes are not restored.
 | P3.2 | worker as one resident process (in-process tools, pty ring buffers + spill, step git-snap, .gitignore, packs to host, expiry; registers via gateway in VM mode, fd 3/4 otherwise); `runtime.spawn` prototype (child env as external fiber, config = parent + patch, per-env state file, parent-death prunes, limits) | round trips, spill, PGID kill, snapshot/restore/expiry, 500 steps no leak; A spawns B, `tree` shows A->B, killing A removes B, B cannot reach A's RPC |
 | P3.3 | harness (host, key) + seams + management tools + docs prompt section | real model turn; resume from log; guard denies; single authority; the agent mounts a plugin through the tools and sees it in `tree` |
 | P3.4 | storage crate + schema; episodes written by the loop | replay a session from SQLite; episodes grow |
-| P3.5 | hard rules v1, budgets, kill switch, approval RPC (`approval.request/answer`, `tenon approve`), runtime contract + `runtime.register`, probes, OS supervision, state copies at LKG, manifests, per-env privilege drop, exit-on-detach/replay | violation -> stop + rollback + notice; budget hard stop; kill -9 base -> supervisor restarts, A resumes from LKG; corrupted state replaced by LKG copy |
+| P3.5 | built-in ASCII UI (`rs/ui`, `attach --ui`, `serve --http`, snapshot tests at 3 widths, HTTP GET/POST tests); hard rules v1, budgets, kill switch, approval RPC (`approval.request/answer`, `tenon approve`), runtime contract + `runtime.register`, probes, OS supervision, state copies at LKG, manifests, per-env privilege drop, exit-on-detach/replay | violation -> stop + rollback + notice; budget hard stop; kill -9 base -> supervisor restarts, A resumes from LKG; corrupted state replaced by LKG copy |
 | P3.6 | krun backend (Mac/CI) + release CI producing the single `tenon` binary | krun passes the suite; fresh machine: download one file, `tenon run` works |
 | P3.7 | change protocol + blue/green kernels; `tenon check kernel`; worker as replaceable plugin; benchmark gate | agent upgrades a plugin, a worker and the kernel without downtime; a bad upgrade auto-rolls back with the reason |
 
