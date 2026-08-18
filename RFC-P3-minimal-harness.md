@@ -1,9 +1,12 @@
 # RFC P3 — Minimal complete harness in Rust on the Tenon kernel (draft for review)
 
-Author: Fable, 2026-08-18. Status: draft v2 (after discussion), for Gemini/human review. Numbering:
+Author: Fable, 2026-08-18. Status: draft v3 (after discussion), for Gemini/human review. Numbering:
 P{m}.{n} from here on (P0 toolchain, P1 kernel, P2 loader/sdk/bridge are done; this is P3).
 v2 changes: one Rust binary; harness in Rust with the seam checklist; krun-only VM; change protocol,
 blue/green kernels and LKG added; qemu-tcg dropped.
+v3 changes: guardian + agent kernels as two BEAM nodes; VM by default with a single sparse workspace
+image and step-granular git snapshots inside it; host state = one SQLite + blob dir; gix only inside
+the worker; DSH plugins as the opt-in long tail; ~6k Rust target.
 
 ## 1. Claim under review
 
@@ -35,7 +38,14 @@ Responsibilities (the `tenon` binary in base role + the Erlang kernel it launche
    - human gates for irreversible actions (git push, payments, deletes outside workspace, publishing)
    - immutable base: base runs outside the sandbox as a distinct OS user; agents run inside
      VM/container/landlock; the base holds the hypervisor/container handles
-5. Chicken and egg resolved: the base does not evolve itself. Humans ship base releases; agents evolve
+5. Two kernels, one implementation: base starts two BEAM nodes from the same payload. Node G
+   (guardian): embedded mode, read-only code path, code loading disabled; runs the watchdog tree
+   (health/budget/hard-rule probes over the wire, notifier, approval gate, `reset`). Node A (agent):
+   the replaceable tree, agents may hot-load code there. Two nodes, not two kernels in one node,
+   because a hot-loaded `tenon.erl` would replace the module for both. Reset = base kills A, restores
+   LKG, restarts A; details of "crazy" detection are P3.5/P3.7, P3.0 only ships the two-node boot and
+   the reset command.
+6. Chicken and egg resolved: the base does not evolve itself. Humans ship base releases; agents evolve
    plugins; the base rolls plugins back. A super-intelligent agent would have to break the sandbox
    boundary first; that is the ground the base holds "for a long while".
 
@@ -53,8 +63,11 @@ Responsibilities (the `tenon` binary in base role + the Erlang kernel it launche
 | S7 | front door | CLI first; TUI = P4 | `tenon run "task"`, `tenon attach`, `tenon rollback` |
 | S8 | DSH bridge | TS (done) | long tail of DSH stays available as one plugin |
 
-Rough LoC: base 1.5-2k, harness 2-3k, worker 1.5-2k (folds playground spike + plugins/term), storage
-0.5-1k, tests ~1x.
+Rough LoC (v3, minimal set only): base 1.2k, sandbox 0.8k, worker 1.5k, harness-lite 2k (loop, llm,
+session log, tools bus, hooks; no compaction, no subagents, no UI), storage 0.5k = ~6k Rust + tests.
+Everything else (compaction, subagents, web UI, skills, LSP) is the DSH long tail behind the bridge,
+opt-in, not loaded by default. Reuse crates, no wheels: libkrun-sys, rusqlite (bundled), gix,
+landlock, portable-pty, tokio, reqwest (streaming).
 
 Shipping shape: ONE Rust binary `tenon` with four roles selected by subcommand — `tenon start|attach|
 stop|rollback` (base), `tenon harness` (spawned by base as a plugin), `tenon worker` (the same file
@@ -77,22 +90,32 @@ tests across backends. This dev box has no `/dev/kvm` (cloud ARM, no nested virt
 develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub Actions Linux runners
 (KVM available). Windows: not planned until there is a machine to test on. qemu-tcg dropped.
 
-## 5. Filesystem: one model for the agent, two layers underneath
+## 5. Filesystem: VM by default, one workspace image, snapshots inside it
 
+- Default: the agent runs inside the VM with no host access. The only host writes are the config file
+  and the state files in section 6. The VM's workspace is ONE sparse disk image (`workspace.img`,
+  ext4, grows on demand, `fstrim` to shrink), attached as virtio-blk. Inside the guest it is a normal
+  filesystem: native IO, nothing to notice.
 - Model-facing tools are POSIX only (view/edit/write/bash + snapshot/time_travel). Single authority.
-- gix is the state layer under the POSIX tree: per-step snapshots (separate GIT_DIR, never the user's
-  `.git`), CoW workspace derivation for parallel hypotheses (overlayfs/reflink where available, plain
-  checkout otherwise), rollback, diff for the model, host<->worker sync (git push/fetch when strict
-  isolation; virtio-fs when speed matters).
-- No gix-backed FUSE filesystem now: large, slow, and compilers/tests need real POSIX anyway.
+- Snapshots are step-granular, not per syscall: the worker commits the workspace tree with gix at each
+  tool-step boundary (post-execute hook) and before risky operations; GIT_DIR lives inside the image.
+  Rollback/diff/time-travel/CoW hypothesis workspaces are git operations inside the guest. Host reads
+  snapshots through the worker (bundle over the wire) or by loop-mounting the image when stopped.
+- Growth control: expiry policy (keep last N steps, LKG, tagged, and one milestone every M steps;
+  `gc --prune` the rest) plus periodic trim. No transparent git filesystem: none is production-proven
+  in Rust and per-write commits would be far too slow.
+- User's project files: default is clone-in / push-out with human review (strong isolation); opt-in
+  virtio-fs mount of a host directory when convenience beats isolation.
 
 ## 6. Storage: SQLite + gix ODB, and how memory/navigator land on it
 
-- SQLite (rusqlite bundled, WAL): `events` (session log, append-only), `tool_results` (index, blob
-  hash), `snapshots` (step -> ref), `memory_nodes`, `memory_edges` (triples, confidence, outcomes),
+- Host state is small and boring: `state.sqlite` (rusqlite bundled, WAL) + `blobs/` (content-
+  addressed files, sha256 names) + `config` + `workspace.img`. gix is not used on the host.
+- SQLite tables: `events` (session log, append-only), `tool_results` (index, blob hash), `snapshots`
+  (step -> ref inside the image), `memory_nodes`, `memory_edges` (triples, confidence, outcomes),
   `embeddings` (blob; brute-force cosine at our scale; sqlite-vec later), `episodes` (state hash,
-  action, verifier score, cost) for the navigator.
-- gix ODB: file blobs, trees, snapshots, large tool outputs (referenced by hash from SQLite).
+  action, verifier score, cost) for the navigator. Large tool outputs go to `blobs/`, referenced by
+  hash. SQLite is not stored inside git and git is not used as a query engine.
 - Rules: model-visible == logged (DSH law) applies to `events`; memory writes are commit-verified
   (explore in the working tree, commit only outcomes confirmed by verifiers); episodes are written by
   the loop for free from day one, so the navigator has data before it exists.
@@ -103,9 +126,9 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 
 | Step | Deliverable | Test gate |
 |---|---|---|
-| P3.0 | Cargo workspace `tenon/rs/` (crates: base, worker, harness, storage, sandbox, sdk moved from sdk/rs); release layout `~/.tenon/`; base extracts + starts BEAM release, `tenon start/attach/stop` | base boots kernel + loader from a profile; kill -9 base -> kernel stops; restart resumes |
+| P3.0 | Cargo workspace `tenon/rs/` (crates: base, worker, harness, storage, sandbox, sdk moved from sdk/rs); release layout `~/.tenon/`; base extracts the BEAM release and starts two nodes (guardian G read-only, agent A), `tenon start/attach/stop/reset` | base boots G + A from a profile; kill -9 base -> both nodes stop; `tenon reset` restarts A from LKG while G stays up |
 | P3.1 | sandbox trait + `oci` + `landlock` backends; conformance suite | same worker tests pass on both; egress/deny policy enforced |
-| P3.2 | worker: pty/fs/edit + git-snap; folds playground spike + plugins/term; wire fd 3/4 and UDS | tool round trips, spill, PGID kill, snapshot/restore, 500 steps no leak |
+| P3.2 | worker: pty/fs/edit + step-granular git-snap inside `workspace.img`; folds playground spike + plugins/term; wire fd 3/4 and UDS/vsock; expiry policy | tool round trips, spill, PGID kill, snapshot/restore/expiry, 500 steps no leak, image grows then trims |
 | P3.3 | harness: llm + loop + session log + tools bus + policy hooks | real model turn; resume from log; guard denies; tools single authority (DSH rows disabled when ours mounted) |
 | P3.4 | storage crate + schema; episodes written by loop | replay a session from SQLite; episodes count grows |
 | P3.5 | hard rules + budgets + LKG rollback + kill switch | violation -> stop + rollback + human notice; budget hard stop |
@@ -134,7 +157,10 @@ then the harness (what makes it a harness), then storage, then the hard rules, t
 - Unix-only tool surface; gix as state layer.
 - SQLite + gix ODB; no external DB.
 - VM backend: krun only; oci + landlock as non-VM backends.
-- Names: base, worker, harness, memory graph, navigator, snapshot, workspace, verifier.
+- Names: base, guardian node, agent node, worker, harness, memory graph, navigator, snapshot,
+  workspace image, verifier.
+- Two BEAM nodes (guardian G read-only, agent A writable) from one payload; VM by default; host state =
+  config + state.sqlite + blobs/ + workspace.img; gix only inside the worker; DSH long tail opt-in.
 
 ## 8b. Change protocol, mutability tiers, always-online
 
