@@ -22,7 +22,7 @@ tenon start                      the base process
 | `storage` | `state.sqlite`: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, `events`, `envs` |
 | `sandbox` | the `Sandbox` trait plus `none`, `oci` (podman/docker) and `landlock` backends; `krun` is a P3.6 placeholder |
 | `harness` | role stub (P3.3) |
-| `worker` | role stub (P3.2); its public error type is already the wire SDK's |
+| `worker` | the `tenon worker` role (P3.2): one resident process inside the sandbox serving `bash`, `pty.*`, `fs.*` and `snap.*` over the wire |
 | `cli` | the `tenon` bin target and `build.rs`, which embeds the BEAM release |
 
 ## Build
@@ -74,8 +74,10 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `run/base.lock` | an exclusive `flock`, held for the life of the base process; guards against a second `start` |
 | `run/base.ready` | holds the base pid while it is up; how `tenon start` waits. Written atomically (temp file + rename) |
 | `run/{base,guardian,root}.log` | stdout and stderr of base and of each node |
-| `run/gateway-<env>.sock` | default `TENON_GATEWAY` unix socket for that env's node, passed to it and (oci/landlock) reachable from inside its sandbox |
-| `envs/<env>/workspace/` | that env's sandbox workspace, bind-mounted (oci) or granted read-write (landlock) at the same path |
+| `run/gw-<env>/gateway.sock` | that env's `TENON_GATEWAY` unix socket. One directory per env, because the oci backend bind-mounts the socket's **directory**: a shared `run/` would put base's front door and every sibling's gateway inside every sandbox |
+| `state-<env>.sqlite` | that env's state file: the `packs` table of workspace snapshots pulled off its worker |
+| `envs/<env>/workspace/` | that env's sandbox workspace, bind-mounted at `/workspace` (oci) or granted read-write at the same path (landlock). `.tenon-snap/` (the snapshot GIT_DIR), `.tenon-out/` (handles and spill files) and `.tenon-restore/` (packs staged for a restore) live inside it |
+| `profiles/<child>/overlay.patch.yml` | a spawned child env's own patch layer; its `TENON_PROFILE` is the parent's layers plus this file |
 | `lkg/` | `config.yml`, `profiles/`, `state.sqlite` copied at every successful boot |
 
 ## Double start, boot signals, state integrity, node auth
@@ -118,6 +120,14 @@ sandbox: auto              # auto | oci | landlock | none
 guardian:
   interval_ms: 2000
   failures: 6
+worker:
+  boot_timeout_ms: 30000   # from "sandbox up" to the worker answering on the wire
+  pull_interval_ms: 5000   # how often base pulls new snapshot packs off each worker
+  keep_packs: 40           # packs kept per env in state-<env>.sqlite
+envs:
+  max_total: 8             # agent environments alive at once, the whole tree
+  max_depth: 3             # root is depth 0, so a depth-4 spawn is refused
+  ram_mb: 512              # per-env sandbox memory cap for spawned children
 ```
 
 The default profile mounts `plugins/term`'s release binary if it is built, otherwise
@@ -151,14 +161,21 @@ when the env stops. Base runs no user code itself — it only spawns, execs into
 `sandbox.exec`, below) and destroys instances, and reports their id/backend/attach
 address in `status`.
 
-**oci.** Default image `python:3.12-alpine` (has `python3`, `sh`, `timeout`); override
-with the `TENON_SANDBOX_IMAGE` env var on base. Memory capped at `policy.ram_mb`
+**oci.** Default image `python:3.12-slim` (has `python3`, `sh`, `timeout`); override
+with the `TENON_SANDBOX_IMAGE` env var on base. The image is **glibc**-based on
+purpose since P3.2: base mounts its own binary read-only at `/usr/local/bin/tenon`
+inside the instance and runs `tenon worker` from it, so the host binary has to load
+there (Debian trixie ships glibc 2.41, this box builds against 2.39). `alpine` stays
+a documented option and needs a musl static build of `tenon` — that is P3.6, not a
+config switch. Memory capped at `policy.ram_mb`
 (default 512, via `--memory`), process count at `policy.pids_max` (default 256, via
 `--pids-limit`). The workspace directory is bind-mounted at `/workspace` inside the
 container. For gateway reachability: a `unix:` `TENON_GATEWAY` has its **directory**
 (not just the socket file, which may not exist yet) bind-mounted read-write at the same
 absolute path inside the container and the env var passed through unchanged, so a
-plugin connecting to `TENON_GATEWAY` from inside sees the same path as the host; a
+plugin connecting to `TENON_GATEWAY` from inside sees the same path as the host. That
+directory is `run/gw-<env>/` and holds exactly one socket, which is what keeps a child
+environment out of its parent's gateway and out of base's front door; a
 `tcp:` gateway is passed through unchanged with `--network host` added (Linux-only,
 documented here rather than attempted cross-platform). `TENON_SANDBOX_ENV` is a
 comma-separated list of host env var names forwarded into the container (`-e NAME=value`
@@ -204,6 +221,143 @@ carried through but not enforced by either real backend yet — RFC section 14, 
 question 4). Landlock has no resource-limit concept; a future P3.5 privilege-drop pass
 may pair it with cgroups for that.
 
+
+## The worker (P3.2)
+
+`tenon worker` is the resident tool process inside a sandbox instance. One process per
+env, started by base once that env's node has registered (so its gateway is listening),
+launched as `sh -c 'cd /workspace && TENON_GATEWAY=... nohup /usr/local/bin/tenon worker
+--workspace /workspace &'` through `Sandbox::exec`. It dials `TENON_GATEWAY`, becomes a
+fiber under that node's `gateway` fiber and provides the service `worker`. Nothing forks
+per tool call: `bash` forks the user's command and that is the only fork.
+
+Base polls `svc worker.info` until it answers, then reports the worker in `status`:
+
+```json
+{"env": "root", "registered": true, "worker": {"state": "ready", "pid": 41}, "sandbox": {...}}
+```
+
+`state` is `off`, `booting`, `ready` or `failed` (with the reason). A failed worker is an
+event (`worker.failed`) and a status field, never a boot failure: the env still runs.
+
+| Method | Arguments | Answer |
+|---|---|---|
+| `ping` / `info` | — | `"pong"` / `{pid, workspace, step, sessions, cap}` |
+| `bash` | `{cmd, cwd?, timeout_ms?, env?, pty?}` | `{status, timed_out, bytes, tail, handle, truncated}` |
+| `pty.open` | `{cmd?, cwd?, env?, cols?, rows?}` | `{session, pid, cols, rows}` |
+| `pty.send` | `{session, data}` | `{session, bytes}` |
+| `pty.read` | `{session, max?}` | `{session, data, bytes, dropped, alive}` |
+| `pty.close` | `{session}` | `{session, status}` |
+| `fs.view` | `{path, start?, end?}` | `{path, start, end, lines, total, content}` |
+| `fs.write` | `{path, content}` | `{path, bytes, created}` |
+| `fs.edit` | `{path, old, new}` | `{path, replaced, bytes}` or a loud error |
+| `fs.grep` | `{pattern, path?}` | `{matches: [{path, line, text}], count, truncated}` |
+| `fs.glob` | `{pattern}` | `{paths, count, truncated}` |
+| `snap.commit` | `{label?}` | `{ref, step, label, files, at}` |
+| `snap.list` | — | `{snapshots: [{ref, step, label, at}], count}` |
+| `snap.restore` | `{ref}` (oid or step) | `{ref, step, files}` |
+| `snap.diff` | `{a, b}` | `{a, b, files, insertions, deletions}` |
+| `snap.pack` | `{since?}` | `{step, ref, bytes, refs, pack \| handle}` |
+| `snap.apply` | `{packs: [{step, ref, handle}], ref?}` | `{applied, ref, step, files}` |
+| `snap.expire` | `{keep_last?, milestone_every?}` | `{kept, removed, count}` |
+
+- **Paths** are resolved under the workspace and normalised; an absolute path outside it
+  or a `..` escape is an error, never a silent clamp.
+- **`bash`** runs `bash -lc` (or `sh -c`) under a PTY by default (`pty: false` gives
+  merged pipes). The child gets its own session/process group, so a timeout is a
+  `killpg` ladder: SIGTERM, 500 ms, SIGKILL, reap; `status` is then `124` and
+  `timed_out` is true. Output is streamed, never buffered whole: the last 32 KB come
+  back as `tail` and, once the total passes that, the **full** output is written to a
+  spill file in `.tenon-out/` and named by `handle` (so `handle`'s length equals
+  `bytes`).
+- **PTY sessions** are sentinel-free: a reader thread per session pumps the master fd
+  into a 256 KB ring, `pty.read` drains it and reports how many bytes overflow dropped.
+  No prompt detection, no marker injection — the caller polls. `close_all` runs on
+  unload, so an unmounted worker leaves no child and no fd behind.
+- **`fs.edit`** replaces a unique `old`. Zero matches and two matches are both errors
+  that name the count and leave the file alone.
+- **The wire cap is respected everywhere.** Anything whose JSON is bigger than
+  `TENON_MAX_FRAME / 8` (clamped to 8 KB..256 KB) is written to `.tenon-out/` instead and
+  answered as `{"handle": path, "bytes": n, "over_cap": true, "method": ...}`; `snap.pack`
+  does the same with the raw packfile rather than base64 in the frame. Handles are always
+  paths inside the workspace, so the host can read them straight off the bind mount.
+- **`worker/step`** is emitted after every mutating call (`bash`, `fs.write`, `fs.edit`,
+  the `pty` calls, `snap.commit/restore/apply/expire`) with `{step, method, ref}`.
+
+## Snapshots, packs and reset
+
+The worker commits the workspace with **libgit2** into a repository whose GIT_DIR is
+`<workspace>/.tenon-snap` and whose work tree is the workspace itself — never the user's
+own `.git`, which is excluded along with `.tenon-snap/` and `.tenon-out/` through the
+repo's `info/exclude`. Staging is `index.add_all` + `update_all`, so `.gitignore` is
+honoured from day one: ignored artifacts are not kept and must be rebuilt after a reset.
+
+Each snapshot is a **parentless root commit** named by `refs/snaps/<step>`, with
+`refs/heads/snap` on the newest. Parentless is deliberate: expiry becomes a ref delete
+instead of a history rewrite, and every pack is self-contained, so replaying packs in any
+prefix order still yields a checkoutable tree. `snap.expire` keeps the newest `keep_last`
+plus every `milestone_every`-th step (and always whatever `refs/heads/snap` points at).
+
+Durability is the RFC's: the guest repo is a cache, the host state file is the truth.
+
+```
+worker  --snap.pack{since}-->  base  -->  state-<env>.sqlite  packs(step, ref, bytes, created_at)
+   ^                                          |
+   +--- snap.apply{packs, ref} <--------------+   on reset: wipe workspace, write packs
+                                                  into .tenon-restore/, check the newest ref out
+```
+
+- **Pulling is on a timer, not on the event.** Base runs one `snap.pull` per env every
+  `worker.pull_interval_ms` (default 5 s). The alternative — reacting to each
+  `worker/step` — would need the event to travel worker -> kernel -> a plugin -> Link ->
+  base, which is more moving parts for the same result; a timer needs no plumbing, cannot
+  wedge on a missed event, and coalesces a burst of steps into one pack. `snap.pull{env}`
+  on the front door forces one immediately.
+- **The acknowledgement is the stored step.** The next pull asks `snap.pack{since:
+  max(step)}`, so the worker never resends a pack the host already has, and a pull that
+  finds nothing new answers `{"pulled": 0}`.
+- **`reset` replays.** Resetting an env kills the node, wipes the workspace, writes every
+  stored pack to `.tenon-restore/<step>.pack`, starts the fresh instance and, once its
+  worker answers, calls `snap.apply` — which folds the packs into a new `.tenon-snap` and
+  checks the newest ref out. Committed files come back; uncommitted and ignored ones do
+  not, by design.
+- `snap.list{env}` on the front door shows what the host holds (step, ref, size, time).
+
+## The environment tree (`runtime.spawn`)
+
+`runtime.spawn{parent?, overrides}` is the P3.2 prototype of RFC section 4. A node asks
+through `Link` (base takes the parent from the requesting connection) or a tool asks over
+the front door with an explicit `parent`. Base — the only thing that creates a runtime —
+builds the child on the host: its own sandbox instance, node A, `state-<child>.sqlite`,
+workspace and gateway directory.
+
+```
+root  (depth 0)  profiles/root/tenon.yml
+  +-- root.1 (depth 1)  TENON_PROFILE=profiles/root/tenon.yml:profiles/root.1/overlay.patch.yml
+  |     +-- root.1.1 (depth 2)  ...:profiles/root.1/overlay.patch.yml:profiles/root.1.1/overlay.patch.yml
+  +-- root.2 (depth 1)
+```
+
+- **Config is the parent's profile plus a patch layer.** `overrides.patch` is written to
+  `profiles/<child>/overlay.patch.yml` and appended to the parent's `TENON_PROFILE`,
+  which is now a `:`-separated list of loader layers; the loader applies a `.patch.yml`
+  layer over the entry list exactly as its own patch semantics prescribe. `overrides.name`
+  and `overrides.ram_mb` are the other two knobs (the RAM cap goes to the sandbox policy).
+- **The child is a fiber in the parent's tree.** Base dials the parent's gateway and
+  provides the service `env:<child>` (`status`, `stop`) on the child's behalf, so
+  `tenon status` shows the child under the parent's `gateway` fiber, and `status`'s
+  per-node `parent`, `depth` and `children` fields spell the lineage out.
+- **Limits.** `envs.max_depth` (default 3, root being 0) and `envs.max_total` (default 8,
+  guardian excluded) are checked before anything is created; both refuse with a reason.
+- **Pruning is a cascade.** A parent that dies or is stopped takes its whole subtree with
+  it: base halts every descendant deepest-first, destroys their instances, drops their
+  `envs` rows and removes their state files, then restarts the parent alone.
+  `runtime.stop{env}` does the same for one child on request (the root env refuses).
+- **A child cannot reach its parent.** Each env's gateway socket lives in its own
+  directory and only that directory is mounted into that env's instance, so from inside a
+  child neither the parent's gateway nor `run/base.sock` exists at all; `node.register`
+  still needs the per-node token base generated, so a stolen socket would not help either.
+
 ## Commands
 
 | Command | What |
@@ -214,7 +368,8 @@ may pair it with cgroups for that.
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon status` | one JSON document: base, both nodes, and each node's fiber tree |
 | `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
-| `tenon harness` / `tenon worker` | print `not implemented in P3.0`, exit 2 |
+| `tenon harness` | prints `not implemented in P3.0`, exit 2 (P3.3) |
+| `tenon worker [--workspace DIR]` | the in-sandbox tool process. Speaks the wire on `TENON_GATEWAY` when it is set, fd 3/4 otherwise. `--workspace` defaults to `$TENON_WORKSPACE`, then `/workspace`, then the working directory |
 
 `--exit-on-detach` stops everything when the last **subscriber** disconnects. `status` and
 `stop` connect without subscribing, so only `attach` holds the door open.
@@ -233,7 +388,11 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `reload{env}` | CLI | forwarded; `Tenon.Loader.reload/1` in that node |
 | `reset{env}` | guardian, CLI | kill, restore LKG, restart. Refused for `guardian` |
 | `svc{env,name,method,args}` | CLI | forwarded to that env's node as a `svc` frame; the node proxies it to `:tenon.svc/4` against its own kernel root ctx and answers with the plugin's result or error |
-| `sandbox.exec{env,cmd,args,timeout}` | CLI | run `cmd args..` inside that env's sandbox instance (`timeout` ms, default 30000); answers `{status,stdout,stderr,timed_out}`. P3.1 test/CLI aid — superseded by the worker's tool surface in P3.2 |
+| `sandbox.exec{env,cmd,args,timeout}` | CLI | run `cmd args..` inside that env's sandbox instance (`timeout` ms, default 30000); answers `{status,stdout,stderr,timed_out}`. A test aid — the worker's tool surface is the agent-facing path |
+| `snap.pull{env}` | CLI | ask that env's worker for everything committed since the last stored pack and store it; answers `{step, ref, bytes, pulled}`. Runs on a timer too |
+| `snap.list{env}` | CLI | the packs the host holds for that env: `{count, packs: [{step, ref, bytes, created_at}]}` |
+| `runtime.spawn{parent?,overrides}` | node, CLI | create a child environment; answers `{env, parent, depth, ram_mb, profile, service, pid}` |
+| `runtime.stop{env}` | node, CLI | stop one child environment and its subtree; answers `{stopped: [...]}` |
 | `sandbox.destroy{env}` | CLI | destroy that env's sandbox instance now, without touching the node; the next `reset` (or node restart) creates a fresh one. Also a P3.1 test aid |
 | `stop` | CLI | graceful shutdown of everything, base included |
 | `status` | CLI | the snapshot plus one `tree` request per registered node |
@@ -268,12 +427,15 @@ cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt 
 TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test
 ```
 
-42 tests: `sandbox` unit 5, `boot.rs` 7, `storage` 3, `harness` 1, `worker` 1, `base` unit 2
+77 tests: `sandbox` unit 5, `boot.rs` 8, `storage` 5, `harness` 1, `base` unit 2
 (`token`, and `home::hash` — stable per home, distinct across homes), the 20-test
-adversarial suite (19 as before P3.1's container hygiene pass, plus
-`reap::a_leaked_container_with_a_dead_base_is_reaped_on_next_start`), `sandbox`'s 2-test
-conformance suite and the 1-test gateway gate. `cli/tests/boot.rs` (7)
-drives the real binary against a temp `TENON_HOME`: the role stubs, a missing base, boot
+adversarial suite, `sandbox`'s 2-test conformance suite, the 1-test gateway gate, the
+P3.2 worker suites (`worker/tests/fs_test.rs` 9, `snap_test.rs` 9, `pty_test.rs` 10,
+`cli/tests/worker_wire.rs` 3) and the two P3.2 gates (`cli/tests/worker_boot.rs` 1,
+`cli/tests/spawn_gate.rs` 1). `cli/tests/boot.rs` (8)
+drives the real binary against a temp `TENON_HOME`: the harness role stub, a `tenon
+worker` whose `TENON_GATEWAY` names a socket nobody is listening on (exit 2, the connect
+error on stderr — the worker never silently falls back to fd 3/4), a missing base, boot
 (both nodes registered, the guardian tree carrying `guardian` and `link`, the root tree
 carrying the demo plugin, the LKG written, and — since `sandbox` now defaults to `auto`
 and this box has podman/docker — the root env's `sandbox.backend` is `oci`), `reset` (new
@@ -306,6 +468,49 @@ and assert that fiber goes away (fails, or is unmounted) while `status` keeps an
 tears down and remounts the gateway along with everything else in that node) and assert
 `status` still answers afterward with the root node registered again.
 
+`worker/tests/` (28) needs neither a release nor a container: `fs_test.rs` covers the
+line-range view, the write/view round trip, a unique `edit`, `edit` failing loud on zero
+and on two matches (file untouched), `grep` across nested directories skipping
+`.gitignore`d files, `glob` on `**/*.rs`, and `../etc/passwd` plus an absolute outside
+path both refused. `snap_test.rs` covers commit/list, `head`, an ignored file that is
+neither snapshotted nor deleted by a restore, restore bringing old content back, a
+tree-to-tree diff, expiry over twelve commits keeping the right set (and never dropping
+what `refs/heads/snap` points at), and the **pack round trip**: `pack(None)` written to a
+file, applied into a brand-new empty repo with `Snap::apply`, restored there, same bytes.
+`pty_test.rs` covers `bash` under a PTY and under pipes, a non-zero exit, a timeout
+killing the whole process group (the grandchild pid is gone afterwards), the spill file
+whose length equals `bytes` while `tail` is exactly the trailing slice, a session
+open/send/read/close with the pid gone afterwards, an unknown session failing loud, and an
+fd count taken from `/proc/self/fd` around 50 session cycles and 200 `bash` calls.
+
+`cli/tests/worker_wire.rs` (3) speaks the kernel half of the wire itself: it binds a unix
+socket, starts the real binary as `tenon worker` with `TENON_GATEWAY` pointing at it,
+answers `hello` with `load`, and then calls the service — `ping`, `info`, `bash`, `fs.*`,
+`snap.commit/list/pack` and a live PTY session — over `svc` frames. It also runs the
+frame-cap case (`TENON_MAX_FRAME=65536`, a 34 KB `fs.view` comes back as a handle inside
+the workspace) and the **500-step loop**: 500 rounds of `fs.write` + `snap.commit` +
+`snap.pack{since}` with `snap.expire` every 50, asserting every step lands, the snapshot
+count stays bounded (<= 20) and the worker's fd count does not grow. 2.5 s here.
+
+`cli/tests/worker_boot.rs` (1, skipped without oci or a release) is the P3.2 worker gate:
+boot a home with `sandbox: oci` and `pull_interval_ms: 2000`, wait for `status` to report
+the root env's `worker.state: ready` with a pid, run `bash` inside the sandbox through
+`svc`, write and commit a file, wait for the **timer** to have pulled the pack into
+`state-root.sqlite` (asserted through `snap.list`, no explicit pull), check a second
+`snap.pull` returns `pulled: 0`, add an uncommitted file, `tenon reset`, and assert the
+committed file is back in the fresh workspace with its content while the uncommitted one
+is gone. 13 s here.
+
+`cli/tests/spawn_gate.rs` (1, same skips) is the P3.2 tree gate, run against a home
+configured with `max_total: 3` and `max_depth: 1` so the limits can be reached cheaply:
+`runtime.spawn` from root yields `root.1` at depth 1 with an `overlay.patch.yml` layer,
+`status` shows `children: ["root.1"]` on the parent and a new fiber under the parent's
+`gateway`, a spawn from `root.1` is refused for depth, a third environment is accepted and
+a fourth refused for the total, a `sandbox.exec` inside the child proves neither the
+parent's gateway socket nor `run/base.sock` exists there (and a python `connect` to the
+parent's gateway fails), and a `kill -9` of the parent node makes the child disappear from
+`status` inside the grace while the parent itself comes back. 16 s here.
+
 `cli/tests/adversarial/` (20, same skip-without-a-release rule) is the P3.0/P3.1 hardening
 suite: double start refusal and survival of the first base, a crashed base's stale `run/`
 files recovered by the next start, a five-round reset storm with no orphaned pids, `stop`
@@ -322,7 +527,8 @@ container carrying this home's `tenon.home` label and a pid from an already-reap
 process (guaranteed dead) as its `tenon.base` label, then asserts a fresh `tenon start` of
 that same home removes it while the real root env still comes up normally.
 
-Every fixture across `boot.rs`, `gateway_gate.rs` and the adversarial suite also sweeps its
+Every fixture across `boot.rs`, `gateway_gate.rs`, `worker_boot.rs`, `spawn_gate.rs` and
+the adversarial suite also sweeps its
 own home with `tenon sandbox reap --all` on teardown (`Drop`), independent of whatever the
 test itself asserted — several of these tests deliberately `kill -9` base to test its
 resilience, which leaks that boot's container by design (see "What base does when
@@ -334,9 +540,11 @@ accumulate across CI runs.
 
 1. **No `rollback`, `approve` or `run` subcommand, and no `wire` crate.** They belong to
    P3.5/P3.7 and to the P3.1 move of `sdk/rs`; `sdk/rs` stays where it is for now.
-2. **`sdk/rs` is only a path dependency of `worker`**, which re-exports its `Error`/`Result`
-   as the worker's public error type. Base does not speak fd 3/4 — it speaks the same frames
-   over a socket — so nothing else needs the SDK until the worker becomes a wire plugin.
+2. **`sdk/rs` is the worker's wire.** It gained the `TENON_GATEWAY` socket transport in P3.2
+   (`Plugin::try_new`, `wires()`, `connect()`; `Plugin::new` still exists and exits 1 with the
+   reason when there is no wire at all), so the worker is an ordinary rust plugin that happens
+   to run inside a sandbox. Base still speaks the same frames over its own socket rather than
+   through the SDK.
 3. **The guardian's release directory is not `chmod`ed.** G and A are started from the same
    extracted release, so a permission change would apply to both and would fight the payload
    extractor. Read-only is enforced instead by `RELEASE_MODE=embedded` and
@@ -345,9 +553,11 @@ accumulate across CI runs.
 4. **`reset` answers as soon as the old node is dead and the new one is spawned**, not when
    it has registered. That keeps the answer inside the requesting node's deadline and keeps
    the actor free; `status` reports `registered: false` until the node is back.
-5. **Only `events` and `envs` exist in `state.sqlite`.** `tool_results`, `snapshots`,
-   `packs`, `blobs`, `memory_*`, `embeddings` and `episodes` arrive with the phases that
-   write them (P3.2-P3.4); adding empty tables now would freeze schemas nothing has used.
+5. **`events`, `envs` and `packs` exist.** `packs(step, ref, bytes, created_at)` arrived with
+   P3.2 and lives in the **per-env** `state-<env>.sqlite`, not in the barebone's
+   `state.sqlite`; `envs` gained `parent` and `depth` (migrated with `alter table` for homes
+   written before P3.2). `tool_results`, `snapshots`, `blobs`, `memory_*`, `embeddings` and
+   `episodes` still arrive with the phases that write them (P3.3-P3.4).
 6. **The sandbox is on the boot path already.** Base resolves `config.sandbox` and spawns one
    instance per env through the trait, so P3.1 replaces a backend rather than adding a seam.
    The `none` backend hands back a `Direct` endpoint and is not isolation of any kind.
@@ -398,3 +608,49 @@ accumulate across CI runs.
     operation a human runs *because* base might not be reachable (a home whose base was
     `kill -9`'d and nobody has restarted), so it talks to the sandbox backend directly
     rather than through an RPC that presupposes a live base.
+
+13. **The worker uses libgit2 (`git2`), not `gix`.** The RFC names gix. What P3.2 needs is
+    `.gitignore`-aware staging of a whole work tree, a forced checkout that also removes
+    files, tree-to-tree diff, a packfile builder and an odb pack writer. libgit2 has all
+    five behind a stable API; gix has no index/add or checkout of that maturity in a
+    released version and its pack-generation surface is low level enough to be its own
+    project. `git2` is built with `default-features = false`, so the binary links only
+    libz, libgcc and libc — which is what lets the host binary run inside the container.
+    Revisit when gix's `status`/`add`/`checkout` land.
+14. **Snapshots are parentless commits, not a chain.** `refs/snaps/<step>` each point at a
+    root commit; `refs/heads/snap` names the newest. This makes `snap.expire` a ref delete
+    instead of a history rewrite and makes every pack self-contained, at the cost of `git
+    log` in the guest showing one commit per ref rather than a line of history. Diff and
+    restore are tree operations and do not care.
+15. **The worker is one resident process with reader threads, not a tokio runtime.** The
+    plan said "one resident async process (tokio)". The wire SDK's loop is synchronous by
+    design (`Rc` handlers, re-entrant `settle`), and PTY/child output is a blocking read on
+    a raw fd; wrapping either in a runtime would buy nothing but a dependency, so the
+    worker runs the wire loop on its main thread and one reader thread per PTY session.
+    What the RFC actually asks for holds: one resident process, in-process tools, and no
+    fork per tool call beyond the user's own command.
+16. **Base opens the child's fiber in its parent's tree, not the child's `Link`.** RFC
+    section 4 has the child's Link connect back to the parent's gateway as a plugin. Link
+    speaks base frames (`node.register`, `health`, `tree`), not wire frames (`hello`,
+    `provide`, `svc`), so making it do both is a BEAM change P3.2 does not need: base dials
+    the parent's gateway itself and provides `env:<child>` on the child's behalf. The
+    observable result — the child is a fiber under the parent's gateway, it dies with the
+    parent, `tree` shows the lineage — is the same. The service is named `env:<child>`
+    rather than `env` because a parent can have several children and service names are
+    unique per kernel.
+17. **`snap.apply` is a worker method the plan did not list.** It is the other half of
+    `snap.pack`: base cannot fold packfiles into a repository itself (no git on the host
+    side, by design), so the restore path hands the staged packs back to the fresh worker.
+18. **`TENON_PROFILE` is now a `:`-separated list of loader layers.** `Tenon.Beam.Boot`
+    splits it and merges a `registry.yml` from each layer's directory. That is the smallest
+    BEAM change that gives a child env "parent profile + patch overlay" without base
+    re-implementing the loader's patch semantics in Rust.
+19. **The default oci image is `python:3.12-slim`, not alpine.** Base mounts its own
+    (glibc, dynamically linked) binary into the instance to run `tenon worker`; musl alpine
+    cannot load it. Alpine remains a documented option once P3.6 produces a static build.
+20. **Packs are pulled on a timer (5 s, configurable), not on each `worker/step`.** Both
+    were allowed; the timer needs no event plumbing from inside the sandbox to base, cannot
+    wedge on a dropped event, and coalesces bursts. `snap.pull{env}` forces one.
+21. **The P3.2 tree gate runs against lowered limits** (`max_total: 3`, `max_depth: 1`)
+    rather than spawning four generations of real containers to trip the shipped defaults.
+    The refusal path is identical; the test is 16 s instead of minutes.
