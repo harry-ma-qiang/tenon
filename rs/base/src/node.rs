@@ -12,7 +12,7 @@ pub const GUARDIAN: &str = "guardian";
 pub struct Spec {
     pub role: String,
     pub env: String,
-    pub profile: PathBuf,
+    pub profile: String,
     pub sock: PathBuf,
     pub target: String,
     pub token: String,
@@ -30,11 +30,18 @@ pub struct Exit {
     pub code: Option<i32>,
 }
 
-pub fn spec(config: &Config, home: &Home, role: &str, env: &str, token: String) -> Spec {
+pub fn spec(
+    config: &Config,
+    home: &Home,
+    role: &str,
+    env: &str,
+    token: String,
+    profile: String,
+) -> Spec {
     Spec {
         role: role.to_string(),
         env: env.to_string(),
-        profile: home.profile(env),
+        profile,
         sock: home.sock(),
         target: config.root_env.clone(),
         token,

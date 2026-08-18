@@ -26,6 +26,7 @@ pub struct LandlockInstance {
     id: String,
     workspace: PathBuf,
     gateway_dir: Option<PathBuf>,
+    binary: String,
 }
 
 pub fn probe() -> Result<Box<dyn Sandbox>, String> {
@@ -52,6 +53,7 @@ impl Sandbox for Landlock {
             id: format!("landlock:{}", spec.env),
             workspace: spec.workspace.clone(),
             gateway_dir,
+            binary: crate::host_binary(spec),
         }))
     }
 }
@@ -84,6 +86,14 @@ impl Instance for LandlockInstance {
 
     fn attach_addr(&self) -> Endpoint {
         Endpoint::Direct
+    }
+
+    fn workspace_path(&self) -> String {
+        self.workspace.display().to_string()
+    }
+
+    fn binary_path(&self) -> String {
+        self.binary.clone()
     }
 
     fn exec(&self, cmd: &str, args: &[String], timeout: Duration) -> Result<ExecOutcome> {

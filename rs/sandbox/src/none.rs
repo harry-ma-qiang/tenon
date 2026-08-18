@@ -8,6 +8,8 @@ pub struct NoSandbox;
 
 struct NoInstance {
     id: String,
+    workspace: String,
+    binary: String,
 }
 
 impl Sandbox for NoSandbox {
@@ -18,6 +20,8 @@ impl Sandbox for NoSandbox {
     fn spawn(&self, spec: &Spec) -> Result<Arc<dyn Instance>> {
         Ok(Arc::new(NoInstance {
             id: format!("none:{}", spec.env),
+            workspace: spec.workspace.display().to_string(),
+            binary: crate::host_binary(spec),
         }))
     }
 }
@@ -33,6 +37,14 @@ impl Instance for NoInstance {
 
     fn attach_addr(&self) -> Endpoint {
         Endpoint::Direct
+    }
+
+    fn workspace_path(&self) -> String {
+        self.workspace.clone()
+    }
+
+    fn binary_path(&self) -> String {
+        self.binary.clone()
     }
 
     fn exec(&self, _cmd: &str, _args: &[String], _timeout: Duration) -> Result<ExecOutcome> {

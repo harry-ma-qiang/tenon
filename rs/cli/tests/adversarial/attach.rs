@@ -2,23 +2,42 @@ use crate::support::*;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
+/// Waits for the subscribe line and then keeps draining that attach's stdout in
+/// a thread until the process ends. Dropping the reader instead would close the
+/// pipe, and the next event base streams would kill `attach` with EPIPE — which
+/// looks exactly like a subscriber detaching on purpose.
 fn wait_for_attach_line(child: &mut std::process::Child) {
     let stdout = child.stdout.take().expect("attach stdout");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         line.clear();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
+            panic!("attach exited before subscribing: {}", stderr_of(child));
         }
         if line.contains("attached from event") {
+            std::thread::spawn(move || {
+                let mut rest = String::new();
+                while reader.read_line(&mut rest).unwrap_or(0) > 0 {
+                    rest.clear();
+                }
+            });
             return;
         }
         if std::time::Instant::now() > deadline {
-            break;
+            panic!("attach never subscribed: {}", stderr_of(child));
         }
     }
+}
+
+fn stderr_of(child: &mut std::process::Child) -> String {
+    let Some(mut pipe) = child.stderr.take() else {
+        return "no stderr".to_string();
+    };
+    let mut text = String::new();
+    let _ = std::io::Read::read_to_string(&mut pipe, &mut text);
+    text
 }
 
 #[test]
@@ -76,9 +95,10 @@ fn two_attaches_one_disconnect_keeps_running() {
         alive(guardian) && alive(root),
         "nodes stopped after one of two attaches detached"
     );
+    let status = fixture.status_result();
     assert!(
-        fixture.status_result().is_ok(),
-        "base stopped responding with a subscriber left"
+        status.is_ok(),
+        "base stopped responding with a subscriber left: {status:?}"
     );
 
     let _ = a2.kill();

@@ -164,13 +164,35 @@ fn kill(pid: i64, signal: &str) {
 }
 
 #[test]
-fn the_role_stubs_report_the_phase() {
-    for role in ["harness", "worker"] {
-        let output = Command::new(BIN).arg(role).output().expect("run tenon");
-        assert_eq!(output.status.code(), Some(2));
-        let text = String::from_utf8_lossy(&output.stdout);
-        assert!(text.contains("not implemented in P3.0"), "{text}");
-    }
+fn the_harness_stub_reports_the_phase() {
+    let output = Command::new(BIN)
+        .arg("harness")
+        .output()
+        .expect("run tenon");
+    assert_eq!(output.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("not implemented in P3.0"), "{text}");
+}
+
+#[test]
+fn the_worker_without_a_reachable_gateway_fails_loudly() {
+    let dir = std::env::temp_dir().join(format!("tenon-it-{}-nowire", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = Command::new(BIN)
+        .arg("worker")
+        .arg("--workspace")
+        .arg(&dir)
+        .env(
+            "TENON_GATEWAY",
+            format!("unix:{}/absent.sock", dir.display()),
+        )
+        .output()
+        .expect("run tenon worker");
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    assert!(text.contains("connect"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

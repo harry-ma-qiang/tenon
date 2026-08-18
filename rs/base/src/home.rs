@@ -67,8 +67,25 @@ impl Home {
         self.env_dir(env).join("workspace")
     }
 
+    pub fn env_state_file(&self, env: &str) -> PathBuf {
+        self.root.join(format!("state-{env}.sqlite"))
+    }
+
+    pub fn restore_dir(&self, env: &str) -> PathBuf {
+        self.workspace_dir(env).join(".tenon-restore")
+    }
+
+    /// One directory per env, holding only that env's gateway socket. The oci
+    /// backend bind-mounts this directory into the instance, so a shared
+    /// `run/` would put base's front door and every sibling's gateway inside
+    /// every sandbox; a per-env directory is what keeps a child env from
+    /// reaching its parent's socket at all.
+    pub fn gateway_dir(&self, env: &str) -> PathBuf {
+        self.run().join(format!("gw-{env}"))
+    }
+
     pub fn gateway_sock(&self, env: &str) -> PathBuf {
-        self.run().join(format!("gateway-{env}.sock"))
+        self.gateway_dir(env).join("gateway.sock")
     }
 
     pub fn gateway_address(&self, env: &str) -> String {
@@ -145,6 +162,44 @@ impl Home {
         if !registry.exists() {
             std::fs::write(&registry, registry_map(demo))?;
         }
+        Ok(())
+    }
+
+    /// Everything one env owns on the host, made before its node starts.
+    pub fn prepare_env(&self, env: &str) -> Result<()> {
+        std::fs::create_dir_all(self.workspace_dir(env))?;
+        std::fs::create_dir_all(self.gateway_dir(env))?;
+        Ok(())
+    }
+
+    /// A child env's profile is its parent's layers plus one patch file of its
+    /// own, in loader order: `TENON_PROFILE` carries them separated by `:` and
+    /// the loader applies the patch over the parent's entry list.
+    pub fn write_overlay(&self, env: &str, overlay: &str) -> Result<PathBuf> {
+        let dir = self.profiles().join(env);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("overlay.patch.yml");
+        std::fs::write(&path, overlay)?;
+        let registry = dir.join("registry.yml");
+        if !registry.exists() {
+            std::fs::write(&registry, "{}\n")?;
+        }
+        Ok(path)
+    }
+
+    pub fn wipe_workspace(&self, env: &str) -> Result<()> {
+        let dir = self.workspace_dir(env);
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(entry.path())?;
+                } else {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        std::fs::create_dir_all(&dir)?;
         Ok(())
     }
 

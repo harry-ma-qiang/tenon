@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_IMAGE: &str = "python:3.12-alpine";
+const DEFAULT_IMAGE: &str = "python:3.12-slim";
+const GUEST_WORKSPACE: &str = "/workspace";
+const GUEST_BINARY: &str = "/usr/local/bin/tenon";
 const ENV_LABEL: &str = "tenon.env";
 const HOME_LABEL: &str = "tenon.home";
 const BASE_LABEL: &str = "tenon.base";
@@ -73,8 +75,13 @@ impl Sandbox for Oci {
             "--pids-limit".to_string(),
             spec.policy.pids_max.to_string(),
             "-v".to_string(),
-            format!("{}:/workspace", spec.workspace.display()),
+            format!("{}:{GUEST_WORKSPACE}", spec.workspace.display()),
         ];
+        let binary = crate::host_binary(spec);
+        if std::path::Path::new(&binary).is_file() {
+            args.push("-v".to_string());
+            args.push(format!("{binary}:{GUEST_BINARY}:ro"));
+        }
         if let Some(address) = &spec.gateway {
             if let Some(dir) = crate::gateway_dir(address) {
                 args.push("-v".to_string());
@@ -199,6 +206,14 @@ impl Instance for OciInstance {
 
     fn backend(&self) -> &'static str {
         "oci"
+    }
+
+    fn workspace_path(&self) -> String {
+        GUEST_WORKSPACE.to_string()
+    }
+
+    fn binary_path(&self) -> String {
+        GUEST_BINARY.to_string()
     }
 
     fn attach_addr(&self) -> Endpoint {

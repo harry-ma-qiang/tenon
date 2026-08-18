@@ -41,6 +41,47 @@ pub enum Cmd {
     SandboxReaped {
         count: usize,
     },
+    WorkerBoot {
+        env: String,
+    },
+    WorkerReady {
+        env: String,
+        pid: Option<i64>,
+        error: Option<String>,
+    },
+    SnapPull {
+        env: String,
+        reply: Option<oneshot::Sender<Result<Value, String>>>,
+    },
+    SnapList {
+        env: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    SnapPacked {
+        env: String,
+        step: i64,
+        reference: String,
+        bytes: Vec<u8>,
+    },
+    Spawn {
+        peer: u64,
+        parent: Option<String>,
+        overrides: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    RuntimeStop {
+        env: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    Restored {
+        env: String,
+        result: Value,
+        error: Option<String>,
+    },
+    EnvStatus {
+        env: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Stop {
         reply: oneshot::Sender<Result<Value, String>>,
     },
@@ -68,6 +109,10 @@ pub struct NodeView {
     pub restarts: u32,
     pub sandbox: Option<Value>,
     pub peer: Option<Peer>,
+    pub parent: Option<String>,
+    pub depth: u32,
+    pub children: Vec<String>,
+    pub worker: Value,
 }
 
 pub struct Snapshot {

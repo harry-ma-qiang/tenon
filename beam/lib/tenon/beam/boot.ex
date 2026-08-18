@@ -60,10 +60,18 @@ defmodule Tenon.Beam.Boot do
   def handle_call(:state, _from, state), do: {:reply, state, state}
 
   defp profile do
-    path = System.get_env("TENON_PROFILE")
-    registry = Registry.load(path && Path.join(Path.dirname(path), "registry.yml"))
-    %{layers: List.wrap(path), registry: registry}
+    layers = layers(System.get_env("TENON_PROFILE"))
+
+    registry =
+      Enum.reduce(layers, Registry.builtin(), fn path, acc ->
+        Map.merge(acc, Registry.load(Path.join(Path.dirname(path), "registry.yml")))
+      end)
+
+    %{layers: layers, registry: registry}
   end
+
+  defp layers(nil), do: []
+  defp layers(value), do: String.split(value, ":", trim: true)
 
   defp link(role, env, kernel, loader) do
     %{

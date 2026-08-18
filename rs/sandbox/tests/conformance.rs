@@ -36,6 +36,7 @@ fn check(name: &str) {
     let spec = Spec {
         env: format!("conf-{name}-{suffix}"),
         image: None,
+        binary: None,
         workspace: workspace.clone(),
         gateway: None,
         env_passthrough: vec![],

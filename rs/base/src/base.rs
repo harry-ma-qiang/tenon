@@ -2,66 +2,35 @@ use crate::config::Config;
 use crate::home::Home;
 use crate::node::{self, Exit, GUARDIAN};
 use crate::peer::Peer;
-use crate::rpc::{Cmd, NodeView, Snapshot};
+use crate::rpc::Cmd;
+use crate::state::Node;
+use crate::state::WorkerState;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tenon_sandbox::{Endpoint, Instance, Sandbox, Spec};
+use tenon_sandbox::Sandbox;
 use tenon_storage::Store;
 use tokio::sync::{mpsc, oneshot};
 
 const BOOT_ABORT_GRACE_MS: u64 = 300;
 
-struct Node {
-    role: String,
-    pid: Option<i32>,
-    generation: u64,
-    registered: bool,
-    restarts: u32,
-    peer: Option<Peer>,
-    sandbox: Option<Arc<dyn Instance>>,
-    exited: Option<oneshot::Receiver<Option<i32>>>,
-    token: String,
-}
-
 pub struct Base {
-    home: Home,
-    config: Config,
-    store: Store,
-    release: PathBuf,
-    sandbox: Arc<dyn Sandbox>,
-    exit_on_detach: bool,
-    nodes: BTreeMap<String, Node>,
-    subs: BTreeMap<u64, (Peer, Option<String>)>,
-    exits: mpsc::UnboundedSender<Exit>,
-    generation: u64,
-    promoted: bool,
-    stopping: bool,
-}
-
-fn sandbox_env_passthrough() -> Vec<String> {
-    std::env::var("TENON_SANDBOX_ENV")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn endpoint_repr(endpoint: &Endpoint) -> Value {
-    match endpoint {
-        Endpoint::Direct => json!("direct"),
-        Endpoint::Uds(path) => json!(format!("unix:{}", path.display())),
-        Endpoint::Tcp(host, port) => json!(format!("tcp:{host}:{port}")),
-    }
+    pub home: Home,
+    pub config: Config,
+    pub store: Store,
+    pub release: PathBuf,
+    pub sandbox: Arc<dyn Sandbox>,
+    pub exit_on_detach: bool,
+    pub nodes: BTreeMap<String, Node>,
+    pub subs: BTreeMap<u64, (Peer, Option<String>)>,
+    pub exits: mpsc::UnboundedSender<Exit>,
+    pub cmds: mpsc::UnboundedSender<Cmd>,
+    pub generation: u64,
+    pub promoted: bool,
+    pub stopping: bool,
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -73,6 +42,7 @@ fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
 }
 
 impl Base {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         home: Home,
         config: Config,
@@ -81,6 +51,7 @@ impl Base {
         sandbox: Arc<dyn Sandbox>,
         exit_on_detach: bool,
         exits: mpsc::UnboundedSender<Exit>,
+        cmds: mpsc::UnboundedSender<Cmd>,
     ) -> Self {
         Self {
             home,
@@ -92,6 +63,7 @@ impl Base {
             nodes: BTreeMap::new(),
             subs: BTreeMap::new(),
             exits,
+            cmds,
             generation: 0,
             promoted: false,
             stopping: false,
@@ -110,7 +82,7 @@ impl Base {
                     None => break,
                 },
                 exit = exits.recv() => match exit {
-                    Some(exit) => self.on_exit(exit),
+                    Some(exit) => self.on_exit(exit).await,
                     None => break,
                 },
             }
@@ -158,6 +130,35 @@ impl Base {
             Cmd::SandboxReaped { count } => {
                 self.emit("sandbox.reaped", None, json!({"count": count}));
             }
+            Cmd::WorkerBoot { env } => self.worker_boot(&env),
+            Cmd::WorkerReady { env, pid, error } => self.worker_ready(&env, pid, error),
+            Cmd::SnapPull { env, reply } => self.snap_pull(&env, reply),
+            Cmd::SnapList { env, reply } => {
+                let _ = reply.send(self.snap_list(&env));
+            }
+            Cmd::SnapPacked {
+                env,
+                step,
+                reference,
+                bytes,
+            } => self.snap_packed(&env, step, &reference, &bytes),
+            Cmd::Spawn {
+                peer,
+                parent,
+                overrides,
+                reply,
+            } => {
+                let outcome = self.spawn_child(peer, parent, &overrides);
+                let _ = reply.send(outcome);
+            }
+            Cmd::RuntimeStop { env, reply } => {
+                let outcome = self.runtime_stop(&env).await;
+                let _ = reply.send(outcome);
+            }
+            Cmd::Restored { env, result, error } => self.restored(&env, result, error),
+            Cmd::EnvStatus { env, reply } => {
+                let _ = reply.send(self.env_status(&env));
+            }
             Cmd::Stop { reply } => {
                 // Destroy every env's sandbox instance before answering, so a
                 // caller that trusts "ok" and force-kills base a moment later
@@ -189,15 +190,32 @@ impl Base {
             None,
             json!({"release": self.release, "sandbox": self.sandbox.backend()}),
         );
-        self.start(GUARDIAN, GUARDIAN)?;
-        self.start("agent", &root)
+        self.start(GUARDIAN, GUARDIAN, None)?;
+        self.start("agent", &root, None)
     }
 
-    fn start(&mut self, role: &str, env: &str) -> Result<(), String> {
+    pub fn start(&mut self, role: &str, env: &str, parent: Option<String>) -> Result<(), String> {
         self.generation += 1;
         let generation = self.generation;
         let token = crate::token::generate();
-        let spec = node::spec(&self.config, &self.home, role, env, token.clone());
+        let depth = parent
+            .as_ref()
+            .and_then(|name| self.nodes.get(name))
+            .map(|node| node.depth + 1)
+            .unwrap_or(0);
+        let profile = match self.nodes.get(env) {
+            Some(node) => node.profile.clone(),
+            None => self.home.profile(env).display().to_string(),
+        };
+        let ram_mb = self
+            .nodes
+            .get(env)
+            .map(|node| node.ram_mb)
+            .unwrap_or(self.config.envs.ram_mb);
+        self.home
+            .prepare_env(env)
+            .map_err(|error| error.to_string())?;
+        let spec = node::spec(&self.config, &self.home, role, env, token.clone(), profile);
         let running = node::spawn(
             &spec,
             &self.config,
@@ -207,105 +225,70 @@ impl Base {
             self.exits.clone(),
         )
         .map_err(|error| error.to_string())?;
-        let restarts = self.nodes.get(env).map(|node| node.restarts).unwrap_or(0);
-        let sandbox = self.enter_sandbox(role, env)?;
-        self.nodes.insert(
-            env.to_string(),
-            Node {
-                role: role.to_string(),
-                pid: Some(running.pid),
-                generation,
-                registered: false,
-                restarts,
-                peer: None,
-                sandbox,
-                exited: running.exited,
-                token,
-            },
-        );
+        let mut previous = self.nodes.remove(env);
+        let restarts = previous.as_ref().map(|node| node.restarts).unwrap_or(0);
+        let sandbox = self.enter_sandbox(role, env, previous.as_ref(), ram_mb)?;
+        let store = match previous.as_mut().and_then(|old| old.store.take()) {
+            Some(store) => Some(store),
+            None => self.env_store(role, env),
+        };
+        let fiber = previous.as_mut().and_then(|old| old.fiber.take());
+        let node = Node {
+            role: role.to_string(),
+            pid: Some(running.pid),
+            generation,
+            registered: false,
+            restarts,
+            peer: None,
+            sandbox,
+            exited: running.exited,
+            token,
+            parent: previous
+                .as_ref()
+                .and_then(|old| old.parent.clone())
+                .or(parent.clone()),
+            depth: previous.as_ref().map(|old| old.depth).unwrap_or(depth),
+            profile: spec.profile.clone(),
+            ram_mb,
+            worker: WorkerState::Off,
+            store,
+            fiber,
+            ticker: None,
+            restore: previous
+                .as_ref()
+                .map(|old| old.restore.clone())
+                .unwrap_or_default(),
+        };
+        self.nodes.insert(env.to_string(), node);
         let _ = self
             .store
             .put_env(env, role, Some(running.pid as i64), "starting");
+        if let Some(parent) = &parent {
+            let _ = self.store.put_env_parent(env, Some(parent), depth as i64);
+        }
         self.emit(
             "node.start",
             Some(env),
-            json!({"role": role, "pid": running.pid}),
+            json!({"role": role, "pid": running.pid, "parent": parent, "depth": depth}),
         );
         Ok(())
     }
 
-    fn enter_sandbox(
-        &mut self,
-        role: &str,
-        env: &str,
-    ) -> Result<Option<Arc<dyn Instance>>, String> {
+    fn env_store(&mut self, role: &str, env: &str) -> Option<Store> {
         if role == GUARDIAN {
-            return Ok(None);
+            return None;
         }
-        if let Some(node) = self.nodes.get_mut(env) {
-            if let Some(old) = node.sandbox.take() {
-                let _ = old.destroy();
+        match Store::open(&self.home.env_state_file(env)) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                self.emit(
+                    "env.state_failed",
+                    Some(env),
+                    json!({"error": error.to_string()}),
+                );
+                None
             }
         }
-        let spec = Spec {
-            env: env.to_string(),
-            image: std::env::var("TENON_SANDBOX_IMAGE").ok(),
-            workspace: self.home.workspace_dir(env),
-            gateway: Some(self.home.gateway_address(env)),
-            env_passthrough: sandbox_env_passthrough(),
-            policy: Default::default(),
-            caps: vec![],
-            home_hash: self.home.hash(),
-            base_pid: std::process::id() as i32,
-        };
-        self.sandbox
-            .spawn(&spec)
-            .map(Some)
-            .map_err(|error| error.to_string())
-    }
-
-    fn sandbox_exec(
-        &mut self,
-        env: String,
-        cmd: String,
-        args: Vec<String>,
-        timeout_ms: u64,
-        reply: oneshot::Sender<Result<Value, String>>,
-    ) {
-        let Some(instance) = self.nodes.get(&env).and_then(|node| node.sandbox.clone()) else {
-            let _ = reply.send(Err(format!("env {env} has no sandbox instance")));
-            return;
-        };
-        tokio::task::spawn_blocking(move || {
-            let outcome = instance.exec(&cmd, &args, Duration::from_millis(timeout_ms.max(1)));
-            let result = outcome
-                .map(|outcome| {
-                    json!({
-                        "status": outcome.status,
-                        "stdout": String::from_utf8_lossy(&outcome.stdout),
-                        "stderr": String::from_utf8_lossy(&outcome.stderr),
-                        "timed_out": outcome.timed_out,
-                    })
-                })
-                .map_err(|error| error.to_string());
-            let _ = reply.send(result);
-        });
-    }
-
-    fn sandbox_destroy(&mut self, env: &str, reply: oneshot::Sender<Result<Value, String>>) {
-        let Some(node) = self.nodes.get_mut(env) else {
-            let _ = reply.send(Err(format!("unknown env {env}")));
-            return;
-        };
-        let Some(instance) = node.sandbox.take() else {
-            let _ = reply.send(Err(format!("env {env} has no sandbox instance")));
-            return;
-        };
-        self.emit("sandbox.destroy", Some(env), json!({"id": instance.id()}));
-        tokio::task::spawn_blocking(move || {
-            let _ = instance.destroy();
-        });
-        let _ = reply.send(Ok(json!({"ok": true})));
     }
 
     fn on_register(
@@ -344,6 +327,9 @@ impl Base {
             json!({"role": role, "pid": pid}),
         );
         let _ = reply.send(Ok(json!({"ok": true})));
+        if role != GUARDIAN {
+            let _ = self.cmds.send(Cmd::WorkerBoot { env: env.clone() });
+        }
         if self.ready() && !self.promoted {
             self.promoted = true;
             let _ = self.store.checkpoint();
@@ -355,7 +341,7 @@ impl Base {
         }
     }
 
-    fn on_exit(&mut self, exit: Exit) {
+    async fn on_exit(&mut self, exit: Exit) {
         if self.stopping {
             return;
         }
@@ -370,6 +356,8 @@ impl Base {
         node.peer = None;
         node.pid = None;
         node.exited = None;
+        node.worker = WorkerState::Off;
+        node.ticker = None;
         let restarts = node.restarts;
         let _ = self.store.put_env(&exit.env, &role, None, "down");
         self.emit(
@@ -383,6 +371,7 @@ impl Base {
                 exit.code
             );
         }
+        self.prune_children(&exit.env).await;
         if restarts >= self.config.max_restarts {
             self.emit(
                 "node.give_up",
@@ -395,7 +384,11 @@ impl Base {
             node.restarts = restarts + 1;
         }
         let _ = self.home.restore_env(&exit.env);
-        if let Err(error) = self.start(&role, &exit.env) {
+        let parent = self
+            .nodes
+            .get(&exit.env)
+            .and_then(|node| node.parent.clone());
+        if let Err(error) = self.start(&role, &exit.env, parent) {
             self.emit(
                 "node.start_failed",
                 Some(&exit.env),
@@ -420,18 +413,29 @@ impl Base {
         let exited = node.exited.take();
         node.registered = false;
         node.peer = None;
+        node.worker = WorkerState::Off;
+        node.ticker = None;
         self.emit("env.reset", Some(env), json!({"pid": pid}));
         if let Some(pid) = pid {
             let grace = Duration::from_millis(self.config.stop_grace_ms);
             node::terminate(pid, exited, grace).await;
         }
+        let staged = self.stage_restore(env);
         let restored = self.home.restore_env(env).unwrap_or(false);
-        self.start(&role, env)?;
+        let parent = self.nodes.get(env).and_then(|node| node.parent.clone());
+        self.start(&role, env, parent)?;
         if let Some(node) = self.nodes.get_mut(env) {
             node.restarts = 0;
+            node.restore = staged.clone();
         }
         let fresh = self.nodes.get(env).and_then(|node| node.pid);
-        Ok(json!({"ok": true, "env": env, "pid": fresh, "lkg": restored}))
+        Ok(json!({
+            "ok": true,
+            "env": env,
+            "pid": fresh,
+            "lkg": restored,
+            "packs": staged.len(),
+        }))
     }
 
     fn ensure_state_integrity(&mut self) {
@@ -477,30 +481,42 @@ impl Base {
     }
 
     async fn stop_nodes(&mut self, grace: Duration) {
-        let order: Vec<String> = self
+        let mut deepest: Vec<(u32, String)> = self
             .nodes
-            .keys()
-            .filter(|env| *env != GUARDIAN)
-            .cloned()
-            .chain(std::iter::once(GUARDIAN.to_string()))
+            .iter()
+            .filter(|(env, _)| *env != GUARDIAN)
+            .map(|(env, node)| (node.depth, env.clone()))
             .collect();
+        deepest.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut order: Vec<String> = deepest.into_iter().map(|(_, env)| env).collect();
+        order.push(GUARDIAN.to_string());
         for env in order {
-            let Some(node) = self.nodes.get_mut(&env) else {
-                continue;
-            };
-            let pid = node.pid.take();
-            let exited = node.exited.take();
-            node.registered = false;
-            node.peer = None;
-            if let Some(pid) = pid {
-                node::terminate(pid, exited, grace).await;
-            }
+            self.halt(&env, grace).await;
+        }
+        let _ = self.store.checkpoint();
+    }
+
+    pub async fn halt(&mut self, env: &str, grace: Duration) {
+        let Some(node) = self.nodes.get_mut(env) else {
+            return;
+        };
+        let pid = node.pid.take();
+        let exited = node.exited.take();
+        node.registered = false;
+        node.peer = None;
+        node.worker = WorkerState::Off;
+        node.ticker = None;
+        node.fiber = None;
+        let role = node.role.clone();
+        if let Some(pid) = pid {
+            node::terminate(pid, exited, grace).await;
+        }
+        if let Some(node) = self.nodes.get_mut(env) {
             if let Some(instance) = node.sandbox.take() {
                 let _ = instance.destroy();
             }
-            let _ = self.store.put_env(&env, &node.role, None, "stopped");
         }
-        let _ = self.store.checkpoint();
+        let _ = self.store.put_env(env, &role, None, "stopped");
     }
 
     async fn on_gone(&mut self, peer: u64) {
@@ -515,36 +531,7 @@ impl Base {
         !self.nodes.is_empty() && self.nodes.values().all(|node| node.registered)
     }
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            home: self.home.root.clone(),
-            release: self.release.clone(),
-            pid: std::process::id(),
-            exit_on_detach: self.exit_on_detach,
-            attached: self.subs.len(),
-            nodes: self
-                .nodes
-                .iter()
-                .map(|(env, node)| NodeView {
-                    env: env.clone(),
-                    role: node.role.clone(),
-                    pid: node.pid,
-                    registered: node.registered,
-                    restarts: node.restarts,
-                    sandbox: node.sandbox.as_ref().map(|instance| {
-                        json!({
-                            "backend": instance.backend(),
-                            "id": instance.id(),
-                            "attach": endpoint_repr(&instance.attach_addr()),
-                        })
-                    }),
-                    peer: node.peer.clone(),
-                })
-                .collect(),
-        }
-    }
-
-    fn emit(&mut self, kind: &str, env: Option<&str>, data: Value) {
+    pub fn emit(&mut self, kind: &str, env: Option<&str>, data: Value) {
         let Ok(event) = self.store.append(kind, env, &data) else {
             return;
         };
