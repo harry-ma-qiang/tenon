@@ -1,6 +1,6 @@
 [package]
 name = "tenon-storage"
-description = "Host state file for the tenon barebone: events and envs in one sqlite database"
+description = "Host state file for the tenon barebone: the session log, packs, blobs and episodes in one sqlite database"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,3 +11,4 @@ anyhow.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
