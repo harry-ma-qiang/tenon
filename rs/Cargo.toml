@@ -18,6 +18,13 @@ globset = "0.4"
 ignore = "0.4"
 libc = "0.2"
 regex = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+  "charset",
+  "http2",
+  "json",
+  "rustls",
+  "stream",
+] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
