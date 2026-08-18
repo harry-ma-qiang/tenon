@@ -48,6 +48,9 @@ impl Base {
                 self.apply_restore(env);
             }
         }
+        // The harness comes up after the worker either way: a failed worker
+        // costs the agent its hands, not its loop.
+        self.harness_boot(env);
     }
 
     /// Pulls whatever the worker has committed since the step this env's state

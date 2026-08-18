@@ -21,7 +21,7 @@ tenon start                      the base process
 | `base` | home layout, config, UDS RPC server, the node supervisor actor, LKG, release payload |
 | `storage` | `state.sqlite`: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, `events`, `envs` |
 | `sandbox` | the `Sandbox` trait plus `none`, `oci` (podman/docker) and `landlock` backends; `krun` is a P3.6 placeholder |
-| `harness` | role stub (P3.3) |
+| `harness` | the `tenon harness` role (P3.3): the agent loop, the llm adapter, the session log, the tools bus and the management tools, one host process per env |
 | `worker` | the `tenon worker` role (P3.2): one resident process inside the sandbox serving `bash`, `pty.*`, `fs.*` and `snap.*` over the wire |
 | `cli` | the `tenon` bin target and `build.rs`, which embeds the BEAM release |
 
@@ -75,7 +75,10 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `run/base.ready` | holds the base pid while it is up; how `tenon start` waits. Written atomically (temp file + rename) |
 | `run/{base,guardian,root}.log` | stdout and stderr of base and of each node |
 | `run/gw-<env>/gateway.sock` | that env's `TENON_GATEWAY` unix socket. One directory per env, because the oci backend bind-mounts the socket's **directory**: a shared `run/` would put base's front door and every sibling's gateway inside every sandbox |
-| `state-<env>.sqlite` | that env's state file: the `packs` table of workspace snapshots pulled off its worker |
+| `state-<env>.sqlite` | that env's state file: the `packs` table of workspace snapshots pulled off its worker, and the `events` table its harness appends the session log to |
+| `profiles/<env>/harness.yml` | that env's harness overlay: provider, model, the *name* of the key variable, `max_steps`, `approval`. Written with defaults on first start, patched through `config.patch` |
+| `config-snapshots/<env>/harness-<ms>.yml` | the copy `config.patch` takes before every change |
+| `run/harness-<env>.log` | stdout and stderr of that env's harness process |
 | `envs/<env>/workspace/` | that env's sandbox workspace, bind-mounted at `/workspace` (oci) or granted read-write at the same path (landlock). `.tenon-snap/` (the snapshot GIT_DIR), `.tenon-out/` (handles and spill files) and `.tenon-restore/` (packs staged for a restore) live inside it |
 | `profiles/<child>/overlay.patch.yml` | a spawned child env's own patch layer; its `TENON_PROFILE` is the parent's layers plus this file |
 | `lkg/` | `config.yml`, `profiles/`, `state.sqlite` copied at every successful boot |
@@ -358,6 +361,128 @@ root  (depth 0)  profiles/root/tenon.yml
   child neither the parent's gateway nor `run/base.sock` exists at all; `node.register`
   still needs the per-node token base generated, so a stolen socket would not help either.
 
+## The harness (P3.3)
+
+`tenon harness` is the agent's own process: one per environment, on the host, holding the
+model key. Base starts it once that env's worker has settled and hands it three things in
+the environment — the gateway address to register on, base's front door to log through,
+and the env's profile overlay as JSON. It is an ordinary wire plugin of that env's node,
+so `tenon status` shows it as a fiber under `gateway` and unmounting the gateway drops it.
+
+```
+host                                            sandbox
+  base <--- events.append, config.*, plugin.*, runtime.spawn, approval.request
+   |                    |
+   +-- spawn -->  tenon harness  --wire-->  gateway  --> node A kernel
+   |                    |                                 |  svc worker.*      -> worker
+   +-- state-<env>.sqlite  (the session log)               |  call tools/pre-execute
+                                                           +--> guard.py, any language
+```
+
+Five services, all on the kernel bus, all reachable through `svc` from anywhere in that
+node (and from the CLI over the front door):
+
+| Service | Methods |
+|---|---|
+| `loop` | `session.create`, `session.prompt{session_id, text}` (queues, answers at once), `session.status`, `session.history`, `session.resume{session_id}`, `sessions` |
+| `llm` | `chat{messages, tools?, stream?}`, `models` |
+| `tools` | `register{name, schema, target:{service, method}, owner?, priority?}`, `unregister`, `list`, `execute{name, args}` |
+| `prompt` | `register{name, order, text}` (returns the id that `unregister` disposes), `unregister{id \| name}`, `list`, `render` |
+| `manage` | the management tools below, one method per operation |
+
+**The llm adapter.** OpenAI-compatible chat completions with SSE streaming, tool calls and
+token usage, configured per env from `profiles/<env>/harness.yml`:
+
+```yaml
+llm:
+  provider: openai            # a label; the wire shape is OpenAI's either way
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY   # the NAME of the variable, never the key
+  temperature: 0
+  timeout_ms: 120000
+  retry_attempts: 3
+  retry_base_ms: 200
+max_steps: 8
+approval: deny                # `auto` makes approval.request answer "approved"
+tool_timeout_ms: 20000
+```
+
+Base reads that file, passes it to the harness as `TENON_HARNESS_CONFIG`, and forwards the
+one variable `api_key_env` names if base itself has it. The key lives in the harness
+process and nowhere else: not in the sandbox, not in the state file, not in an event.
+`429`, any `5xx`, a timeout and a connection failure are retried with exponential backoff
+(`retry_base_ms * 2^n`); a `4xx` is not. Streaming deltas are coalesced into
+`assistant/chunk` events (240 characters or the end of the stream, whichever comes first).
+Every request first runs the `llm/request` waterfall: an array back means "possibly
+rewritten request", an object back short-circuits the model and *is* the answer.
+
+**The session log.** Append-only `events` in `state-<env>.sqlite`, written through base
+(`events.append`), never by the harness opening sqlite itself. Model-visible == logged:
+`user/message`, `assistant/chunk`, `assistant/message`, `tool/call`, `tool/result`,
+`turn/start`, `turn/end`, `step/start`, `step/end`, plus `session/created` and
+`harness/ready`. Every row carries its `session`, so `session.history` is a filter and
+`session.resume{session_id}` is a fold: user messages, assistant messages and tool results
+in order become the model context again. That is what a restarted harness resumes from —
+base restarts a harness that dies (bounded by `max_restarts`) and the sessions come back
+on request, not automatically.
+
+**The loop.** A turn is the queue entry for one prompt; a step is one model call. Each
+step assembles the system prompt from the registered `prompt` sections in `order`,
+collects the tool schemas from the bus, runs the `agent/pre-step` waterfall over
+`{session, step, system, messages, tools}`, calls the model, logs the answer, and either
+dispatches the tool calls (feeding each result back as a `tool` message) or asks the
+`agent/turn-stopping` waterfall whether it may stop — a hook answering `{stop: false,
+text}` keeps the turn going with one more user message. `max_steps` bounds it.
+**Context overflow is not handled**: when the model API refuses an oversized context the
+turn ends as `turn/end{ok: false, error}` and the session stays usable. The memory and
+navigator stages own compaction (RFC section 6).
+
+**The tools bus** is the single authority over model-facing tools. One name, one row; a
+name registered twice by different owners keeps the higher priority and logs the loser
+(`tools.register` answers `{ok: false, kept: <owner>, reason}`), while the same owner
+replaces its own row. Every execution runs `tools/pre-execute` (hooks may rewrite the
+arguments by passing the array on, or deny with `{deny: reason}`), then the target
+service's method, then `tools/post-execute`. A denial and a failure are both tool results
+the model reads, never a broken turn. The DSH rows that overlap ours are disabled in the
+DSH profile when ours are mounted — a config note in the bridge's profile, not code here.
+
+| Tool | Target | What |
+|---|---|---|
+| `bash` | `worker.bash` | a shell command in the workspace |
+| `view_file` / `write_file` / `edit_file` | `worker.fs.view/write/edit` | the POSIX trio |
+| `grep` / `glob` | `worker.fs.grep/glob` | search the workspace |
+| `snapshot{op}` | `worker.snap.commit/list/restore` (list via base) | workspace time travel |
+| `plugin{op, id, spec}` | `manage.plugin.*` | list/mount/unmount/restart the fibers of this node |
+| `config{op, patch}` | `manage.config.*` | read or patch this env's overlay |
+| `runtime_spawn{overrides}` | base `runtime.spawn` | a child environment |
+| `approval_request{reason}` | base `approval.request` | ask a human |
+
+The management tools are what make the environment editable from inside it, and the
+"how to extend Tenon" prompt section (registered at boot, `order: 100`) tells the model
+they exist. `plugin.mount` takes a registry-shaped spec (`{module}` or `{cmd, args, env}`)
+and mounts it under the node's root fiber through `Link`; the mounted fiber shows up in
+`tenon status` and in `plugin.list`. `config.patch` snapshots the overlay into
+`config-snapshots/<env>/harness-<ms>.yml`, merges the patch (objects merge, everything
+else replaces) and asks the node to reload its profile; the running harness keeps the
+settings it started with, so a changed `llm` block takes effect at the next harness start
+or `tenon reset`. `approval.request` is a P3.5 stub: it answers `denied` with the reason
+`approvals not enabled` unless the env's overlay says `approval: auto`.
+
+**Driving it.** `tenon run "task" [--env NAME]` creates a session, prompts it and streams
+that session's events until `turn/end`, printing the assistant text as it arrives, the
+tool calls and denials on stderr, and exiting non-zero if the turn failed. `tenon attach`
+shows the same events for every session, mixed with base's own. Both read the log; nothing
+about the loop is invisible.
+
+```
+$ tenon run "run echo tenon-ok with bash"
+tenon run: tool bash {"cmd":"echo tenon-ok"}
+tenon run: tool bash ok
+the output was tenon-ok
+tenon run: session s41-1 ok, usage {"completion":7,"prompt":11,"total":18}
+```
+
 ## Commands
 
 | Command | What |
@@ -368,7 +493,8 @@ root  (depth 0)  profiles/root/tenon.yml
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon status` | one JSON document: base, both nodes, and each node's fiber tree |
 | `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
-| `tenon harness` | prints `not implemented in P3.0`, exit 2 (P3.3) |
+| `tenon run "task" [--env NAME] [--timeout SECONDS]` | one task for that env's agent: create a session, prompt it, stream the answer, exit 0 if the turn ended ok |
+| `tenon harness [--env NAME]` | the agent process of one env. Base starts one per env; run by hand only against a live gateway |
 | `tenon worker [--workspace DIR]` | the in-sandbox tool process. Speaks the wire on `TENON_GATEWAY` when it is set, fd 3/4 otherwise. `--workspace` defaults to `$TENON_WORKSPACE`, then `/workspace`, then the working directory |
 
 `--exit-on-detach` stops everything when the last **subscriber** disconnects. `status` and
@@ -394,6 +520,13 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `runtime.spawn{parent?,overrides}` | node, CLI | create a child environment; answers `{env, parent, depth, ram_mb, profile, service, pid}` |
 | `runtime.stop{env}` | node, CLI | stop one child environment and its subtree; answers `{stopped: [...]}` |
 | `sandbox.destroy{env}` | CLI | destroy that env's sandbox instance now, without touching the node; the next `reset` (or node restart) creates a fresh one. Also a P3.1 test aid |
+| `plugin{env,op,plugin_id?,spec?}` | harness, CLI | forwarded to that env's node: `list`, `mount` (a `{module}` or `{cmd,args,env}` spec), `unmount`, `restart`. The fiber's id travels as `plugin_id` because `id` is the frame's own correlation id |
+| `session.create{env}` / `session.prompt{env,session_id,text}` / `session.status` / `session.history` / `session.resume` | CLI | forwarded to that env's harness as `svc{name: "loop"}`; how `tenon run` drives the agent |
+| `events.append{env,kind,data}` | harness | one row in `state-<env>.sqlite`'s `events`, fanned out to every subscriber as an `{"t":"event","scope":"env"}` frame. Base is that file's only writer |
+| `events.tail{env,after?,limit?}` | harness, CLI | that env's session log from `after` on |
+| `config.get{env}` | harness, CLI | the env's harness overlay plus the paths it lives at |
+| `config.patch{env,patch}` | harness, CLI | snapshot `profiles/<env>/harness.yml` into `config-snapshots/<env>/`, merge the patch, ask the node to `reload`; answers `{snapshot, harness, reload}` |
+| `approval.request{env,reason}` | harness, CLI | the P3.5 stub: `{status: "denied", reason: "approvals not enabled"}` unless the env's overlay says `approval: auto` |
 | `stop` | CLI | graceful shutdown of everything, base included |
 | `status` | CLI | the snapshot plus one `tree` request per registered node |
 | `subscribe{env}` | CLI | this connection starts receiving `{"t":"event",...}` frames; `env` keeps only that env's events plus the base-wide ones |
@@ -402,6 +535,11 @@ Requests to a node are answered outside the supervisor actor, so a `health` prob
 queues behind a `reset`. `reset` and `stop` do run inside it, for at most `stop_grace_ms`.
 `sandbox.exec` and `sandbox.destroy` run the actual backend call in a `spawn_blocking`
 task, not inside the actor, so a slow container exec never stalls `status`/`health`.
+
+`status` reports the harness beside the worker: `"harness": {"state": "off" | "booting" |
+"ready" | "failed", "pid": N, "restarts": N}`. A harness that dies is restarted while the
+env keeps running (bounded by `max_restarts`); its sessions are in the log and come back
+through `session.resume`.
 
 `status`'s per-node `sandbox` field is now an object rather than a bare id string:
 `{"backend":"oci","id":"tenon-6af3f8eda318-root-171...","attach":"unix:/home/x/.tenon/run/gateway-root.sock"}`,
@@ -413,6 +551,7 @@ or `null` for the guardian.
 |---|---|
 | `kill -9` base | nothing — the nodes notice their socket closing and stop themselves (~1.1 s). Any sandbox instance base owned keeps running too; nothing survives a SIGKILL to call `destroy`. There is nothing to do about this *at* the moment of the kill — the next `tenon start` (or `tenon sandbox reap`) of the same home reaps it, since the leaked container still carries this boot's `tenon.base` pid and that pid is now provably dead |
 | SIGTERM/SIGINT base | graceful `stop`: envs first (each env's sandbox instance is `destroy`ed as part of stopping it), then G, then exit. The RPC reply for `stop` (and `AbortBoot`, its during-boot equivalent) is held until this full teardown — env kill, sandbox destroy, all of it — actually completes, not sent the moment shutdown starts; a caller that trusts "ok" and force-kills base shortly after (a test fixture's teardown, an impatient supervisor) would otherwise race an in-flight `podman stop`/`rm -f` and orphan the container anyway, the same failure mode as the row above, just self-inflicted |
+| the harness of an env dies | log `harness.exit`, start a fresh one against the same node (up to `max_restarts`); the env, its sandbox and its worker are untouched |
 | an env node dies | log `node.exit`, restore its LKG profile, restart it, up to `max_restarts`. The old sandbox instance is `destroy`ed before the new one is spawned |
 | G dies | the same, plus a loud line on stderr; the env keeps running |
 | the guardian sees N bad health answers | it sends `reset{env}`; base performs it (old sandbox instance destroyed, new one spawned, same as an env restart) |
@@ -427,13 +566,16 @@ cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt 
 TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test
 ```
 
-77 tests: `sandbox` unit 5, `boot.rs` 8, `storage` 5, `harness` 1, `base` unit 2
+92 tests: `sandbox` unit 5, `boot.rs` 8, `storage` 5, `base` unit 2
 (`token`, and `home::hash` — stable per home, distinct across homes), the 20-test
 adversarial suite, `sandbox`'s 2-test conformance suite, the 1-test gateway gate, the
 P3.2 worker suites (`worker/tests/fs_test.rs` 9, `snap_test.rs` 9, `pty_test.rs` 10,
-`cli/tests/worker_wire.rs` 3) and the two P3.2 gates (`cli/tests/worker_boot.rs` 1,
-`cli/tests/spawn_gate.rs` 1). `cli/tests/boot.rs` (8)
-drives the real binary against a temp `TENON_HOME`: the harness role stub, a `tenon
+`cli/tests/worker_wire.rs` 3), the two P3.2 gates (`cli/tests/worker_boot.rs` 1,
+`cli/tests/spawn_gate.rs` 1) and the P3.3 suites (`harness/tests/llm_test.rs` 5,
+`loop_test.rs` 8, `cli/tests/harness_gate.rs` 1, `harness_model.rs` 1).
+`cli/tests/boot.rs` (8)
+drives the real binary against a temp `TENON_HOME`: `tenon harness` without a
+`TENON_BASE_SOCK` (exit 2, the reason on stderr), a `tenon
 worker` whose `TENON_GATEWAY` names a socket nobody is listening on (exit 2, the connect
 error on stderr — the worker never silently falls back to fd 3/4), a missing base, boot
 (both nodes registered, the guardian tree carrying `guardian` and `link`, the root tree
@@ -443,6 +585,39 @@ pid for A, unchanged pid for G, the old process gone), `kill -9` base (both node
 inside 5 s), `stop` (base and both nodes gone, socket and ready file removed) and an
 unexpected `SIGKILL` of A (base brings it back with `restarts: 1`). Without a release they
 print a skip line naming how to build one and pass.
+
+`harness/tests/` (13) needs no BEAM, no container and no key: `llm_test.rs` drives the
+adapter against `harness::fake`, a tokio server that answers `/chat/completions` with
+deliberately fragmented SSE — text arriving three characters at a time, a tool call whose
+name and arguments come in three frames, `429` then `503` then success (three requests,
+one answer), three failures in a row reported as one reason naming the attempt count, and
+a `400` that is not retried. `loop_test.rs` drives the whole loop against doubles for the
+bus and the log: a turn logging `session/created` through `turn/end` with the usage, a
+tool call executed through the bus and fed back so the second request's roles are
+`system, user, assistant, tool`, a `tools/pre-execute` hook denying with its own reason
+(and the target service never called), a model `400` ending the turn as `ok: false` with
+the session still usable, `session.resume` folding one session's rows back into three
+messages while ignoring another session's, prompt sections rendering in `order` (and the
+disposer removing one), the single-authority rules (a lower-priority owner is refused and
+logged, a higher-priority one takes over), and a pre-execute hook rewriting the arguments
+the target then receives.
+
+`cli/tests/harness_gate.rs` (1, skipped without oci or a release) is the P3.3 gate, one
+boot carrying five assertions: `tenon run "reply with the single word pong"` against a
+fake model injected through `profiles/root/harness.yml` prints the answer and the log
+holds `harness/ready` through `turn/end`; a scripted `bash` tool call runs in the sandbox
+and comes back with `tenon-ok` in the tool result; the agent mounts a python plugin
+through its own `plugin` tool and that plugin's service answers a `svc` call while its
+fiber shows in the tree; a guard plugin started *inside* the sandbox through the gateway
+denies an `rm -rf` tool call with its own reason, which reaches the model as the tool
+result and the human as a line on stderr; and a `SIGKILL` of the harness is followed by a
+fresh one, a `session.resume` that rebuilds the conversation and a next request that still
+carries the first turn's text. 8 s here.
+
+`cli/tests/harness_model.rs` (1) is the same first turn against the real DeepSeek endpoint,
+skipped with a printed reason when `DEEPSEEK_API_KEY` is not set. The key is read by the
+harness process from the variable the env's overlay names; it never enters the sandbox, the
+state file or an event. 7 s here.
 
 `sandbox/tests/conformance.rs` (2, `oci` and `landlock`; `krun`/`none` are excluded —
 `krun` is not implemented and `none` runs no sandboxed exec by design) spawns, execs
@@ -654,3 +829,28 @@ accumulate across CI runs.
 21. **The P3.2 tree gate runs against lowered limits** (`max_total: 3`, `max_depth: 1`)
     rather than spawning four generations of real containers to trip the shipped defaults.
     The refusal path is identical; the test is 16 s instead of minutes.
+
+22. **The harness has its own async wire client, not `sdk/rs`.** The SDK's loop is
+    synchronous (`Rc` handlers, a re-entrant `settle`), which is right for the worker and
+    wrong for a process whose calls are a model streaming for half a minute: a blocked read
+    loop would mean no `session.status` during a turn and no second session at all.
+    `harness/src/wire.rs` speaks the same frames over tokio — one writer channel, a pending
+    map for `call`/`svc`, a task per inbound request. The worker keeps the SDK.
+23. **`agent/turn-stopping` is a waterfall, not a `bail`.** The wire has no `bail` frame,
+    so the veto is `{stop: false, text?}` from a `call`-mode hook. Same for `llm/request`,
+    where an object back (rather than the argument array) short-circuits the model.
+24. **The management tools are grouped by an `op`, not named with dots.** OpenAI-compatible
+    tool names are `[a-zA-Z0-9_-]`, so the model sees `plugin{op}`, `config{op}` and
+    `snapshot{op}` while the `manage` service still exposes `plugin.list`, `config.patch`,
+    `snapshot.restore` and the rest as individually named methods for plugins.
+25. **`config.patch` does not restart the running harness.** Restarting it mid-turn would
+    drop the tool result the model is waiting for. The patch is snapshotted, written and
+    followed by a loader `reload`; a changed `llm` block applies at the next harness start
+    or `tenon reset`. `approval.request` is likewise a stub until P3.5 owns the queue.
+26. **A plugin the kernel spawns now gets `TENON_GATEWAY` unset.** An agent node exports it
+    so processes born inside the sandbox can dial in, but an SDK that prefers the gateway
+    (`sdk/py` and `sdk/rs` both do since P3.2) would open a *second* fiber for a plugin the
+    kernel had just spawned and leave the port-backed one waiting for a `hello` forever.
+    `Tenon.Beam.Registry.spec/1` appends `{"TENON_GATEWAY", false}` to every spawned
+    plugin's env; `Link` also answers `svc` and `plugin` requests from a spawned process now,
+    so a minute-long tool call cannot block the guardian's health probes.

@@ -164,14 +164,15 @@ fn kill(pid: i64, signal: &str) {
 }
 
 #[test]
-fn the_harness_stub_reports_the_phase() {
+fn the_harness_without_a_base_socket_fails_loudly() {
     let output = Command::new(BIN)
         .arg("harness")
+        .env_remove("TENON_BASE_SOCK")
         .output()
         .expect("run tenon");
     assert_eq!(output.status.code(), Some(2));
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("not implemented in P3.0"), "{text}");
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("TENON_BASE_SOCK"), "{text}");
 }
 
 #[test]

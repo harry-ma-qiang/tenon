@@ -131,6 +131,14 @@ impl Base {
                 self.emit("sandbox.reaped", None, json!({"count": count}));
             }
             Cmd::WorkerBoot { env } => self.worker_boot(&env),
+            Cmd::HarnessBoot { .. }
+            | Cmd::HarnessReady { .. }
+            | Cmd::HarnessExit { .. }
+            | Cmd::EventsAppend { .. }
+            | Cmd::EventsTail { .. }
+            | Cmd::ConfigGet { .. }
+            | Cmd::ConfigPatch { .. }
+            | Cmd::Approval { .. } => self.on_env_cmd(cmd),
             Cmd::WorkerReady { env, pid, error } => self.worker_ready(&env, pid, error),
             Cmd::SnapPull { env, reply } => self.snap_pull(&env, reply),
             Cmd::SnapList { env, reply } => {
@@ -251,6 +259,10 @@ impl Base {
             profile: spec.profile.clone(),
             ram_mb,
             worker: WorkerState::Off,
+            harness: crate::harness::State::Off,
+            harness_pid: None,
+            harness_restarts: 0,
+            harness_exited: None,
             store,
             fiber,
             ticker: None,
@@ -359,6 +371,8 @@ impl Base {
         node.worker = WorkerState::Off;
         node.ticker = None;
         let restarts = node.restarts;
+        self.harness_halt(&exit.env, Duration::from_millis(self.config.stop_grace_ms))
+            .await;
         let _ = self.store.put_env(&exit.env, &role, None, "down");
         self.emit(
             "node.exit",
@@ -416,6 +430,8 @@ impl Base {
         node.worker = WorkerState::Off;
         node.ticker = None;
         self.emit("env.reset", Some(env), json!({"pid": pid}));
+        let grace = Duration::from_millis(self.config.stop_grace_ms);
+        self.harness_halt(env, grace).await;
         if let Some(pid) = pid {
             let grace = Duration::from_millis(self.config.stop_grace_ms);
             node::terminate(pid, exited, grace).await;
@@ -497,6 +513,10 @@ impl Base {
     }
 
     pub async fn halt(&mut self, env: &str, grace: Duration) {
+        if !self.nodes.contains_key(env) {
+            return;
+        }
+        self.harness_halt(env, grace).await;
         let Some(node) = self.nodes.get_mut(env) else {
             return;
         };

@@ -45,6 +45,10 @@ pub struct Node {
     pub profile: String,
     pub ram_mb: u64,
     pub worker: WorkerState,
+    pub harness: crate::harness::State,
+    pub harness_pid: Option<i32>,
+    pub harness_restarts: u32,
+    pub harness_exited: Option<oneshot::Receiver<Option<i32>>>,
     pub store: Option<Store>,
     pub fiber: Option<envfiber::Handle>,
     pub ticker: Option<Ticker>,
@@ -73,6 +77,7 @@ impl Base {
             "parent": node.parent,
             "depth": node.depth,
             "worker": worker_view(&node.worker),
+            "harness": crate::harness::view(&node.harness, node.harness_restarts),
             "children": self.children_of(env),
         }))
     }
@@ -113,6 +118,7 @@ impl Base {
                     depth: node.depth,
                     children: self.children_of(env),
                     worker: worker_view(&node.worker),
+                    harness: crate::harness::view(&node.harness, node.harness_restarts),
                 })
                 .collect(),
         }

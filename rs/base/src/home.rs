@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -169,7 +170,68 @@ impl Home {
     pub fn prepare_env(&self, env: &str) -> Result<()> {
         std::fs::create_dir_all(self.workspace_dir(env))?;
         std::fs::create_dir_all(self.gateway_dir(env))?;
+        self.write_harness_default(env)?;
         Ok(())
+    }
+
+    /// The env's harness overlay: the provider, the model and the key's
+    /// *name* (never the key itself), plus the loop's own knobs. It is L3
+    /// config in RFC section 10 terms, so `config.patch` snapshots it first.
+    pub fn harness_file(&self, env: &str) -> PathBuf {
+        self.profiles().join(env).join("harness.yml")
+    }
+
+    pub fn config_snapshots(&self, env: &str) -> PathBuf {
+        self.root.join("config-snapshots").join(env)
+    }
+
+    pub fn write_harness_default(&self, env: &str) -> Result<()> {
+        let path = self.harness_file(env);
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, HARNESS_DEFAULT)
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn harness_config(&self, env: &str) -> Result<Value> {
+        let path = self.harness_file(env);
+        if !path.is_file() {
+            return Ok(json!({}));
+        }
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let value: Value =
+            serde_yaml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+        Ok(match value.is_object() {
+            true => value,
+            false => json!({}),
+        })
+    }
+
+    /// Snapshot, merge, write. The snapshot is a plain copy under
+    /// `config-snapshots/<env>/`, which is what makes an agent's own config
+    /// change rollback-able without touching the LKG the barebone promotes.
+    pub fn patch_harness(&self, env: &str, patch: &Value) -> Result<(PathBuf, Value)> {
+        self.write_harness_default(env)?;
+        let path = self.harness_file(env);
+        let dir = self.config_snapshots(env);
+        std::fs::create_dir_all(&dir)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|at| at.as_millis())
+            .unwrap_or(0);
+        let snapshot = dir.join(format!("harness-{stamp}.yml"));
+        copy_file(&path, &snapshot)?;
+        let mut config = self.harness_config(env)?;
+        merge(&mut config, patch);
+        let body = serde_yaml::to_string(&config)?;
+        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+        Ok((snapshot, config))
     }
 
     /// A child env's profile is its parent's layers plus one patch file of its
@@ -221,6 +283,34 @@ impl Home {
         let _ = std::fs::remove_dir_all(&into);
         copy_tree(&from, &into)?;
         Ok(true)
+    }
+}
+
+const HARNESS_DEFAULT: &str = "\
+llm:
+  provider: openai
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+max_steps: 8
+approval: deny
+";
+
+/// Object keys merge, everything else replaces: the loader's patch semantics
+/// for one file rather than for an entry list.
+pub fn merge(into: &mut Value, patch: &Value) {
+    match (into.as_object_mut(), patch.as_object()) {
+        (Some(target), Some(rows)) => {
+            for (key, value) in rows {
+                match target.get_mut(key) {
+                    Some(slot) if slot.is_object() && value.is_object() => merge(slot, value),
+                    _ => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        _ => *into = patch.clone(),
     }
 }
 
