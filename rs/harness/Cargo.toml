@@ -1,0 +1,9 @@
+[package]
+name = "tenon-harness"
+description = "Agent loop, llm adapter and session log, one process per environment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

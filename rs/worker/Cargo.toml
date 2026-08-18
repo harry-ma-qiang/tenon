@@ -1,0 +1,10 @@
+[package]
+name = "tenon-worker"
+description = "Resident in-sandbox tool process: pty, fs, edit, git snapshots over the wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tenon-sdk = { path = "../../sdk/rs" }
