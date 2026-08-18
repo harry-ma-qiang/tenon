@@ -1,0 +1,40 @@
++----------------------------------------------++--------------------------------------------------------------++----------------------------------------------+
+| [TREE]                                       || [TRANSCRIPT]                                                 || [EVENTS]                                     |
+| root [agent] up                              || user: please run the build and fix any failures              || 1001 session/created root                    |
+| root.1 [agent] up sandbox=oci                || assistant: sure, starting with a clean build to see the      || 1002 user/message please run the build and   |
+| root.2 [agent] restarting restarts=3         || current state                                                || fix any failures                             |
+| side [agent] down sandbox=landlock           || [-] tool bash (3 lines)                                      || 1003 turn/start turn 1                       |
+|                                              || cargo build                                                  || 1004 tool/call bash cargo build              |
+|                                              || Compiling tenon-ui                                           || 1005 tool/result ok                          |
+|                                              || Finished dev                                                 || 1006 turn/end turn 1 ok                      |
+|                                              || assistant: build is clean, running clippy next               ||                                              |
+|                                              || [+] tool bash (2 lines)                                      ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
+|                                              ||                                                              ||                                              |
++----------------------------------------------++--------------------------------------------------------------++----------------------------------------------+
++--------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| [APPROVALS]                                                                                                                                                  |
+| [ap-1] env=root reason=publish workspace to the host                                                                                                         |
+|                                                                                                                                                              |
+|                                                                                                                                                              |
+|                                                                                                                                                              |
+|                                                                                                                                                              |
+|                                                                                                                                                              |
+|                                                                                                                                                              |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------+
+base pid=4242 attached=2 tokens=12000/50000 wall=90s/600s                                                                                                       
+> type a task, p to prompt, a to approve, r to rollback, q to quit                                                                                              

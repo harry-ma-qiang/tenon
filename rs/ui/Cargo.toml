@@ -1,0 +1,10 @@
+[package]
+name = "tenon-ui"
+description = "Dependency-free ASCII renderer for the barebone's own face: terminal and HTML carriers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true

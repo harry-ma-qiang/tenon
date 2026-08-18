@@ -1,0 +1,30 @@
++-------------------------------++-----------------------------------------------------------------+
+| [TREE]                        || [TRANSCRIPT]                                                    |
+| root [agent] up               || user: please run the build and fix any failures                 |
+| root.1 [agent] up sandbox=oci || assistant: sure, starting with a clean build to see the current |
+| root.2 [agent] restarting     || state                                                           |
+| restarts=3                    || [-] tool bash (3 lines)                                         |
+| side [agent] down             || cargo build                                                     |
+| sandbox=landlock              || Compiling tenon-ui                                              |
+|                               || Finished dev                                                    |
+|                               || assistant: build is clean, running clippy next                  |
+|                               || [+] tool bash (2 lines)                                         |
+|                               ||                                                                 |
+|                               ||                                                                 |
+|                               ||                                                                 |
+|                               |+-----------------------------------------------------------------+
+|                               |+-----------------------------------------------------------------+
+|                               || [APPROVALS]                                                     |
+|                               || [ap-1] env=root reason=publish workspace to the host            |
+|                               ||                                                                 |
+|                               ||                                                                 |
++-------------------------------++-----------------------------------------------------------------+
++--------------------------------------------------------------------------------------------------+
+| [EVENTS]                                                                                         |
+| 1001 session/created root                                                                        |
+| 1002 user/message please run the build and fix any failures                                      |
+| 1003 turn/start turn 1                                                                           |
+| 1004 tool/call bash cargo build                                                                  |
++--------------------------------------------------------------------------------------------------+
+base pid=4242 attached=2 tokens=12000/50000 wall=90s/600s                                           
+> type a task, p to prompt, a to approve, r to rollback, q to quit                                  

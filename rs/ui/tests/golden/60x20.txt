@@ -1,0 +1,20 @@
++----------------------------------------------------------+
+| [TREE]                                                   |
+| root [agent] up                                          |
++----------------------------------------------------------+
++----------------------------------------------------------+
+| [TRANSCRIPT]                                             |
+| user: please run the build and fix any failures          |
+| assistant: sure, starting with a clean build to see the  |
+| current state                                            |
+| [-] tool bash (3 lines)                                  |
++----------------------------------------------------------+
++----------------------------------------------------------+
+| [EVENTS]                                                 |
++----------------------------------------------------------+
++----------------------------------------------------------+
+| [APPROVALS]                                              |
+| [ap-1] env=root reason=publish workspace to the host     |
++----------------------------------------------------------+
+base pid=4242 attached=2 tokens=12000/50000 wall=90s/600s   
+> type a task, p to prompt, a to approve, r to rollback, q t
