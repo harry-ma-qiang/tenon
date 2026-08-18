@@ -20,7 +20,8 @@
 -type disposer() :: fun(() -> any()).
 -type status() :: pending | loading | active | failed | unloading | disposed.
 -type spec() :: #{module => module(), cmd => string(), args => [string()],
-                  env => [{string(), string()}], config => term(), id => term()}.
+                  env => [{string(), string()}], socket => port(), config => term(),
+                  id => term()}.
 
 -export_type([ctx/0, disposer/0, status/0, spec/0, tabs/0]).
 
@@ -31,7 +32,8 @@
             opts :: map(), inject = [] :: [atom()], epoch = inactive :: term(),
             status = pending :: status(), error :: term(), disposers = [] :: list(),
             phase = ready :: ready | hello | loading, waiters = [] :: list(),
-            anchor :: {pid(), reference()} | undefined, port :: port() | undefined,
+            anchor :: {pid(), reference()} | undefined,
+            port :: {port, port()} | {socket, port()} | undefined,
             os_pid :: integer() | undefined, wire = #{} :: map(), pending = #{} :: map()}).
 
 -spec start() -> {ok, pid()}.
@@ -74,6 +76,7 @@ status(Fiber) ->
 mount(#{kernel := Kernel, fiber := Owner}, Spec) ->
     Ref = make_ref(),
     {ok, Fiber} = gen_server:call(Kernel, {mount, Spec, Owner, Ref}, infinity),
+    ok = case Spec of #{socket := Sock} -> ok = gen_tcp:controlling_process(Sock, Fiber), inet:setopts(Sock, [{active, true}]); _ -> ok end,
     try attach(Owner, Ref, fun() -> unmount(Fiber) end) of
         ok -> _ = status(Fiber), {ok, Fiber}
     catch
@@ -260,20 +263,14 @@ handle_info({tenon_drop, Ref}, #f{} = State) ->
     {noreply, run_disposer(State, Ref)};
 handle_info({tenon_forget, Ref}, #f{disposers = Ds} = State) ->
     {noreply, State#f{disposers = lists:keydelete(Ref, 1, Ds)}};
-handle_info({Port, {data, Bin}}, #f{port = Port} = State) ->
-    case byte_size(Bin) > max_frame(State) of
-        true ->
-            {noreply, reject_frame(Bin, State)};
-        false ->
-            case decode_frame(Bin) of
-                {ok, Frame} -> {noreply, handle_frame(Frame, State)};
-                error -> {noreply, State}
-            end
-    end;
-handle_info({Port, {exit_status, Code}}, #f{port = Port} = State) ->
+handle_info({RawPort, {data, Bin}}, #f{port = {port, RawPort}} = State) -> {noreply, handle_incoming(Bin, State)};
+handle_info({tcp, Sock, Bin}, #f{port = {socket, Sock}} = State) -> {noreply, handle_incoming(Bin, State)};
+handle_info({RawPort, {exit_status, Code}}, #f{port = {port, RawPort}} = State) ->
     port_gone(State#f{os_pid = undefined}, {exit_status, Code});
-handle_info({'EXIT', Port, Reason}, #f{port = Port} = State) when is_port(Port) ->
+handle_info({'EXIT', RawPort, Reason}, #f{port = {port, RawPort}} = State) ->
     port_gone(State, {port_exit, Reason});
+handle_info({tcp_closed, Sock}, #f{port = {socket, Sock}} = State) -> port_gone(State, tcp_closed);
+handle_info({tcp_error, Sock, Reason}, #f{port = {socket, Sock}} = State) -> port_gone(State, {tcp_error, Reason});
 handle_info({'EXIT', Kernel, _Reason}, #f{ctx = #{kernel := Kernel}} = State) ->
     {stop, shutdown, State};
 handle_info({tenon_deadline, Req}, #f{} = State) ->
@@ -307,6 +304,12 @@ decode_frame(Bin) ->
         Class:Reason ->
             logger:error("tenon: bad frame ~p", [{Class, Reason, Bin}]),
             error
+    end.
+
+handle_incoming(Bin, State) ->
+    case byte_size(Bin) > max_frame(State) of
+        true -> reject_frame(Bin, State);
+        false -> case decode_frame(Bin) of {ok, Frame} -> handle_frame(Frame, State); error -> State end
     end.
 
 options(Opts) ->
@@ -484,7 +487,7 @@ drain(State) ->
     end.
 
 kind(#f{module = Module}) when Module =/= undefined -> inline;
-kind(#f{spec = #{cmd := _}}) -> external;
+kind(#f{spec = Spec}) when is_map_key(cmd, Spec) orelse is_map_key(socket, Spec) -> external;
 kind(#f{}) -> root.
 
 declared_inject(#f{module = undefined}) ->
@@ -499,9 +502,12 @@ declared_inject(#f{module = Module}) ->
 announce(State) ->
     emit(State#f.ctx, 'internal/plugin', [self()]),
     case kind(State) of
-        external -> open_plugin(State);
+        external -> connect_external(State);
         _ -> refresh(State)
     end.
+
+connect_external(#f{spec = #{socket := Sock}} = State) -> arm(State#f{port = {socket, Sock}}, hello);
+connect_external(State) -> open_plugin(State).
 
 settled(#f{phase = Phase}) -> Phase =:= ready.
 
@@ -554,8 +560,9 @@ do_load(State0) ->
         external -> spawn_or_load(State)
     end.
 
-spawn_or_load(#f{port = Port} = State) when is_port(Port) ->
+spawn_or_load(#f{port = Tx} = State) when Tx =/= undefined ->
     wire_load(State);
+spawn_or_load(#f{spec = #{socket := _}} = State) -> settle(fail_external(State#f{phase = ready}, socket_unavailable));
 spawn_or_load(State) ->
     open_plugin(State#f{phase = hello, wire = #{}}).
 
@@ -660,7 +667,7 @@ open_plugin(#f{spec = Spec} = State) ->
                     {os_pid, Pid} -> Pid;
                     _ -> undefined
                 end,
-        arm(State#f{port = Port, os_pid = OsPid}, hello)
+        arm(State#f{port = {port, Port}, os_pid = OsPid}, hello)
     catch
         Class:Reason ->
             settle(fail_external(State#f{phase = ready}, {spawn_failed, Class, Reason}))
@@ -673,19 +680,22 @@ arm(#f{pending = Pending} = State, Req) ->
 next_req(#f{ctx = #{tabs := #{seq := Seq}}}) ->
     ets:update_counter(Seq, req, 1).
 
-send_frame(#f{port = Port} = State, Frame) when is_port(Port) ->
+send_frame(#f{port = Tx} = State, Frame) when Tx =/= undefined ->
     try
         Data = json:encode(Frame),
         Size = iolist_size(Data),
         case Size > max_frame(State) of
             true -> too_large(Frame, Size, State);
-            false -> port_command(Port, Data), ok
+            false -> tx_send(Tx, Data), ok
         end
     catch
         _:_ -> ok
     end;
 send_frame(_State, _Frame) ->
     ok.
+
+tx_send({port, Port}, Data) -> port_command(Port, Data);
+tx_send({socket, Sock}, Data) -> gen_tcp:send(Sock, Data).
 
 too_large(Frame, Size, State) ->
     logger:error("tenon: outbound ~p frame of ~p bytes over cap ~p, dropped",
@@ -696,13 +706,13 @@ notice(State, Frame) ->
     _ = send_frame(State, Frame),
     State.
 
-request(#f{port = Port} = State, From, Frame) when is_port(Port) ->
+request(#f{port = Tx} = State, From, Frame) when Tx =/= undefined ->
     Req = next_req(State),
     park(send_frame(State, Frame#{req => Req}), Req, From, State);
 request(State, _From, _Frame) ->
     {reply, {error, no_plugin}, State}.
 
-resume(#f{port = Port} = State, From, Req, Result) when is_port(Port) ->
+resume(#f{port = Tx} = State, From, Req, Result) when Tx =/= undefined ->
     Frame = #{t => <<"result">>, req => Req, result => enc(Result)},
     park(send_frame(State, Frame), Req, From, State);
 resume(State, _From, _Req, _Result) ->
@@ -723,28 +733,26 @@ wire_load(State0) ->
         {error, Reason} -> settle(fail(State#f{phase = ready}, Reason))
     end.
 
-close_plugin(#f{port = Port} = State) when is_port(Port) ->
+close_plugin(#f{port = Tx} = State) when Tx =/= undefined ->
     send_frame(State, #{t => <<"unload">>}),
-    close_port(await_exit(State, Port));
+    close_port(await_exit(State, Tx));
 close_plugin(State) ->
     State.
 
-await_exit(State, Port) ->
+await_exit(State, Tx) ->
     receive
-        {Port, {exit_status, _Code}} -> State#f{os_pid = undefined}
-    after grace(State) ->
-        State
+        {P, {exit_status, _}} when Tx =:= {port, P} -> State#f{os_pid = undefined};
+        {tcp_closed, S} when Tx =:= {socket, S} -> State
+    after grace(State) -> State
     end.
 
-close_port(#f{port = Port} = State0) when is_port(Port) ->
-    State = case drain_exit(Port) of
-                true -> State0#f{os_pid = undefined};
-                false -> State0
-            end,
+close_port(#f{port = {port, Port}} = State0) ->
+    State = case drain_exit(Port) of true -> State0#f{os_pid = undefined}; false -> State0 end,
     catch erlang:port_close(Port),
     ok = kill(State#f.os_pid),
     cancel_all(State#f{port = undefined, os_pid = undefined});
-close_port(State) ->
+close_port(#f{port = {socket, Sock}} = State0) -> catch gen_tcp:close(Sock), cancel_all(State0#f{port = undefined});
+close_port(#f{port = undefined} = State) ->
     State.
 
 drain_exit(Port) ->
