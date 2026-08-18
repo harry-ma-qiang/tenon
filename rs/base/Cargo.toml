@@ -1,0 +1,20 @@
+[package]
+name = "tenon-base"
+description = "The tenon barebone: boots the guardian and env nodes, owns the UDS front door and the LKG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tenon-sandbox = { path = "../sandbox" }
+tenon-storage = { path = "../storage" }

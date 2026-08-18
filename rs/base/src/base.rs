@@ -1,0 +1,447 @@
+use crate::config::Config;
+use crate::home::Home;
+use crate::node::{self, Exit, GUARDIAN};
+use crate::peer::Peer;
+use anyhow::Result;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+use tenon_sandbox::{Instance, Sandbox, Spec};
+use tenon_storage::Store;
+use tokio::sync::{mpsc, oneshot};
+
+pub enum Cmd {
+    Boot {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Register {
+        peer: Peer,
+        role: String,
+        env: String,
+        pid: i64,
+    },
+    Snapshot {
+        reply: oneshot::Sender<Snapshot>,
+    },
+    PeerOf {
+        env: String,
+        reply: oneshot::Sender<Option<Peer>>,
+    },
+    Reset {
+        env: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    Stop {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    Subscribe {
+        peer: Peer,
+        env: Option<String>,
+        reply: oneshot::Sender<Value>,
+    },
+    Gone {
+        peer: u64,
+    },
+    Ready {
+        reply: oneshot::Sender<bool>,
+    },
+}
+
+pub struct NodeView {
+    pub env: String,
+    pub role: String,
+    pub pid: Option<i32>,
+    pub registered: bool,
+    pub restarts: u32,
+    pub sandbox: Option<String>,
+    pub peer: Option<Peer>,
+}
+
+pub struct Snapshot {
+    pub home: PathBuf,
+    pub release: PathBuf,
+    pub pid: u32,
+    pub exit_on_detach: bool,
+    pub attached: usize,
+    pub nodes: Vec<NodeView>,
+}
+
+struct Node {
+    role: String,
+    pid: Option<i32>,
+    generation: u64,
+    registered: bool,
+    restarts: u32,
+    peer: Option<Peer>,
+    sandbox: Option<Instance>,
+    exited: Option<oneshot::Receiver<Option<i32>>>,
+}
+
+pub struct Base {
+    home: Home,
+    config: Config,
+    store: Store,
+    release: PathBuf,
+    sandbox: Box<dyn Sandbox>,
+    exit_on_detach: bool,
+    nodes: BTreeMap<String, Node>,
+    subs: BTreeMap<u64, (Peer, Option<String>)>,
+    exits: mpsc::UnboundedSender<Exit>,
+    generation: u64,
+    promoted: bool,
+    stopping: bool,
+}
+
+fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
+    match (filter, env) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(filter), Some(env)) => filter == env,
+    }
+}
+
+impl Base {
+    pub fn new(
+        home: Home,
+        config: Config,
+        store: Store,
+        release: PathBuf,
+        sandbox: Box<dyn Sandbox>,
+        exit_on_detach: bool,
+        exits: mpsc::UnboundedSender<Exit>,
+    ) -> Self {
+        Self {
+            home,
+            config,
+            store,
+            release,
+            sandbox,
+            exit_on_detach,
+            nodes: BTreeMap::new(),
+            subs: BTreeMap::new(),
+            exits,
+            generation: 0,
+            promoted: false,
+            stopping: false,
+        }
+    }
+
+    pub async fn run(
+        mut self,
+        mut cmds: mpsc::UnboundedReceiver<Cmd>,
+        mut exits: mpsc::UnboundedReceiver<Exit>,
+    ) -> i32 {
+        loop {
+            tokio::select! {
+                cmd = cmds.recv() => match cmd {
+                    Some(cmd) => self.on_cmd(cmd).await,
+                    None => break,
+                },
+                exit = exits.recv() => match exit {
+                    Some(exit) => self.on_exit(exit),
+                    None => break,
+                },
+            }
+            if self.stopping {
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(self.home.ready_file());
+        let _ = std::fs::remove_file(self.home.sock());
+        0
+    }
+
+    async fn on_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Boot { reply } => {
+                let _ = reply.send(self.boot());
+            }
+            Cmd::Register {
+                peer,
+                role,
+                env,
+                pid,
+            } => self.on_register(peer, role, env, pid),
+            Cmd::Snapshot { reply } => {
+                let _ = reply.send(self.snapshot());
+            }
+            Cmd::PeerOf { env, reply } => {
+                let peer = self.nodes.get(&env).and_then(|node| node.peer.clone());
+                let _ = reply.send(peer);
+            }
+            Cmd::Reset { env, reply } => {
+                let outcome = self.reset(&env).await;
+                let _ = reply.send(outcome);
+            }
+            Cmd::Stop { reply } => {
+                let _ = reply.send(Ok(json!({"ok": true})));
+                self.stop().await;
+            }
+            Cmd::Subscribe { peer, env, reply } => {
+                let last = self.store.last_event_id().unwrap_or(0);
+                self.subs.insert(peer.id(), (peer, env.clone()));
+                let _ = reply.send(json!({"ok": true, "last_event": last, "env": env}));
+            }
+            Cmd::Gone { peer } => self.on_gone(peer).await,
+            Cmd::Ready { reply } => {
+                let _ = reply.send(self.ready());
+            }
+        }
+    }
+
+    fn boot(&mut self) -> Result<(), String> {
+        let root = self.config.root_env.clone();
+        self.emit(
+            "base.boot",
+            None,
+            json!({"release": self.release, "sandbox": self.sandbox.backend()}),
+        );
+        self.start(GUARDIAN, GUARDIAN)?;
+        self.start("agent", &root)
+    }
+
+    fn start(&mut self, role: &str, env: &str) -> Result<(), String> {
+        self.generation += 1;
+        let generation = self.generation;
+        let spec = node::spec(&self.config, &self.home, role, env);
+        let running = node::spawn(
+            &spec,
+            &self.config,
+            &self.home,
+            &self.release,
+            generation,
+            self.exits.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let restarts = self.nodes.get(env).map(|node| node.restarts).unwrap_or(0);
+        let sandbox = self.enter_sandbox(role, env)?;
+        self.nodes.insert(
+            env.to_string(),
+            Node {
+                role: role.to_string(),
+                pid: Some(running.pid),
+                generation,
+                registered: false,
+                restarts,
+                peer: None,
+                sandbox,
+                exited: running.exited,
+            },
+        );
+        let _ = self
+            .store
+            .put_env(env, role, Some(running.pid as i64), "starting");
+        self.emit(
+            "node.start",
+            Some(env),
+            json!({"role": role, "pid": running.pid}),
+        );
+        Ok(())
+    }
+
+    fn enter_sandbox(&mut self, role: &str, env: &str) -> Result<Option<Instance>, String> {
+        if role == GUARDIAN {
+            return Ok(None);
+        }
+        if let Some(node) = self.nodes.get_mut(env) {
+            if let Some(old) = node.sandbox.take() {
+                let _ = self.sandbox.destroy(&old);
+            }
+        }
+        let spec = Spec {
+            env: env.to_string(),
+            image: None,
+            workspace: self.home.root.join("workspace").join(env),
+            policy: Default::default(),
+            caps: vec![],
+        };
+        self.sandbox
+            .spawn(&spec)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn on_register(&mut self, peer: Peer, role: String, env: String, pid: i64) {
+        let Some(node) = self.nodes.get_mut(&env) else {
+            return;
+        };
+        node.peer = Some(peer);
+        node.registered = true;
+        node.pid = Some(pid as i32);
+        let _ = self.store.put_env(&env, &role, Some(pid), "up");
+        self.emit(
+            "node.register",
+            Some(&env),
+            json!({"role": role, "pid": pid}),
+        );
+        if self.ready() && !self.promoted {
+            self.promoted = true;
+            let _ = self.store.checkpoint();
+            match self.home.promote_lkg() {
+                Ok(()) => self.emit("lkg.promote", None, json!({"ok": true})),
+                Err(error) => self.emit("lkg.promote", None, json!({"error": error.to_string()})),
+            }
+            self.emit("base.ready", None, json!({"nodes": self.nodes.len()}));
+        }
+    }
+
+    fn on_exit(&mut self, exit: Exit) {
+        if self.stopping {
+            return;
+        }
+        let Some(node) = self.nodes.get_mut(&exit.env) else {
+            return;
+        };
+        if node.generation != exit.generation {
+            return;
+        }
+        let role = node.role.clone();
+        node.registered = false;
+        node.peer = None;
+        node.pid = None;
+        node.exited = None;
+        let restarts = node.restarts;
+        let _ = self.store.put_env(&exit.env, &role, None, "down");
+        self.emit(
+            "node.exit",
+            Some(&exit.env),
+            json!({"code": exit.code, "role": role, "restarts": restarts}),
+        );
+        if role == GUARDIAN {
+            eprintln!(
+                "tenon base: GUARDIAN NODE DIED (code {:?}), restarting",
+                exit.code
+            );
+        }
+        if restarts >= self.config.max_restarts {
+            self.emit(
+                "node.give_up",
+                Some(&exit.env),
+                json!({"restarts": restarts}),
+            );
+            return;
+        }
+        if let Some(node) = self.nodes.get_mut(&exit.env) {
+            node.restarts = restarts + 1;
+        }
+        let _ = self.home.restore_env(&exit.env);
+        if let Err(error) = self.start(&role, &exit.env) {
+            self.emit(
+                "node.start_failed",
+                Some(&exit.env),
+                json!({"error": error}),
+            );
+        }
+    }
+
+    async fn reset(&mut self, env: &str) -> Result<Value, String> {
+        if env == GUARDIAN {
+            return Err("the guardian is not resettable".to_string());
+        }
+        let Some(node) = self.nodes.get_mut(env) else {
+            return Err(format!("unknown env {env}"));
+        };
+        let role = node.role.clone();
+        let pid = node.pid;
+        let exited = node.exited.take();
+        node.registered = false;
+        node.peer = None;
+        self.emit("env.reset", Some(env), json!({"pid": pid}));
+        if let Some(pid) = pid {
+            let grace = Duration::from_millis(self.config.stop_grace_ms);
+            node::terminate(pid, exited, grace).await;
+        }
+        let restored = self.home.restore_env(env).unwrap_or(false);
+        self.start(&role, env)?;
+        if let Some(node) = self.nodes.get_mut(env) {
+            node.restarts = 0;
+        }
+        let fresh = self.nodes.get(env).and_then(|node| node.pid);
+        Ok(json!({"ok": true, "env": env, "pid": fresh, "lkg": restored}))
+    }
+
+    async fn stop(&mut self) {
+        self.stopping = true;
+        self.emit("base.stop", None, json!({"ok": true}));
+        let grace = Duration::from_millis(self.config.stop_grace_ms);
+        let order: Vec<String> = self
+            .nodes
+            .keys()
+            .filter(|env| *env != GUARDIAN)
+            .cloned()
+            .chain(std::iter::once(GUARDIAN.to_string()))
+            .collect();
+        for env in order {
+            let Some(node) = self.nodes.get_mut(&env) else {
+                continue;
+            };
+            let pid = node.pid.take();
+            let exited = node.exited.take();
+            node.registered = false;
+            node.peer = None;
+            if let Some(pid) = pid {
+                node::terminate(pid, exited, grace).await;
+            }
+            if let Some(instance) = node.sandbox.take() {
+                let _ = self.sandbox.destroy(&instance);
+            }
+            let _ = self.store.put_env(&env, &node.role, None, "stopped");
+        }
+        let _ = self.store.checkpoint();
+    }
+
+    async fn on_gone(&mut self, peer: u64) {
+        let was = self.subs.remove(&peer).is_some();
+        if was && self.subs.is_empty() && self.exit_on_detach {
+            self.emit("base.detach", None, json!({"exit_on_detach": true}));
+            self.stop().await;
+        }
+    }
+
+    fn ready(&self) -> bool {
+        !self.nodes.is_empty() && self.nodes.values().all(|node| node.registered)
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            home: self.home.root.clone(),
+            release: self.release.clone(),
+            pid: std::process::id(),
+            exit_on_detach: self.exit_on_detach,
+            attached: self.subs.len(),
+            nodes: self
+                .nodes
+                .iter()
+                .map(|(env, node)| NodeView {
+                    env: env.clone(),
+                    role: node.role.clone(),
+                    pid: node.pid,
+                    registered: node.registered,
+                    restarts: node.restarts,
+                    sandbox: node.sandbox.as_ref().map(|instance| instance.id.clone()),
+                    peer: node.peer.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn emit(&mut self, kind: &str, env: Option<&str>, data: Value) {
+        let Ok(event) = self.store.append(kind, env, &data) else {
+            return;
+        };
+        let frame = json!({
+            "t": "event",
+            "id": event.id,
+            "at": event.at,
+            "kind": event.kind,
+            "env": event.env,
+            "data": event.data,
+        });
+        for (peer, filter) in self.subs.values() {
+            if wanted(filter.as_deref(), event.env.as_deref()) {
+                peer.send(frame.clone());
+            }
+        }
+    }
+}

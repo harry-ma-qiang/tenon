@@ -1,0 +1,11 @@
+[package]
+name = "tenon-sandbox"
+description = "Sandbox trait for tenon environments, with the none backend of P3.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
