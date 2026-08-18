@@ -786,3 +786,135 @@ untouched throughout.
 P3.3: the harness — llm adapter, agent loop, session log, tools bus and the policy hooks,
 with the worker's surface as its first tool catalog; the management tools that let an agent
 mount a plugin, patch config and call `runtime.spawn` itself.
+
+## 23. P3.3 result: the harness — llm, loop, session log, tools bus, management tools (2026-08-18)
+
+The P3.3 row of the plan. `rs/harness` is now the `tenon harness` role: one host process
+per environment, holding the model key, registering itself as a wire plugin of that env's
+node through the gateway. It is the first thing in Tenon that can be handed a task in
+English and answer with work done inside the sandbox.
+
+### Lines
+
+| Part | LoC |
+|---|---|
+| `rs/harness/src/{lib,wire,bus,config,api,llm,agent,tools,prompt,manage,fake}.rs` | 253+249+38+122+156+348+447+420+131+118+235 = 2517 |
+| `rs/harness/tests/{llm_test,loop_test,support}.rs` | 96+415+152 = 663 |
+| `rs/base/src/{harness,envrpc,run}.rs` (new) | 238+192+91 = 521 |
+| `rs/base/src/{base,home,server,rpc,state,spawn,snap,lib}.rs` (touched) | 572+456+305+165+143+198+249+327 |
+| `rs/cli/tests/{harness_gate,harness_model}.rs` | 456+144 = 600 |
+| `beam/lib/tenon/beam/{link/handlers,link/server,registry}.ex` (touched) | 179+183+55 |
+
+New Rust this phase: ~4300 lines including tests, ~2500 of it the harness itself, against
+the RFC's estimate of 2k for the harness. Every file is under the 600-line ceiling;
+`base.rs` stayed there by putting the harness supervision in `harness.rs` and the new
+env-scoped RPCs in `envrpc.rs`.
+
+### The shape that mattered: an async wire, not the SDK
+
+`sdk/rs` is synchronous by design — `Rc` handlers, a re-entrant `settle`, one thread. That
+is right for the worker, whose calls are microseconds, and wrong for a harness, whose calls
+are a model streaming for thirty seconds. A blocked read loop would mean no `session.status`
+while a turn runs, no second session, no `tools.execute` from a hook. So `harness/wire.rs`
+speaks the same frames over tokio: one writer channel, one reader loop, a pending map for
+`call`/`svc` correlation and a spawned task per inbound `svc`. 247 lines, and everything
+the loop needs — concurrent turns, tool calls that come back through the kernel, waterfall
+hooks awaited from inside a step — falls out of it. The synchronous SDK stays what it is.
+
+Two traits keep it testable: `Bus` (svc/call/emit) and `Log` (append/tail). The wire
+implements one, base's front door the other; the tests use doubles and drive the whole loop
+against a fake OpenAI server in-process, with no BEAM, no container and no key.
+
+### Model-visible == logged
+
+Every input and output of the model is an event in `state-<env>.sqlite`, appended through
+base (`events.append`) because base is that file's only writer. `session.resume{id}` folds
+the rows back into a context: user messages, assistant messages, tool results, in order.
+That is what makes a harness restart a non-event — the gate kills the process with SIGKILL,
+base restarts it, `session.resume` returns the same conversation and the next request to
+the model still carries the first turn's text.
+
+The same rows are what `tenon run` streams. It subscribes to base, prompts, prints
+`assistant/chunk` as it arrives, reports tool calls and denials on stderr, and exits on
+`turn/end`. No separate progress channel exists, so there is nothing that can disagree with
+the log.
+
+### Single authority, and the hook that proves it
+
+`tools.register` keeps one row per name: same owner replaces, a different owner needs a
+strictly higher priority, and the loser is logged with the reason. `tools.execute` runs
+`tools/pre-execute` (array back = allowed and possibly rewritten, `{deny: reason}` =
+refused), then the target service, then `tools/post-execute`. The gate mounts the guard
+from `playground/web/plugins/guard.py`'s shape *inside the sandbox*, connecting out through
+the gateway, and a `rm -rf` tool call comes back to the model as `blocked by the sandbox
+guard`. The same seam that DSH's bridge mirrors, with no DSH in the picture.
+
+One P3.1 test had to change with it: `gateway_gate` used to wait for "a new fiber under
+`gateway`" as its proof that the in-sandbox plugin had registered. The harness is a
+gateway fiber too now, so that count could grow without the plugin being there; it waits
+for the plugin's own service to answer instead, which is the thing it actually means.
+
+### Three defects this phase found in older code
+
+1. **A plugin the kernel spawns inherited `TENON_GATEWAY`.** An agent node exports it so
+   processes born in the sandbox can dial in; an SDK that prefers the gateway (both
+   `sdk/py` and `sdk/rs` do, since P3.2) therefore opened a *second* fiber for itself and
+   left the port-backed one waiting for a `hello` that never came — a 30 s deadline, a
+   failed fiber, and a mount that blocked past base's request timeout. `Registry.spec/1`
+   now appends `{"TENON_GATEWAY", false}` to every spawned plugin's env. This also fixes
+   the default profile's demo plugin, which had been failing the same way since P3.2.
+2. **`Link` answered `svc` on its own GenServer process.** A tool call that takes a minute
+   would block the guardian's health probes behind it and end in a reset. `svc` and the new
+   `plugin` request now answer from a spawned process; only the socket is shared.
+3. **`id` collided with `id`.** The fiber id for `plugin.unmount` travelled in the field
+   the frame protocol uses for request correlation, so it silently overwrote it. It is
+   `plugin_id` on every hop now.
+
+### Management tools
+
+`plugin.list/mount/unmount/restart` reach the node's kernel through `Link`; `config.get`
+and `config.patch` read and patch `profiles/<env>/harness.yml` through base, snapshotting
+into `config-snapshots/<env>/` and reloading the loader; `snapshot.list/restore` and
+`runtime.spawn` are base RPCs; `approval.request` is the honest P3.5 stub — `denied` with
+`approvals not enabled` unless the overlay says `approval: auto`. A prompt section named
+`extend` documents all of them to the model. The gate has the agent mount a python plugin
+through the `plugin` tool and then calls that plugin's service through base: the fiber is
+in `tenon status`, exactly the P3.3 acceptance line.
+
+### Deviations
+
+1. The harness has its own async wire client instead of `sdk/rs` (above).
+2. `agent/turn-stopping` is a waterfall, not a `bail`: the wire has no `bail` frame, so a
+   veto is `{stop: false}` from a `call`-mode hook.
+3. Model-facing tool names cannot contain dots on OpenAI-compatible providers, so the
+   management tools are grouped: one `plugin` tool with an `op`, one `config`, one
+   `snapshot`. The `manage` service still exposes `plugin.list`, `config.patch` and the
+   rest as individually named methods for plugins.
+4. `config.patch` does not restart the running harness. Restarting it mid-turn would drop
+   the tool result the model is waiting for; the new settings apply at the next harness
+   start or `tenon reset`.
+5. The fake OpenAI server is hand-written on tokio (`harness/src/fake.rs`, 235 lines)
+   rather than axum: it has to speak chunked SSE with deliberately fragmented frames, which
+   is easier to control at that level than through a framework, and it costs no dependency.
+6. Tool timeouts are capped below the kernel's 30 s request deadline (`tool_timeout_ms`,
+   default 20 s), since a tool call is a kernel-to-plugin request like any other.
+7. `upgrade.propose/status` from RFC section 6 is not here; it belongs to the P3.7 change
+   protocol, which is what would implement it.
+
+### Gates
+
+`cargo build --release`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+clean. `TENON_RELEASE_DIR=... cargo test`: 91 green (20 adversarial, 8 `boot.rs`, 5+8 the
+harness unit suites, 1 gateway gate, 1 harness gate, 1 real-model smoke, 1 spawn gate, 1
+worker gate, 3 `worker_wire`, 9 `fs_test`, 10 `pty_test`, 9 `snap_test`, 5 sandbox unit, 2
+conformance, 5 storage, 2 base unit), from 77 at the end of P3.2; the harness gate is 8 s
+and the real-model smoke 8 s against DeepSeek. BEAM (Link and Registry changed): `mix
+compile --warnings-as-errors`, `mix format --check-formatted`, `mix credo --strict`, `mix
+test` 24/24, `MIX_ENV=prod mix release`.
+`podman ps -a --filter label=tenon.home` empty after the runs. The live user demo was left
+untouched.
+
+### Next
+
+P3.4: the storage crate and the rest of the schema — `tool_results`, `snapshots`, `blobs`,
+`episodes` written by the loop from day one, so the navigator has data before it exists.
