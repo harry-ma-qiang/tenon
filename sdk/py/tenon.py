@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import struct
 import sys
 import traceback
@@ -41,14 +42,39 @@ def _reason(exc):
     return str(exc) or type(exc).__name__
 
 
+def _connect_gateway(address):
+    if address.startswith("unix:"):
+        path = address[len("unix:"):]
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        return sock
+    if address.startswith("tcp:"):
+        host, port = address[len("tcp:"):].rsplit(":", 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, int(port)))
+        return sock
+    raise TenonError("bad TENON_GATEWAY address: %r" % (address,))
+
+
+def _default_wires():
+    address = os.environ.get("TENON_GATEWAY")
+    if not address:
+        return os.fdopen(WIRE_IN_FD, "rb", 0), os.fdopen(WIRE_OUT_FD, "wb", 0)
+    sock = _connect_gateway(address)
+    return sock.makefile("rb", buffering=0), sock.makefile("wb", buffering=0)
+
+
 class Plugin:
     def __init__(self, inject=(), wire_in=None, wire_out=None):
         self.inject = list(inject)
         self.max_frame = _env_int("TENON_MAX_FRAME", DEFAULT_MAX_FRAME)
         self.deadline_ms = _env_int("TENON_KERNEL_DEADLINE", DEFAULT_DEADLINE_MS)
         self.config = {}
-        self._in = wire_in if wire_in is not None else os.fdopen(WIRE_IN_FD, "rb", 0)
-        self._out = wire_out if wire_out is not None else os.fdopen(WIRE_OUT_FD, "wb", 0)
+        default_in, default_out = (None, None)
+        if wire_in is None or wire_out is None:
+            default_in, default_out = _default_wires()
+        self._in = wire_in if wire_in is not None else default_in
+        self._out = wire_out if wire_out is not None else default_out
         self._hooks = {}
         self._services = {}
         self._replies = {}

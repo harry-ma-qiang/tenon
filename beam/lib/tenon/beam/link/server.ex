@@ -108,6 +108,17 @@ defmodule Tenon.Beam.Link.Server do
     state
   end
 
+  defp incoming(%{"t" => "svc", "id" => id} = frame, state) do
+    reply =
+      case Handlers.svc(frame, state) do
+        {:result, result} -> %{"t" => "rep", "id" => id, "result" => result}
+        {:error, reason} -> %{"t" => "rep", "id" => id, "error" => reason}
+      end
+
+    send_frame(state, reply)
+    state
+  end
+
   defp incoming(%{"t" => other, "id" => id}, state) do
     send_frame(state, %{"t" => "rep", "id" => id, "error" => "unknown_method:#{other}"})
     state

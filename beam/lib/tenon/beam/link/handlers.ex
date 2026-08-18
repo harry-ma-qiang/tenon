@@ -40,6 +40,30 @@ defmodule Tenon.Beam.Link.Handlers do
     end
   end
 
+  @spec svc(map(), map()) :: {:result, term()} | {:error, term()}
+  def svc(frame, state) do
+    case opt(state.config, :kernel, nil) do
+      kernel when is_pid(kernel) -> call_svc(kernel, frame)
+      _other -> {:error, "no_kernel"}
+    end
+  end
+
+  defp call_svc(kernel, frame) do
+    name = String.to_atom(Map.get(frame, "name", ""))
+    method = String.to_atom(Map.get(frame, "method", ""))
+    args = Map.get(frame, "args", [])
+    ctx = :tenon.root(kernel)
+
+    try do
+      case :tenon.svc(ctx, name, method, args) do
+        {:error, reason} -> {:error, Frame.jsonable(reason)}
+        result -> {:result, Frame.jsonable(result)}
+      end
+    catch
+      :error, reason -> {:error, Frame.jsonable(reason)}
+    end
+  end
+
   defp tree(state) do
     case opt(state.config, :kernel, nil) do
       kernel when is_pid(kernel) -> :tenon.tree(kernel)

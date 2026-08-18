@@ -67,6 +67,34 @@ defmodule Tenon.Beam.LinkTest do
     assert_receive {:base, %{"t" => "rep", "id" => 9, "result" => %{"ok" => true}}}, 2_000
   end
 
+  test "proxies svc to a kernel service", %{base: base, ctx: ctx} do
+    assert_receive {:base, %{"t" => "node.register"}}, 2_000
+    :tenon.provide(ctx, :probe, fn :ping, [] -> "pong" end)
+    Base.push(base, %{
+      "t" => "svc",
+      "id" => 11,
+      "name" => "probe",
+      "method" => "ping",
+      "args" => []
+    })
+
+    assert_receive {:base, %{"t" => "rep", "id" => 11, "result" => "pong"}}, 2_000
+  end
+
+  test "reports an unknown svc as an error", %{base: base} do
+    assert_receive {:base, %{"t" => "node.register"}}, 2_000
+
+    Base.push(base, %{
+      "t" => "svc",
+      "id" => 12,
+      "name" => "nope",
+      "method" => "ping",
+      "args" => []
+    })
+
+    assert_receive {:base, %{"t" => "rep", "id" => 12, "error" => _reason}}, 2_000
+  end
+
   test "refuses an unknown method", %{base: base} do
     assert_receive {:base, %{"t" => "node.register"}}, 2_000
     Base.push(base, %{"t" => "nope", "id" => 10})
