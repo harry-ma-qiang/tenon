@@ -67,7 +67,7 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         .unwrap_or(&opts.root_env)
         .to_string();
     match method {
-        "node.register" => register(body, peer, cmds),
+        "node.register" => register(body, peer, cmds).await,
         "health" | "tree" | "reload" => forward(method, &env, cmds, opts).await,
         "reset" => ask(cmds, |reply| Cmd::Reset { env, reply }).await,
         "stop" => ask(cmds, |reply| Cmd::Stop { reply }).await,
@@ -77,18 +77,20 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
     }
 }
 
-fn register(body: &Value, peer: &Peer, cmds: &Cmds) -> Answer {
+async fn register(body: &Value, peer: &Peer, cmds: &Cmds) -> Answer {
     let role = string(body, "role", "agent");
     let env = string(body, "env", "root");
     let pid = body.get("pid").and_then(Value::as_i64).unwrap_or(0);
-    cmds.send(Cmd::Register {
+    let token = string(body, "token", "");
+    ask(cmds, |reply| Cmd::Register {
         peer: peer.clone(),
         role,
         env,
         pid,
+        token,
+        reply,
     })
-    .map_err(|_| "base_gone".to_string())?;
-    Ok(json!({"ok": true}))
+    .await
 }
 
 async fn forward(method: &str, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {

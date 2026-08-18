@@ -3,15 +3,21 @@ pub mod client;
 pub mod config;
 pub mod frame;
 pub mod home;
+pub mod integrity;
+pub mod lock;
 pub mod node;
 pub mod peer;
 pub mod release;
 pub mod server;
+pub mod signals;
+pub mod token;
 
 use crate::base::Cmd;
 use crate::client::Client;
 use crate::config::Config;
 use crate::home::Home;
+use crate::lock::Lock;
+use crate::signals::Signals;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -19,6 +25,7 @@ use std::time::Duration;
 use tenon_storage::Store;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 const READY_POLL_MS: u64 = 50;
 const DAEMON_WAIT_MS: u64 = 60_000;
@@ -43,6 +50,18 @@ pub async fn start(opts: StartOpts) -> Result<i32> {
 pub async fn foreground(opts: StartOpts) -> Result<i32> {
     let home = Home::resolve(opts.home)?;
     home.scaffold()?;
+    let _lock = match Lock::try_acquire(&home)? {
+        Some(lock) => lock,
+        None => {
+            let pid = Lock::holder_pid(&home).unwrap_or(0);
+            bail!("already running (pid {pid})");
+        }
+    };
+    let sock = home.sock();
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(home.ready_file());
+    let mut signals = Signals::install()?;
+
     let config = Config::load(&home.config_file())?;
     home.prepare(&config.root_env)?;
     let release = release::resolve(
@@ -51,11 +70,11 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         opts.payload,
         opts.version,
     )?;
+    if integrity::restore_if_corrupt(&home.state_file(), &home.lkg_state_file())? {
+        eprintln!("tenon: state.sqlite was corrupt, restored from lkg");
+    }
     let store = Store::open(&home.state_file())?;
     let sandbox = tenon_sandbox::backend(&config.sandbox)?;
-    let sock = home.sock();
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_file(home.ready_file());
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
 
     let (cmds, cmd_rx) = mpsc::unbounded_channel();
@@ -79,30 +98,67 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
     ));
     let actor = tokio::spawn(state.run(cmd_rx, exit_rx));
 
-    let (tx, rx) = oneshot::channel();
-    cmds.send(Cmd::Boot { reply: tx })
-        .map_err(|_| anyhow::anyhow!("base actor gone"))?;
-    rx.await?.map_err(|error| anyhow::anyhow!(error))?;
-
-    if !ready(&cmds, Duration::from_millis(config.boot_timeout_ms)).await {
-        let (tx, rx) = oneshot::channel();
-        let _ = cmds.send(Cmd::Stop { reply: tx });
-        let _ = rx.await;
-        let _ = actor.await;
-        bail!(
-            "the nodes did not register within {} ms",
-            config.boot_timeout_ms
-        );
+    tokio::select! {
+        _ = signals.recv() => {
+            return shutdown_during_boot(cmds, actor).await;
+        }
+        outcome = boot_until_ready(&cmds, Duration::from_millis(config.boot_timeout_ms)) => {
+            if let Err(error) = outcome {
+                let (tx, rx) = oneshot::channel();
+                let _ = cmds.send(Cmd::Stop { reply: tx });
+                let _ = rx.await;
+                let _ = actor.await;
+                return Err(error);
+            }
+        }
     }
-    std::fs::write(home.ready_file(), std::process::id().to_string())?;
+
+    write_ready(&home, std::process::id())?;
     println!(
         "tenon: base ready, pid {}, home {}, release {}",
         std::process::id(),
         home.root.display(),
         release.display()
     );
-    tokio::spawn(signals(cmds.clone()));
+    tokio::spawn(async move {
+        signals.recv().await;
+        let (tx, rx) = oneshot::channel();
+        let _ = cmds.send(Cmd::Stop { reply: tx });
+        let _ = rx.await;
+    });
     Ok(actor.await.unwrap_or(1))
+}
+
+async fn boot_until_ready(cmds: &mpsc::UnboundedSender<Cmd>, timeout: Duration) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    cmds.send(Cmd::Boot { reply: tx })
+        .map_err(|_| anyhow::anyhow!("base actor gone"))?;
+    rx.await?.map_err(|error| anyhow::anyhow!(error))?;
+    if !ready(cmds, timeout).await {
+        bail!(
+            "the nodes did not register within {} ms",
+            timeout.as_millis()
+        );
+    }
+    Ok(())
+}
+
+async fn shutdown_during_boot(
+    cmds: mpsc::UnboundedSender<Cmd>,
+    actor: JoinHandle<i32>,
+) -> Result<i32> {
+    let (tx, rx) = oneshot::channel();
+    let _ = cmds.send(Cmd::AbortBoot { reply: tx });
+    let _ = rx.await;
+    let _ = actor.await;
+    bail!("interrupted during boot")
+}
+
+fn write_ready(home: &Home, pid: u32) -> Result<()> {
+    let tmp = home.ready_tmp_file();
+    std::fs::write(&tmp, pid.to_string())?;
+    std::fs::rename(&tmp, home.ready_file())?;
+    Ok(())
 }
 
 pub async fn attach(home: Option<PathBuf>, env: Option<String>) -> Result<i32> {
@@ -157,28 +213,22 @@ async fn ready(cmds: &mpsc::UnboundedSender<Cmd>, limit: Duration) -> bool {
     false
 }
 
-async fn signals(cmds: mpsc::UnboundedSender<Cmd>) {
-    use tokio::signal::unix::{signal, SignalKind};
-    let Ok(mut term) = signal(SignalKind::terminate()) else {
-        return;
-    };
-    let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
-        return;
-    };
-    tokio::select! {
-        _ = term.recv() => {},
-        _ = interrupt.recv() => {},
-    }
-    let (tx, rx) = oneshot::channel();
-    let _ = cmds.send(Cmd::Stop { reply: tx });
-    let _ = rx.await;
-}
-
 fn daemonize(opts: &StartOpts) -> Result<i32> {
     use std::os::unix::process::CommandExt;
 
     let home = Home::resolve(opts.home.clone())?;
     home.scaffold()?;
+    match Lock::try_acquire(&home)? {
+        Some(lock) => {
+            let _ = std::fs::remove_file(home.sock());
+            let _ = std::fs::remove_file(home.ready_file());
+            drop(lock);
+        }
+        None => {
+            let pid = Lock::holder_pid(&home).unwrap_or(0);
+            bail!("already running (pid {pid})");
+        }
+    }
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

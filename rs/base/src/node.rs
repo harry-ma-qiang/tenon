@@ -15,6 +15,7 @@ pub struct Spec {
     pub profile: PathBuf,
     pub sock: PathBuf,
     pub target: String,
+    pub token: String,
 }
 
 pub struct Running {
@@ -29,13 +30,14 @@ pub struct Exit {
     pub code: Option<i32>,
 }
 
-pub fn spec(config: &Config, home: &Home, role: &str, env: &str) -> Spec {
+pub fn spec(config: &Config, home: &Home, role: &str, env: &str, token: String) -> Spec {
     Spec {
         role: role.to_string(),
         env: env.to_string(),
         profile: home.profile(env),
         sock: home.sock(),
         target: config.root_env.clone(),
+        token,
     }
 }
 
@@ -70,6 +72,7 @@ pub fn spawn(
             "TENON_GUARDIAN_FAILURES",
             config.guardian.failures.to_string(),
         )
+        .env("TENON_NODE_TOKEN", &spec.token)
         .env("RELEASE_TMP", home.run())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
