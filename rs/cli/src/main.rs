@@ -51,8 +51,21 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// Give the environment's agent one task and stream its answer
+    Run {
+        /// What the agent should do
+        task: String,
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+        /// How long to wait for the turn to end
+        #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+        timeout: u64,
+    },
     /// Agent loop, llm adapter and session log, one per environment
     Harness {
+        /// The environment this harness serves; defaults to $TENON_ENV
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -91,7 +104,15 @@ fn main() {
 fn run() -> Result<i32> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Harness { args } => Ok(tenon_harness::run(&args)),
+        Command::Harness { env, args } => {
+            let mut argv = Vec::new();
+            if let Some(env) = env {
+                argv.push("--env".to_string());
+                argv.push(env);
+            }
+            argv.extend(args);
+            Ok(tenon_harness::run(&argv))
+        }
         Command::Worker { workspace, args } => {
             let mut argv = Vec::new();
             if let Some(dir) = workspace {
@@ -141,6 +162,9 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             tenon_base::rpc(home, "reset", params).await
         }
         Command::Status => tenon_base::rpc(home, "status", json!({})).await,
+        Command::Run { task, env, timeout } => {
+            tenon_base::run::task(home, env, task, std::time::Duration::from_secs(timeout)).await
+        }
         Command::Sandbox { command } => match command {
             SandboxCommand::Reap { all } => tenon_base::sandbox_reap(home, all).await,
         },

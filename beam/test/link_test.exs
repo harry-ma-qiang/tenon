@@ -118,6 +118,49 @@ defmodule Tenon.Beam.LinkTest do
     assert Task.await(task) == {:error, "no_such_env"}
   end
 
+  test "lists, mounts, restarts and unmounts plugins", %{base: base} do
+    assert_receive {:base, %{"t" => "node.register"}}, 2_000
+    Base.push(base, %{"t" => "plugin", "id" => 20, "op" => "list"})
+    assert_receive {:base, %{"t" => "rep", "id" => 20, "result" => listed}}, 2_000
+    assert listed["ok"]
+    assert "link" in Enum.map(listed["plugins"], & &1["id"])
+
+    spec = %{"module" => "Tenon.Beam.Test.Probe"}
+    Base.push(base, %{"t" => "plugin", "id" => 21, "op" => "mount", "spec" => spec})
+    assert_receive {:base, %{"t" => "rep", "id" => 21, "result" => mounted}}, 5_000
+    assert mounted["ok"], inspect(mounted)
+    assert mounted["status"] == "active"
+    probe = mounted["id"]
+
+    Base.push(base, %{"t" => "plugin", "id" => 22, "op" => "list"})
+    assert_receive {:base, %{"t" => "rep", "id" => 22, "result" => again}}, 2_000
+    assert probe in Enum.map(again["plugins"], & &1["id"])
+
+    Base.push(base, %{"t" => "plugin", "id" => 23, "op" => "restart", "plugin_id" => probe})
+    assert_receive {:base, %{"t" => "rep", "id" => 23, "result" => restarted}}, 5_000
+    assert restarted["ok"], inspect(restarted)
+
+    Base.push(base, %{"t" => "plugin", "id" => 24, "op" => "unmount", "plugin_id" => probe})
+    assert_receive {:base, %{"t" => "rep", "id" => 24, "result" => removed}}, 5_000
+    assert removed["ok"], inspect(removed)
+
+    Base.push(base, %{"t" => "plugin", "id" => 25, "op" => "list"})
+    assert_receive {:base, %{"t" => "rep", "id" => 25, "result" => final}}, 2_000
+    refute probe in Enum.map(final["plugins"], & &1["id"])
+  end
+
+  test "refuses an unknown plugin and an unknown op", %{base: base} do
+    assert_receive {:base, %{"t" => "node.register"}}, 2_000
+    Base.push(base, %{"t" => "plugin", "id" => 30, "op" => "unmount", "plugin_id" => "nope"})
+    assert_receive {:base, %{"t" => "rep", "id" => 30, "result" => answer}}, 2_000
+    refute answer["ok"]
+    assert answer["error"] =~ "unknown plugin"
+
+    Base.push(base, %{"t" => "plugin", "id" => 31, "op" => "levitate"})
+    assert_receive {:base, %{"t" => "rep", "id" => 31, "result" => other}}, 2_000
+    assert other["error"] =~ "unknown op"
+  end
+
   test "stops the node when base goes away", %{base: base} do
     assert_receive {:base, %{"t" => "node.register"}}, 2_000
     Base.close(base)

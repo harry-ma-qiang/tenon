@@ -186,7 +186,26 @@ async fn a_plugin_started_inside_the_sandbox_registers_through_the_gateway() {
         .cloned()
         .unwrap();
     assert_eq!(root["sandbox"]["backend"], "oci", "{status}");
-    let before = active(&gateway_children(&status));
+    // Wait until this env's own gateway fibers — the worker and, since P3.3,
+    // the harness — are up, so "a new fiber appeared" below can only be the
+    // plugin the test starts inside the sandbox.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut before = active(&gateway_children(&status));
+    while Instant::now() < deadline {
+        let status = fixture.status().await;
+        let root = status["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["env"] == "root")
+            .cloned()
+            .unwrap();
+        before = active(&gateway_children(&status));
+        if root["worker"]["state"] == "ready" && root["harness"]["state"] == "ready" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
 
     let workspace = fixture.workspace();
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -217,30 +236,29 @@ async fn a_plugin_started_inside_the_sandbox_registers_through_the_gateway() {
         .expect("sandbox.exec launch");
     assert_eq!(launch["status"], 0, "{launch}\n{}", fixture.log());
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut after = before.clone();
+    // The service answering is the registration, not the fiber count: poll it,
+    // then assert the fiber is there too.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ping = Err("never answered".to_string());
     while Instant::now() < deadline {
-        let status = fixture.status().await;
-        after = active(&gateway_children(&status));
-        if after.len() > before.len() {
+        ping = fixture
+            .rpc(
+                "svc",
+                json!({"env": "root", "name": "inside", "method": "ping", "args": []}),
+            )
+            .await;
+        if ping.is_ok() {
             break;
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+    assert_eq!(ping.expect("svc ping"), "pong", "{}", fixture.log());
+    let after = active(&gateway_children(&fixture.status().await));
     assert!(
         after.len() > before.len(),
         "no new gateway fiber appeared: before={before:?} after={after:?}\n{}",
         fixture.log()
     );
-
-    let ping = fixture
-        .rpc(
-            "svc",
-            json!({"env": "root", "name": "inside", "method": "ping", "args": []}),
-        )
-        .await
-        .expect("svc ping");
-    assert_eq!(ping, "pong", "{ping}");
 
     let destroyed = fixture
         .rpc("sandbox.destroy", json!({"env": "root"}))

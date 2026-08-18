@@ -109,13 +109,20 @@ defmodule Tenon.Beam.Link.Server do
   end
 
   defp incoming(%{"t" => "svc", "id" => id} = frame, state) do
-    reply =
+    # Off the server process: a service call may be a whole model turn or a
+    # minute of `bash`, and a health probe must not queue behind it.
+    detach(state, id, fn ->
       case Handlers.svc(frame, state) do
-        {:result, result} -> %{"t" => "rep", "id" => id, "result" => result}
-        {:error, reason} -> %{"t" => "rep", "id" => id, "error" => reason}
+        {:result, result} -> %{"result" => result}
+        {:error, reason} -> %{"error" => reason}
       end
+    end)
 
-    send_frame(state, reply)
+    state
+  end
+
+  defp incoming(%{"t" => "plugin", "id" => id} = frame, state) do
+    detach(state, id, fn -> %{"result" => Handlers.plugin(frame, state)} end)
     state
   end
 
@@ -125,6 +132,25 @@ defmodule Tenon.Beam.Link.Server do
   end
 
   defp incoming(_frame, state), do: state
+
+  defp detach(state, id, body) do
+    socket = state.socket
+
+    spawn(fn ->
+      frame = Map.merge(%{"t" => "rep", "id" => id}, outcome(body))
+      :gen_tcp.send(socket, Frame.encode(frame))
+    end)
+  end
+
+  # A detached body that raises would otherwise leave base waiting for a reply
+  # that no process is going to send.
+  defp outcome(body) do
+    body.()
+  rescue
+    error -> %{"error" => Exception.message(error)}
+  catch
+    _kind, reason -> %{"error" => Frame.jsonable(reason)}
+  end
 
   defp answer(id, result, state) do
     case Map.pop(state.pending, id) do

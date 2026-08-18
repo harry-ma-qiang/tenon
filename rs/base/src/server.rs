@@ -9,6 +9,11 @@ use tokio::sync::{mpsc, oneshot};
 type Answer = Result<Value, String>;
 type Cmds = mpsc::UnboundedSender<Cmd>;
 
+/// Mounting a plugin spawns a process and waits for its handshake, which the
+/// kernel gives 30 s; a node request deadline of 10 s would report a timeout
+/// for a mount that is merely slow.
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct Opts {
     pub root_env: String,
@@ -70,6 +75,40 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         "node.register" => register(body, peer, cmds).await,
         "health" | "tree" | "reload" => forward(method, &env, cmds, opts).await,
         "svc" => svc(body, &env, cmds, opts).await,
+        "plugin" => plugin(body, &env, cmds, opts).await,
+        "session.create" | "session.prompt" | "session.status" | "session.history"
+        | "session.resume" => session(method, body, &env, cmds, opts).await,
+        "events.append" => {
+            let kind = string(body, "kind", "");
+            let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
+            ask(cmds, |reply| Cmd::EventsAppend {
+                env,
+                kind,
+                data,
+                reply,
+            })
+            .await
+        }
+        "events.tail" => {
+            let after = body.get("after").and_then(Value::as_i64).unwrap_or(0);
+            let limit = body.get("limit").and_then(Value::as_i64).unwrap_or(500);
+            ask(cmds, |reply| Cmd::EventsTail {
+                env,
+                after,
+                limit,
+                reply,
+            })
+            .await
+        }
+        "config.get" => ask(cmds, |reply| Cmd::ConfigGet { env, reply }).await,
+        "config.patch" => {
+            let patch = body.get("patch").cloned().unwrap_or_else(|| json!({}));
+            ask(cmds, |reply| Cmd::ConfigPatch { env, patch, reply }).await
+        }
+        "approval.request" => {
+            let reason = string(body, "reason", "unspecified");
+            ask(cmds, |reply| Cmd::Approval { env, reason, reply }).await
+        }
         "reset" => ask(cmds, |reply| Cmd::Reset { env, reply }).await,
         "runtime.spawn" => {
             let parent = body
@@ -111,6 +150,39 @@ async fn svc(body: &Value, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {
         "method": body.get("method").cloned().unwrap_or(Value::Null),
         "args": body.get("args").cloned().unwrap_or_else(|| json!([])),
     });
+    node.request("svc", params, opts.timeout).await
+}
+
+/// Plugin management is the node's kernel, not base's: base only carries the
+/// frame to that env's `Link`, which mounts, unmounts or restarts the fiber.
+async fn plugin(body: &Value, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {
+    let node = peer_of(env, cmds).await?;
+    let mut params = json!({"op": body.get("op").cloned().unwrap_or_else(|| json!("list"))});
+    // The frame's own `id` correlates the request, so the fiber's id travels
+    // as `plugin_id`.
+    if let Some(value) = body.get("plugin_id") {
+        params["plugin_id"] = value.clone();
+    }
+    for key in ["spec", "name", "config"] {
+        if let Some(value) = body.get(key) {
+            params[key] = value.clone();
+        }
+    }
+    node.request("plugin", params, opts.timeout.max(MOUNT_TIMEOUT))
+        .await
+}
+
+/// The CLI drives the env's harness through base: one `svc` frame to that
+/// env's node, addressed to the harness's `loop` service.
+async fn session(method: &str, body: &Value, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {
+    let node = peer_of(env, cmds).await?;
+    let mut args = body.clone();
+    if let Some(object) = args.as_object_mut() {
+        for key in ["t", "id", "env"] {
+            object.remove(key);
+        }
+    }
+    let params = json!({"name": "loop", "method": method, "args": [args]});
     node.request("svc", params, opts.timeout).await
 }
 
@@ -199,6 +271,7 @@ async fn node_json(node: &NodeView, opts: &Opts) -> Value {
         "depth": node.depth,
         "children": node.children,
         "worker": node.worker,
+        "harness": node.harness,
         "tree": tree,
     })
 }

@@ -44,6 +44,45 @@ pub enum Cmd {
     WorkerBoot {
         env: String,
     },
+    HarnessBoot {
+        env: String,
+    },
+    HarnessReady {
+        env: String,
+        pid: Option<i32>,
+        error: Option<String>,
+    },
+    HarnessExit {
+        env: String,
+        generation: u64,
+        code: Option<i32>,
+    },
+    EventsAppend {
+        env: String,
+        kind: String,
+        data: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    EventsTail {
+        env: String,
+        after: i64,
+        limit: i64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ConfigGet {
+        env: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ConfigPatch {
+        env: String,
+        patch: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    Approval {
+        env: String,
+        reason: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     WorkerReady {
         env: String,
         pid: Option<i64>,
@@ -113,6 +152,7 @@ pub struct NodeView {
     pub depth: u32,
     pub children: Vec<String>,
     pub worker: Value,
+    pub harness: Value,
 }
 
 pub struct Snapshot {
