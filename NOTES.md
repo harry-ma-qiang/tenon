@@ -442,3 +442,186 @@ out-of-scope `beam/test/link_test.exs` noted in §18.5 — untouched here.
 Deviation: `rs/base/Cargo.toml` gained a direct `rusqlite` dependency (already resolved via
 `tenon-storage` in the workspace lock) so the boot/reset integrity check can run `PRAGMA
 integrity_check` from `rs/base/src/integrity.rs`.
+
+## 20. P3.1b result: sandbox oci/landlock backends, base wiring, gateway gate (2026-08-18)
+
+The other half of the P3.1 row: real `oci` and `landlock` `Sandbox` backends, base owning
+one instance per env end to end (spawn at boot, destroy+recreate at reset, destroy at
+stop), a conformance suite over both, and the P3.1 gate itself — a python plugin started
+inside an oci sandbox via `sandbox.exec`, registering through the gateway, answering a
+`svc` round trip proxied by a small addition to `Tenon.Beam.Link`.
+
+Both real backends ran here: `podman` 4.9.3 and `docker` 29.4.0 are both on this box (oci
+prefers podman), and the kernel (6.17, aarch64) supports Landlock at least through ABI
+v2. `/dev/kvm` is absent, so `krun` stayed the placeholder the task asked for —
+`tenon_sandbox::krun::probe()` always returns `Err("/dev/kvm absent")` here, or
+`Err("krun backend arrives in P3.6")` on a machine that has `/dev/kvm` but no
+implementation.
+
+### Lines
+
+| Part | LoC |
+|---|---|
+| `rs/sandbox/src/{lib,none,proc,oci,landlock,krun}.rs` | 192+45+44+221+107+9 = 618 |
+| `rs/sandbox/tests/conformance.rs` | 164 |
+| `rs/base/src/rpc.rs` (extracted from `base.rs` to stay under 600 lines) | 77 |
+| `rs/base/src/{base,server,home,node,config,lib}.rs` (touched, not new) | 556+215+277+136+103+281 |
+| `rs/cli/tests/gateway_gate.rs` | 276 |
+| `beam/lib/tenon/beam/link/{handlers,server}.ex` (touched) | 80+166 |
+| `sdk/py/tenon.py` (touched) | 308 |
+
+New Rust: ~1135 lines (sandbox crate + its tests + the gate test + `rpc.rs`). Every
+touched file is under the 600-line ceiling; `base.rs` was pulled back under it by moving
+`Cmd`/`NodeView`/`Snapshot` into the new `rpc.rs` (a pure data/message module, no logic
+moved).
+
+### What landed
+
+- **`Sandbox`/`Instance` traits reshaped.** `spawn` now returns `Arc<dyn Instance>`
+  (`Box` would not let base clone a handle out to a `spawn_blocking` task while still
+  holding one in `Node.sandbox`); `Instance` carries `id`, `backend`, `attach_addr`,
+  `exec(cmd, args, timeout) -> ExecOutcome{status,stdout,stderr,timed_out}` and `destroy`.
+  `detect()` returns the picked backend plus every skipped one's reason; `backend(name)`
+  resolves `auto|oci|landlock|krun|none` and fails loud with the same reason for an
+  explicit, unavailable choice.
+- **oci** (`rs/sandbox/src/oci.rs`, 221 lines): podman-preferred/docker-fallback via a
+  `PATH` scan, no client library — every operation shells out. `spawn` runs
+  `<cli> run -d --name tenon-<env>-<nanos> --label tenon.env=<env> --memory <ram>m
+  --pids-limit <n> -v <workspace>:/workspace [-v <gateway-dir>:<gateway-dir>:rw]
+  [--network host] [-e TENON_GATEWAY=...] [-e NAME=value ...] <image> sleep infinity`.
+  `exec` runs `<cli> exec <id> timeout -s KILL <secs> <cmd> <args..>` — the in-guest
+  `timeout` (present in `python:3.12-alpine`, confirmed by hand before trusting it) is
+  the actual enforcement; the outer `wait-timeout`-based runner in `proc.rs` is a
+  backstop with a few extra seconds of grace, and a `137` exit status is also treated as
+  `timed_out` in case the outer backstop never fires. `destroy` is `stop -t 2` then
+  `rm -f`, idempotent behind an `AtomicBool`, and repeated by `Drop` as a safety net.
+- **landlock** (`rs/sandbox/src/landlock.rs`, 107 lines): no persistent process — `spawn`
+  just records the workspace and gateway-socket directory; `exec` restricts the *forked
+  child* with `Command::pre_exec` (before `execve`, so the restriction covers the whole
+  run) to read-only `/usr /lib /lib64 /bin /sbin /etc /proc/self` and read-write the
+  workspace and the gateway directory, via `path_beneath_rules` + `restrict_self`. `probe`
+  uses `CompatLevel::HardRequirement` against ABI v1 so an unsupported kernel fails loud
+  instead of silently degrading; the actual per-exec ruleset uses best-effort compat
+  (`ABI::V2`) so a slightly older-but-still-Landlock kernel still gets what it can enforce
+  rather than erroring on every exec.
+- **Shared exec runner** (`rs/sandbox/src/proc.rs`, 44 lines): spawns with piped
+  stdout/stderr read on two threads, `wait_timeout` (crate `wait-timeout`) with a kill +
+  `wait` on timeout. Used by both real backends so "kill on timeout" is one code path.
+- **Base wiring**: `config.sandbox` defaults to `auto` (was `none`); `Home` grew
+  `envs_dir/env_dir/workspace_dir/gateway_sock/gateway_address`; `node::spawn` now sets
+  `TENON_HOME` (previously never passed to the node at all — its own `TENON_GATEWAY`
+  default would have silently resolved against the *real* `$HOME` in every test, not the
+  test's temp `TENON_HOME`, a P3.1a gap this closes) and, for agent-role nodes only,
+  `TENON_GATEWAY` explicitly from `Home::gateway_address`, so base and the node agree on
+  the exact same address without base having to parse the node's own default logic.
+  `enter_sandbox` builds `Spec{workspace: home.workspace_dir(env), gateway:
+  Some(home.gateway_address(env)), image: $TENON_SANDBOX_IMAGE, env_passthrough:
+  $TENON_SANDBOX_ENV.split(',')}` and destroys+replaces the old instance on every
+  `start()` (boot, restart-after-death, `reset`), matching the "destroyed at env stop and
+  reset; reset re-creates" requirement without new state machinery — `start()` already ran
+  on all three paths. `status`'s per-node `sandbox` field is now `{backend,id,attach}`
+  instead of a bare id string.
+- **Two new base RPCs**: `sandbox.exec{env,cmd,args,timeout}` and
+  `sandbox.destroy{env}`, both documented as P3.1 test/CLI aids in `rs/README.md`. Both
+  run the actual backend call via `tokio::task::spawn_blocking` so a slow container exec
+  or `podman rm` never stalls the single-threaded base actor's handling of `status`/
+  `health`/other envs' commands.
+- **`svc{env,name,method,args}` proxy**: `server.rs` forwards it to the env's node as a
+  raw `svc` frame (reusing the existing `Peer::request` path `health`/`tree`/`reload`
+  already use, just with real params instead of `{}`). On the Elixir side,
+  `Tenon.Beam.Link.Handlers.svc/2` (18 new lines) converts `name`/`method` from the wire's
+  binaries to atoms exactly the way the kernel's own `wire_svc` handling already does
+  (`to_atom/1` in `kernel/src/tenon.erl`, so the round trip through a wire-backed service
+  lands on the same string the plugin declared), calls `:tenon.svc(root_ctx, name, method,
+  args)`, and reports `{:error, reason}` results or a raised `{:error, _}`/`error(...)`
+  the same way. `Link.Server` gained one new `incoming/2` clause (10 lines) to wire the
+  frame in. Two new tests in `link_test.exs`: a successful proxy through a locally
+  `provide`d service, and an unknown-service error. Beam suite: 20 tests (was 18), all
+  passing; `mix credo --strict` clean, `mix format --check-formatted` clean,
+  `mix compile --warnings-as-errors` clean.
+- **`py/tenon.py` socket transport** (18 new lines): if `TENON_GATEWAY` is set,
+  `Plugin()` connects a `socket.socket` (`unix:`/`tcp:` parsed the same way the gateway
+  plugin itself parses its listen address) and wraps it with `sock.makefile(...)` for the
+  read/write sides instead of opening fd 3/4; every frame past `hello` is unchanged, since
+  the kernel's socket-backed fiber (P3.1a) is wire-protocol-identical to a port-backed
+  one. Verified by hand with a throwaway unix-socket server script (hello -> load ->
+  provide -> rep round-tripped correctly) before trusting it inside the real gate test.
+  `sdk/test`'s existing 16-test fd-3/4 conformance suite (unaffected, still fd-based)
+  stayed green.
+- **Conformance suite** (`rs/sandbox/tests/conformance.rs`, 164 lines, one `check(name)`
+  body parameterized over `"oci"`/`"landlock"`, `println!("skipping {name}: {reason}")`
+  and an early return when `backend(name)` errors): spawn; `exec echo`; write a file
+  inside (`/workspace/...` for oci, a bare relative path under `current_dir` for landlock)
+  and read it back from the host; `sleep 5` against a 1 s timeout asserted `timed_out`;
+  oci additionally reads `/sys/fs/cgroup/memory.max` from inside and asserts it equals the
+  policy's `ram_mb * 1024 * 1024`; landlock additionally asserts a write to
+  `/etc/tenon-landlock-should-fail` is denied (its equivalent of a resource-cap check,
+  since Landlock has no memory concept); `destroy` then, for oci, `ps -a --filter
+  label=tenon.env=<env>` is asserted empty.
+- **The P3.1 gate** (`rs/cli/tests/gateway_gate.rs`, 276 lines): boots base with
+  `sandbox: oci` in a throwaway `config.yml` (skips if neither `podman` nor `docker` is on
+  `PATH`); copies `sdk/py/tenon.py` and a 6-line plugin script into the root env's
+  workspace; `sandbox.exec`s `sh -c "nohup python3 /workspace/inside_plugin.py
+  >/workspace/inside.log 2>&1 </dev/null & echo started"` (backgrounding inside the
+  container so the exec itself returns immediately — confirmed by hand first that
+  `podman stop` on the container's `sleep infinity` PID 1 takes the whole PID namespace,
+  and everything in it, down within its grace period, since Linux kills every process in
+  a PID namespace when its init dies); polls `status` until a new **non-failed** child
+  appears under the root tree's `gateway` fiber (a socket close leaves a `failed` fiber in
+  the tree rather than removing it — README section 11's wire v1.2 semantics — so
+  "gone"/"appeared" both filter on `status != "failed"`, not on list length alone); calls
+  `svc{env: root, name: inside, method: ping}` and asserts `"pong"`; calls
+  `sandbox.destroy{env: root}` and polls until that fiber's status flips or it
+  disappears, while confirming `status` itself keeps answering (base unaffected); runs
+  `tenon reset --env root` as the "restart" alternative to a Link `unmount{id}` request
+  (there is no such request yet — reset already tears down and remounts the whole node,
+  gateway included, which is the RFC's other named option) and confirms `status` answers
+  with the root node registered again afterward. Passed 3 consecutive runs, ~5.7 s each.
+
+### Gates, full last lines
+
+rs: `cargo build --release` — Finished, no warnings. `cargo clippy --all-targets -- -D
+warnings` — Finished, no output. `cargo fmt --check` — exit 0. `TENON_RELEASE_DIR=...
+cargo test` (`--test-threads=1`, run three times across the refactor) — stable every time:
+1 (`base::token`) + 19 (adversarial) + 7 (`boot.rs`) + 1 (`gateway_gate.rs`) + 1
+(`harness`) + 5 (`sandbox` unit) + 2 (`sandbox` conformance) + 3 (`storage`) + 1 (`worker`)
+= 39 passed, 0 failed, every run.
+
+beam: `mix compile --warnings-as-errors` clean. `mix format --check-formatted` clean (only
+the pre-existing `link_test.exs` on `main`, noted in §18.5, was ever unformatted, and this
+task's edits to that file are themselves formatted). `mix credo --strict` "142 mods/funs,
+found no issues". `mix test` "20 tests, 0 failures". `MIX_ENV=prod mix release` assembled
+and used by the rs gate above.
+
+sdk: `cd sdk/test && mix test` — "16 tests, 0 failures" (unaffected fd-3/4 path).
+
+### Deviations
+
+1. **`krun` is exactly the placeholder the task asked for** — no libkrun dependency added,
+   `probe()` always `Err`, reason names why (`/dev/kvm absent` here).
+2. **A `kill -9` of base leaks that boot's oci container(s)** and `Sandbox::reap` exists
+   but is deliberately not wired into the boot path — see `rs/README.md` deviation 11 for
+   the full reasoning (wiring it made `sigterm_during_boot_leaves_no_zombies` flaky by
+   blocking the actor on a `podman ps`/`rm -f` round trip during `Cmd::Boot`). Every
+   container this work's own test runs created was confirmed removed by hand
+   (`podman ps -a --filter label=tenon.env`) before finishing.
+3. **`sandbox` defaulting to `auto` changes P3.0 test behavior**: the default profile's
+   root env now runs inside a real `oci` container. `cli/tests/boot.rs`'s sandbox
+   assertion was updated (it now accepts `oci` or `landlock`, whichever `auto` picks) and
+   the adversarial suite got measurably slower (~95 s vs. the near-instant `none` path)
+   but stayed green across three full runs. Memory/pids caps and egress allowlisting
+   remain oci-only (RFC open question 4 is still open); landlock has no resource-cap
+   concept to enforce them with.
+4. **No `runtime.spawn`/child-env plumbing here** — one sandbox instance per *existing*
+   env (root, plus whatever a future P3.2 `runtime.spawn` creates) is P3.1's scope; spawning
+   child envs at all is P3.2.
+5. **`sandbox.exec`/`sandbox.destroy` are base RPCs behind `tenon_base::client::Client`,
+   not `tenon` CLI subcommands** — deliberately, per the task's "test aid" framing; adding
+   CLI surface for something P3.2's worker tools supersede felt like scope creep.
+
+### Next
+
+P3.2: the worker as one resident process (in-process tools, pty ring buffers, step
+git-snap, `.gitignore`, packs to host) registering via the gateway in sandboxed envs and
+fd 3/4 otherwise; `runtime.spawn` so an agent node can create child envs as external
+fibers.
