@@ -20,6 +20,8 @@ Design reference: Cordis (MIT), see NOTICE. Decisions, phase plans and status: `
 | [`kernel/`](kernel/README.md) | the atom kernel, `src/tenon.erl`, zero deps | Erlang |
 | [`loader/`](loader/README.md) | config tree plugin: yml layers, patches, groups, DSH collapse | Elixir |
 | [`cli/`](cli/README.md) | the `tenon` escript: `start` / `dump` / `check` | Elixir |
+| [`beam/`](beam/README.md) | `tenon_beam`: the node release, link + guardian plugins | Elixir |
+| [`rs/`](rs/README.md) | the `tenon` binary and the barebone: base, storage, sandbox, roles | Rust |
 | [`sdk/`](sdk/README.md) | wire SDKs `py/`, `ts/`, `rs/` + `test/` conformance suite | Python, TS, Rust |
 | [`bridge/dsh/`](bridge/dsh/README.md) | `tenon-bridge`: the whole DeepSeek Harness as one plugin | TypeScript |
 | [`plugins/term/`](plugins/term/README.md) | `tenon-term`: process runner, the worked handle example | Rust |
@@ -84,6 +86,8 @@ Every commit, in each project you touched:
 | `kernel/` | `mix compile` (erlc warnings as errors), `mix format --check-formatted`, `mix test` |
 | `loader/`, `cli/` | the same plus `mix credo --strict` |
 | `sdk/test/`, `bridge/dsh/test/` | `mix test` |
+| `beam/` | the loader gates plus `MIX_ENV=prod mix release` |
+| `rs/` | `cargo build --release`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test` |
 | `sdk/rs/`, `plugins/term/` | `cargo build --release`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` |
 | `sdk/ts/`, `bridge/dsh/` | `pnpm exec tsc --noEmit` |
 
