@@ -1,9 +1,12 @@
 # RFC P3 — Minimal complete harness in Rust on the Tenon kernel (draft for review)
 
-Author: Fable, 2026-08-18. Status: draft v3 (after discussion), for Gemini/human review. Numbering:
+Author: Fable, 2026-08-18. Status: draft v3.2 (after discussion), for Gemini/human review. Numbering:
 P{m}.{n} from here on (P0 toolchain, P1 kernel, P2 loader/sdk/bridge are done; this is P3).
 v2 changes: one Rust binary; harness in Rust with the seam checklist; krun-only VM; change protocol,
 blue/green kernels and LKG added; qemu-tcg dropped.
+v3.2 changes: in-memory workspace in a single RAM-capped VM (read-only base image + tmpfs overlay),
+per-step packs to the host as the truth, host files down to config + state.sqlite; SQLite kept
+(DuckDB reads it later); no message bus, UDS RPC in base, HTTP server optional.
 v3 changes: guardian + agent kernels as two BEAM nodes; VM by default with a single sparse workspace
 image and step-granular git snapshots inside it; host state = one SQLite + blob dir; gix only inside
 the worker; DSH plugins as the opt-in long tail; ~6k Rust target.
@@ -92,20 +95,23 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 
 ## 5. Filesystem: VM by default, one workspace image, snapshots inside it
 
-- Default: the agent runs inside the VM with no host access. The only host writes are the config file
-  and the state files in section 6. The VM's workspace is ONE sparse disk image (`workspace.img`,
-  ext4, grows on demand, `fstrim` to shrink), attached as virtio-blk. Inside the guest it is a normal
-  filesystem: native IO, nothing to notice.
+- Default: the agent runs inside ONE VM with no host access; one VM per base (all-in-one) in v1,
+  parallel hypotheses are git branches inside it, multi-VM later. The guest root is a read-only base
+  image (alpine + py/node, OCI layers provided by the host, shared, not counted against the VM) with a
+  tmpfs overlay as the workspace. The VM has a hard RAM cap (500 MB for early tests, enforced by
+  krun/cgroup); heavy toolchains must live in the base image, never in tmpfs. The VM is disposable
+  compute: the host log is the truth (below). Long-running guest processes die with a reset by design.
+- Escape hatch: a workspace that outgrows RAM (large repos, node_modules) fails loud in v1; a sparse
+  `workspace.img` (virtio-blk) is the opt-in alternative, same tools, same snapshots.
 - Model-facing tools are POSIX only (view/edit/write/bash + snapshot/time_travel). Single authority.
 - Snapshots are step-granular, not per syscall: the worker commits the workspace tree with gix at each
   tool-step boundary (post-execute hook) and before risky operations; GIT_DIR lives inside the image.
   Rollback/diff/time-travel/CoW hypothesis workspaces are git operations inside the guest.
-- Coherence and durability: single writer at a time (only the guest touches the image while the VM
-  runs; the host never loop-mounts a live image). After each snapshot commit the worker fsyncs
-  (`core.fsync=all` + `sync`; virtio-blk flush maps to host fsync), so a guest crash loses at most the
-  in-flight step. The per-step packfile is pushed to the host over the wire and stored in
-  `state.sqlite`; the guest git is a cache, the host copy is the truth for LKG and reset, so a
-  destroyed image can be rebuilt.
+- Durability: after each step the worker pushes the packfile to the host over the wire; the host
+  stores it in `state.sqlite` and acknowledges. Guest git is a cache; the host copy is the truth for
+  LKG and reset; a killed VM loses at most the in-flight step and is rebuilt by replaying packs. With
+  the optional disk image, single writer at a time (host never loop-mounts a live image) and per-step
+  fsync (`core.fsync=all`, virtio-blk flush -> host fsync) apply.
 - Growth control: expiry policy (keep last N steps, LKG, tagged, and one milestone every M steps;
   `gc --prune` the rest) plus periodic trim. No transparent git filesystem: none is production-proven
   in Rust and per-write commits would be far too slow.
@@ -114,10 +120,14 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 
 ## 6. Storage: SQLite + gix ODB, and how memory/navigator land on it
 
-- Host state is three files: `config`, `state.sqlite`, `workspace.img`. No blob directories: SQLite
-  is the application file format (BLOBs up to 1 GB per row, incremental read via `blob_open`,
-  `incremental_vacuum` to shrink); large tool outputs and per-step snapshot packs are BLOB rows with a
-  retention policy. gix is not used on the host.
+- Host state is two files: `config` and `state.sqlite` (plus the optional `workspace.img`). No blob
+  directories: SQLite is the application file format (BLOBs up to 1 GB per row, incremental read via
+  `blob_open`, `incremental_vacuum` to shrink); large tool outputs and per-step snapshot packs are
+  BLOB rows with a retention policy. gix is not used on the host.
+- Why SQLite and not something else: append-heavy small rows, transactions, FTS5, vectors later
+  (sqlite-vec), single file, mature. DuckDB is columnar/analytical and weak at many small writes; it
+  can read the SQLite file directly for episode analytics later, so nothing is lost by not choosing it
+  now. redb (pure Rust KV) only if a zero-C build becomes a hard requirement; it loses SQL/FTS.
 - SQLite tables: `events` (session log, append-only), `tool_results` (index, blob hash), `snapshots`
   (step -> ref inside the image), `memory_nodes`, `memory_edges` (triples, confidence, outcomes),
   `embeddings` (blob; brute-force cosine at our scale; sqlite-vec later), `episodes` (state hash,
@@ -166,9 +176,13 @@ then the harness (what makes it a harness), then storage, then the hard rules, t
 - VM backend: krun only; oci + landlock as non-VM backends.
 - Names: base, guardian node, agent node, worker, harness, memory graph, navigator, snapshot,
   workspace image, verifier.
-- Two BEAM nodes (guardian G read-only, agent A writable) from one payload; VM by default; host state =
-  config + state.sqlite + workspace.img (three files, no directories); gix only inside the worker;
-  per-step packs pushed to the host; DSH long tail opt-in.
+- Two BEAM nodes (guardian G read-only, agent A writable) from one payload; one RAM-capped VM by
+  default with an in-memory workspace; host state = config + state.sqlite (two files; workspace.img
+  optional); gix only inside the worker; per-step packs pushed to the host; DSH long tail opt-in.
+- Control plane: no message bus (the kernel is the bus; tokio channels inside base); base exposes a
+  UDS JSON-RPC (same frames as the wire) for CLI/TUI/guardian attach; HTTP client in the harness
+  (streaming model calls); HTTP server only as an optional feature (`tenon serve --http`) for
+  browsers/remote, not in the minimal set.
 
 ## 8b. Change protocol, mutability tiers, always-online
 
