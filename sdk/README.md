@@ -2,7 +2,9 @@
 
 Three tiny zero-dependency ports of the wire protocol in `../kernel/README.md`. All three
 speak wire v1.1: 4-byte big-endian length + JSON, read from **fd 3**, written to **fd 4**.
-stdin, stdout and stderr stay free for logs.
+stdin, stdout and stderr stay free for logs. `py/tenon.py` additionally speaks wire v1.2
+over a socket when `TENON_GATEWAY` is set — see "TENON_GATEWAY socket mode" below, the
+P3.1 path for a plugin started inside a sandbox to register with its node.
 
 | | python | typescript | rust |
 |---|---|---|---|
@@ -118,6 +120,35 @@ endpoint — and let the two plugins talk over that channel themselves. The kern
 brokers discovery through services. `../plugins/term` is the worked example: output over
 64 KiB becomes `{"handle": path, "bytes": n}` and the caller pages it back with
 `term.read`.
+
+## TENON_GATEWAY socket mode (python)
+
+Wire v1.1 (fd 3/4) is how the host spawns a plugin directly. Inside a P3.1 sandbox
+(`oci`, `landlock`) nothing spawns the plugin process with those descriptors wired up —
+instead the plugin dials out to the gateway plugin listening in its node (RFC section 6,
+kernel wire v1.2, `../beam/README.md`'s Gateway section). `py/tenon.py` picks the
+transport automatically:
+
+```python
+import tenon
+
+plugin = tenon.Plugin(inject=[])
+plugin.provide("inside", {"ping": lambda: "pong"})
+plugin.run()
+```
+
+If the `TENON_GATEWAY` environment variable is set (`unix:<path>` or `tcp:<host>:<port>`,
+the same string the node itself was started with — see `../beam/README.md`), `Plugin()`
+connects a `socket.socket` to that address instead of opening file descriptors 3 and 4,
+and wraps it in a read side and a write side with `sock.makefile(...)`; everything past
+that point — `hello`, `load`, `provide`, `svc`, `on`/hooks — is identical, since the
+kernel treats a socket-backed fiber exactly like a port-backed one. Without
+`TENON_GATEWAY` set, behavior is unchanged: fd 3/4, as before. Passing `wire_in`/`wire_out`
+explicitly (tests, `example.py`) always wins over both.
+
+Typescript and rust do not have this mode yet — only python plugins are expected to run
+disposably inside a sandbox in P3.1; the other two SDKs stay fd 3/4-only until a runtime
+needs them there too.
 
 ## Frame cap
 
