@@ -264,3 +264,82 @@ profile patch); `mix release` packaging of kernel + loader + cli as one artifact
 ## 16. Live run: DSH web under the Tenon kernel (2026-08-16)
 
 `cli/tenon start playground/web/tenon.yml --dsh-bundles dsh-base,dsh-web-app ...` (kernel = top process; DSH node process is its child via erl_child_setup). Tree: guard (py, sdk/py, `tools/pre-execute` call hook, prepend) / audit (py, emit hooks -> audit.jsonl) / dsh (collapsed, web at http://127.0.0.1:3080). Real model deepseek-v4-flash via DEEPSEEK_API_KEY (env only). Smoke via JSON-RPC `/api/*`: pong PASS; bash `echo tenon-ok` executed PASS; `rm -rf` denied by the Tenon-side python guard PASS; audit lines PASS. Fix landed: `--dsh-bundles` flag (`618809c`). Test-profile rows `sandbox-policy danger-full-access` + `approval never` (no sandbox backend on this host) live in the Tenon yml as `tenon: dsh` rows and were hot-applied with SIGHUP (DSH HMR, same pid). Caveat unchanged: TS plugins inside Node run on real Cordis (L2 design). Web binds 127.0.0.1 only; use an SSH tunnel.
+
+## 17. P3.0 result: the safety floor (2026-08-18)
+
+RFC `RFC-P3-minimal-harness.md` step P3.0: one Rust binary that boots and watches a BEAM
+guardian node and a root environment node, a UDS front door shared by nodes and CLI, LKG with
+`reset`, and `kill -9` of base taking every node down. Base runs no plugin code.
+
+### What was built
+
+`beam/` — mix project `tenon_beam`, release `tenon_beam` with ERTS included (self-contained,
+21 MB gzipped, 68 MB when embedded in the binary). Depends on `../kernel` and `../loader`.
+`Tenon.Beam.Boot` turns `TENON_ROLE` / `TENON_ENV` / `TENON_BASE_SOCK` / `TENON_PROFILE` into
+one kernel with the loader on the profile plus two barebone plugins mounted outside the
+loader: `Tenon.Beam.Link` (outbound UDS to base, `node.register`, answers `health` / `tree` /
+`reload`, publishes the `link` service, and stops the node when the socket closes) and
+`Tenon.Beam.Guardian` (probes base for the agent env's health every `interval`, sends
+`reset{env}` after N consecutive failures). `RELEASE_DISTRIBUTION=none` and
+`RELEASE_MODE=embedded`: no distribution, no epmd, no code loading at runtime.
+
+`rs/` — Cargo workspace, one bin target `tenon`. `base` (home layout, config, frame codec,
+peer with per-direction request correlation, node spawn/terminate, the supervisor actor, the
+UDS server, the release payload extractor, the CLI client), `storage` (`state.sqlite`, WAL +
+`synchronous=NORMAL` + `busy_timeout=5000`, `events` append-only, `envs`), `sandbox` (trait +
+`none` backend, already on the boot path), `harness` and `worker` (role stubs, exit 2), `cli`
+(clap subcommands `start|attach|stop|reset|status|harness|worker` and the `build.rs` that
+`include_bytes!`es a release tarball named by `TENON_RELEASE_TAR`).
+
+### Lines and tests
+
+| Part | LoC | Tests |
+|---|---|---|
+| `beam/lib` | 524 (link/server 154, boot 83, guardian/server 78, link/handlers 56, registry 48, frame 37, link 30, guardian 20, application 18) | 14 (`link_test.exs` 9, `guardian_test.exs` 5) against a fake UDS base |
+| `rs/base/src` | 1568 (base 436, home 245, lib 230, server 173, node 128, config 103, peer 82, release 74, client 50, frame 47) | covered by the integration suite |
+| `rs/storage` | 222 (incl. 3 unit tests) | 3 |
+| `rs/sandbox` | 115 (incl. 2 unit tests) | 2 |
+| `rs/cli` | 133 (main 109, build.rs 24) | 7 in `cli/tests/boot.rs` |
+| `rs/harness`, `rs/worker` | 30 | 1 each |
+
+Rust: 2068 source lines (135 of them inline `cfg(test)`) plus 294 lines of integration test.
+BEAM: 524 source lines plus 262 of test. 14 Elixir tests and 14 Rust tests, all green.
+
+Gates, full last lines: beam `mix compile --warnings-as-errors` clean, `mix format
+--check-formatted` clean, `mix credo --strict` "110 mods/funs, found no issues",
+`mix test` "14 tests, 0 failures", `MIX_ENV=prod mix release` assembled. rs `cargo build
+--release` Finished, `cargo clippy --all-targets -- -D warnings` Finished with no output,
+`cargo fmt --check` exit 0, `cargo test` 7 + 3 + 2 + 1 + 1 = 14 passed, 0 failed.
+
+### Measured on this box (OTP 27.3, arm64, 4 cores)
+
+- `tenon start` to both nodes registered: **1.2 s** (embedded payload, first-run extraction
+  of the 21 MB tarball included).
+- `kill -9` base to both nodes exited: **1.1-1.5 s**, well inside the 5 s the gate asks for.
+  No OS supervision involved: the nodes see their socket close and stop themselves.
+- `tenon reset`: the env node gets a new pid, its LKG profile is restored, the guardian's pid
+  is unchanged. `SIGKILL` of the env node: base restarts it and `status` shows `restarts: 1`.
+
+### Deviations from the RFC
+
+Full list with reasoning in `rs/README.md` and `beam/README.md`. The load-bearing ones:
+
+1. No `rollback` / `approve` / `run` subcommand and no `wire` crate; `sdk/rs` stays where it
+   is and is only a path dependency of `worker` (whose public error type it supplies). Base
+   speaks the wire frames over a socket, not fd 3/4, so it needs no SDK.
+2. Only `events` and `envs` in `state.sqlite`. The other section-9 tables arrive with the
+   phases that write them (P3.2-P3.4) rather than as frozen empty schemas.
+3. The guardian's release directory is not `chmod`ed read-only: G and A run from the same
+   extracted release. Read-only is enforced by embedded mode, no distribution, and base never
+   writing under `erts/`.
+4. `reset` answers when the old node is dead and the new one is spawned, not when it has
+   registered, so the answer stays inside the requesting node's deadline.
+5. `--exit-on-detach` counts `subscribe`rs, so `tenon status` and `tenon stop` cannot trip it;
+   only `tenon attach` holds the door open.
+6. The sandbox trait is already on the boot path with the `none` backend (one instance per
+   env), so P3.1 replaces a backend instead of adding a seam.
+
+### Next
+
+P3.1: sandbox trait with oci and landlock backends, the conformance suite, the kernel
+socket-backed external fiber spec and the gateway plugin in node A.
