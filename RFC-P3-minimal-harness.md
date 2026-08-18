@@ -1,9 +1,14 @@
 # RFC P3 — Minimal complete harness in Rust on the Tenon kernel (draft for review)
 
-Author: Fable, 2026-08-18. Status: draft v3.5, for Gemini/human review. Numbering:
+Author: Fable, 2026-08-18. Status: draft v3.6, for Gemini/human review. Numbering:
 P{m}.{n} from here on (P0 toolchain, P1 kernel, P2 loader/sdk/bridge are done; this is P3).
 v2 changes: one Rust binary; harness in Rust with the seam checklist; krun-only VM; change protocol,
 blue/green kernels and LKG added; qemu-tcg dropped.
+v3.6 changes: environment tree — every env can spawn a child env by calling its parent's
+`runtime.spawn` (delegated up the ancestry to the barebone, which is the only creator); children run
+in parallel on the host, config = parent profile + patch layer, monitored by the caller as an external
+fiber in the caller's kernel tree; parent death prunes the whole subtree (v1); limits on VM count,
+RAM per env, depth. Replaces the "one runtime, one VM" wording.
 v3.5 changes: barebone vs runtime vocabulary + runtime contract (any runtime, even DSH, may
 replace the default one while the barebone keeps watching); gateway plugin + kernel socket-fiber
 instead of a kernel listener; hard rules reduced to boundary + budgets + kill switch + host-affecting
@@ -55,8 +60,23 @@ Responsibilities (the `tenon` binary in base role + the Erlang kernel it launche
    - immutable barebone: base runs outside the sandbox as a distinct OS user and holds the
      hypervisor/container handles
 4b. Vocabulary. Barebone = base + guardian node G + the built-in kernel copy + the built-in worker
-   (LKG fallback): fixed by design, changed only by human releases. Runtime = agent node A + harness
-   + worker + gateway: replaceable as a whole. Runtime contract: a runtime registers with base over
+   (LKG fallback): fixed by design, changed only by human releases; it is the ancestor (depth 0).
+   Runtime (env) = agent node A + harness + worker + gateway + its own sandbox instance + its own
+   state file: replaceable as a whole, and there can be many.
+4c. Environment tree. Only the barebone creates runtimes (like a kernel is the only thing that
+   forks). Any env spawns a child by calling its parent's `runtime.spawn(overrides)`; each generation
+   either overrides that method (changing behavior for its descendants) or delegates upward, until
+   the barebone performs the creation on the host (VM/sandbox instance, kernel node, harness, state
+   file). The child runs in parallel with everyone else on the host; its config is the caller's
+   profile plus a patch layer (loader semantics, nothing new); the caller becomes its parent: the
+   child is mounted as an external fiber in the parent's kernel tree (`tree` shows the lineage,
+   health/events flow up, child budget is a slice of the parent's), and the barebone keeps a global
+   registry. Children cannot touch parents: their RPC channel connects only to their parent (and to
+   the barebone through the parent), socket ownership enforced; host-side privilege drop per env is
+   the P3.5 hardening. Pruning v1: when a parent dies the barebone kills its whole subtree (same
+   semantics as fiber cascade); reparenting to the grandparent is a later option. Limits: total VM
+   count, RAM cap per env, depth (v1: 3). Nested VMs are never needed: every env's sandbox is created
+   by the barebone on the host. Runtime contract: a runtime registers with base over
    the base RPC (manifest name/version/hash, health endpoint, event/approval channel), answers probes,
    writes the event log. Any runtime that meets the contract can replace the default one — the
    agent's own, or DSH mounted as the runtime — while the barebone keeps the old kernel watching, the
@@ -118,8 +138,9 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 
 ## 5. Filesystem: VM by default, one workspace image, snapshots inside it
 
-- Default: the agent runs inside ONE VM with no host access; one VM per base (all-in-one) in v1,
-  parallel hypotheses are git branches inside it, multi-VM later. The guest root is a read-only base
+- Default: an env's agent runs inside its own VM with no host access; one VM per env, several envs
+  per host within the barebone's limits (section 2, 4c); parallel hypotheses inside one env are git
+  branches, across envs are child envs. The guest root is a read-only base
   image (alpine + py/node, OCI layers provided by the host, shared, not counted against the VM) with a
   tmpfs overlay as the workspace. The VM has a hard RAM cap (500 MB for early tests, enforced by
   krun/cgroup); heavy toolchains must live in the base image, never in tmpfs. The VM is disposable
@@ -173,7 +194,7 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 
 | Step | Deliverable | Test gate |
 |---|---|---|
-| P3.0 | Cargo workspace `tenon/rs/` (crates: base, worker, harness, storage, sandbox, sdk moved from sdk/rs); release layout `~/.tenon/`; base extracts the BEAM release and starts two nodes (guardian G read-only, agent A), `tenon start/attach/stop/reset` | base boots G + A from a profile; kill -9 base -> both nodes stop; `tenon reset` restarts A from LKG while G stays up |
+| P3.0 | Cargo workspace `tenon/rs/` (crates: base, worker, harness, storage, sandbox, sdk moved from sdk/rs); release layout `~/.tenon/`; base extracts the BEAM release and starts two nodes (guardian G read-only, agent A), `tenon start/attach/stop/reset`; `runtime.spawn` prototype (child env created by the barebone on request from a parent, mounted as an external fiber in the parent's tree, config = parent + patch, per-env state file, parent-death prunes subtree, depth/VM/RAM limits) | base boots G + A from a profile; kill -9 base -> both nodes stop; `tenon reset` restarts A from LKG while G stays up; env A spawns child B, `tree` shows A -> B, killing A removes B, B cannot reach A's RPC |
 | P3.1 | sandbox trait + `oci` + `landlock` backends; conformance suite; kernel socket-backed external fiber (`%{socket: S}` spec, ~80 lines Erlang) + `gateway` plugin in node A: listens on one configurable port (HTTP/WS/SSE carrier; vsock/UDS same frames), each connection is mounted as a real fiber, disconnect = fiber gone; two ports, two processes (base UDS vs gateway) | same worker tests pass on both; a python plugin started inside the sandbox registers a service through the gateway; killing the VM or the gateway leaves base untouched |
 | P3.2 | worker: pty/fs/edit + step-granular git-snap inside `workspace.img`; folds playground spike + plugins/term; wire fd 3/4 and UDS/vsock; expiry policy | tool round trips, spill, PGID kill, snapshot/restore/expiry, 500 steps no leak, image grows then trims |
 | P3.3 | harness (runs on the host, holds the model key; only tool calls cross into the sandbox): llm + loop + session log + tools bus + policy hooks (context overflow handling deferred to the memory/navigator stage; v1 lets the model API error fail the turn gracefully); model-facing management tools (`plugin.list/mount/unmount/restart`, `config.get/patch`, `snapshot.list/restore`, `upgrade.propose/status`, `approval.request`) + a "how to extend Tenon" prompt section | real model turn; resume from log; guard denies; tools single authority (DSH rows disabled when ours mounted); the agent mounts a new plugin through the tools and sees it in `tree` |
