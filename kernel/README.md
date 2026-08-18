@@ -177,6 +177,20 @@ print("logs go to stdout, the wire does not", flush=True)
 A shell plugin can simply move the descriptors: `python3 -c '...' <&3 >&4` (see
 `../playground/plugins/shell_echo.sh`).
 
+**Wire v1.2 — socket transport.** `mount(Ctx, #{socket => Sock})` treats an
+already-connected `gen_tcp`/local-domain socket exactly like a port-backed external
+plugin: same hello/load/on/provide/emit/call/svc/next/rep frames, same deadlines, same
+frame cap, same `tree`/`status` rows. `Sock` must be `{packet, 4}, binary}`; `mount/2`
+transfers its controlling process to the new fiber and only then sets `{active, true}`,
+so no frame can be delivered to the wrong process during the handoff (the documented
+`gen_tcp:controlling_process/2` race). The kernel never listens itself — some other
+process (typically a gateway plugin sitting in front of a listen socket) accepts the
+connection and calls `mount/2`; the kernel only ever sees the accepted socket. The socket
+closes (`tcp_closed` / `tcp_error`) the same way a spawned process exiting does — the
+fiber goes `failed` — and `unmount` sends `unload` then closes the socket after `grace`,
+mirroring the port backstop. There is nothing to respawn a closed socket with, so
+`restart/1,2` on a socket fiber fails the fiber instead of trying.
+
 Kernel to plugin:
 
 | Frame | Fields | Meaning |
@@ -357,7 +371,7 @@ mix test
 mix test --seed 1        # order-independent; seeds 1..5 verified
 ```
 
-61 tests in two files. `test/tenon_test.exs` (43) is the whole P1 acceptance list
+66 tests in three files. `test/tenon_test.exs` (43) is the whole P1 acceptance list
 (load/unload, reverse disposers, kill sweep, inject wait/lose/regain/swap, prepend,
 waterfall rewrite and short-circuit, parent cascade, cross-fiber mount into a group ctx
 unwound by unmount and by kill, failed -> restart, internal events,
@@ -368,6 +382,10 @@ OS process, request timeout, noisy stdout/stderr, oversized reply, cap by option
 `TENON_MAX_FRAME`, plugin environment, error-name normalization), and the two perf smoke
 tests above.
 `test/tenon_adversarial_test.exs` (18) covers hot swap, scale, concurrency and wire abuse.
+`test/tenon_socket_test.exs` (5) mounts a UDS-connected python3 plugin the test itself
+listens for and accepts (standing in for a gateway): hook + svc round trip, `unmount`
+closing the socket and ending the process, `SIGKILL` of the plugin failing the fiber,
+`restart` failing a socket fiber outright, and an oversized reply over the socket.
 
 ## Deviations from NOTES section 9
 
@@ -394,3 +412,13 @@ tests above.
 8. As specified in 9.1, `parallel`, `serial`, the Service and Plugin macros, the Ctx
    struct and `update` are gone. `serial` was already identical to `bail` on the BEAM and
    `update(Config)` is `restart(Fiber, Config)`.
+9. **A mounted socket's `{active, true}` is set by `mount/2`, not required beforehand.**
+   The caller (a gateway) hands `mount/2` a socket that is `{packet, 4}, binary}` but may
+   leave it passive; `mount/2` runs in the caller's own process — still the socket's real
+   owner at that point — so it can transfer control to the new fiber and only then flip
+   `active` on, both from the same process, with no window where a frame could reach
+   the wrong mailbox. Handing `mount/2` an already-active socket also works as long as
+   nothing has been sent to it yet, but is not required. A few of the smallest new
+   dispatch functions (`connect_external/1`, `tx_send/2`, `close_port/1`'s socket clause)
+   are written as one line per clause to keep `tenon.erl` under the 1000-line budget;
+   every other new clause matches the file's existing multi-line style.
