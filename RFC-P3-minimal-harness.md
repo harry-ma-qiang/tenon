@@ -1,9 +1,13 @@
 # RFC P3 — Minimal complete harness in Rust on the Tenon kernel (draft for review)
 
-Author: Fable, 2026-08-18. Status: draft v3.3 (after discussion), for Gemini/human review. Numbering:
+Author: Fable, 2026-08-18. Status: draft v3.4 (after readiness review), for Gemini/human review. Numbering:
 P{m}.{n} from here on (P0 toolchain, P1 kernel, P2 loader/sdk/bridge are done; this is P3).
 v2 changes: one Rust binary; harness in Rust with the seam checklist; krun-only VM; change protocol,
 blue/green kernels and LKG added; qemu-tcg dropped.
+v3.4 changes: readiness review (section 10) — wire v2 socket listener, worker as a replaceable
+plugin, model-facing management tools + config API + docs section, approval RPC, minimal truncation,
+harness on host (keys never enter the VM), OS-level supervision of base, LKG backup of state.sqlite,
+plugin/LKG manifests, contract suite as a runtime check.
 v3.3 changes: .gitignore-aware snapshots; no message-bus component: log = truth (SQLite events),
 kernel = live bus, one RPC schema over many transports (fd 3/4, vsock, UDS, HTTP/WS optional);
 Kafka/NATS/iceoryx2 only as future plugins if measured.
@@ -150,13 +154,13 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 | Step | Deliverable | Test gate |
 |---|---|---|
 | P3.0 | Cargo workspace `tenon/rs/` (crates: base, worker, harness, storage, sandbox, sdk moved from sdk/rs); release layout `~/.tenon/`; base extracts the BEAM release and starts two nodes (guardian G read-only, agent A), `tenon start/attach/stop/reset` | base boots G + A from a profile; kill -9 base -> both nodes stop; `tenon reset` restarts A from LKG while G stays up |
-| P3.1 | sandbox trait + `oci` + `landlock` backends; conformance suite | same worker tests pass on both; egress/deny policy enforced |
+| P3.1 | sandbox trait + `oci` + `landlock` backends; conformance suite; wire v2 socket listener in the kernel (UDS/vsock accept) so plugins born inside the sandbox can register | same worker tests pass on both; egress/deny policy enforced; a python plugin started inside the sandbox registers a service |
 | P3.2 | worker: pty/fs/edit + step-granular git-snap inside `workspace.img`; folds playground spike + plugins/term; wire fd 3/4 and UDS/vsock; expiry policy | tool round trips, spill, PGID kill, snapshot/restore/expiry, 500 steps no leak, image grows then trims |
-| P3.3 | harness: llm + loop + session log + tools bus + policy hooks | real model turn; resume from log; guard denies; tools single authority (DSH rows disabled when ours mounted) |
+| P3.3 | harness (runs on the host, holds the model key; only tool calls cross into the sandbox): llm + loop + session log + tools bus + policy hooks + budget-based truncation; model-facing management tools (`plugin.list/mount/unmount/restart`, `config.get/patch`, `snapshot.list/restore`, `upgrade.propose/status`, `approval.request`) + a "how to extend Tenon" prompt section | real model turn; resume from log; guard denies; tools single authority (DSH rows disabled when ours mounted); the agent mounts a new plugin through the tools and sees it in `tree` |
 | P3.4 | storage crate + schema; episodes written by loop | replay a session from SQLite; episodes count grows |
-| P3.5 | hard rules + budgets + LKG rollback + kill switch | violation -> stop + rollback + human notice; budget hard stop |
+| P3.5 | hard rules + budgets + LKG rollback + kill switch; approval RPC (`approval.request/answer`, `tenon approve`); guardian probe list (A alive, tree healthy, worker responsive, budgets, hard-rule violations in the log); OS-level supervision (systemd --user / launchd unit; base runs no user code, panic = abort); `state.sqlite` copied at every LKG promotion; plugin + LKG manifests (name/version/hash) | violation -> stop + rollback + human notice; budget hard stop; kill -9 base -> supervisor restarts it and A resumes from LKG; a corrupted state file is replaced by the LKG copy |
 | P3.6 | `krun` backend (Mac HVF / CI KVM) + release CI (Linux x64/arm64, macOS) producing the single `tenon` binary | krun passes the same conformance suite; fresh machine: download one file, `tenon run` works |
-| P3.7 | change protocol + blue/green kernels (section 8b): `harness.upgrade`, `kernel.upgrade`, LKG promotion, benchmark gate | agent upgrades a plugin and the kernel without downtime; a bad upgrade auto-rolls back |
+| P3.7 | change protocol + blue/green kernels (section 8b): `harness.upgrade`, `kernel.upgrade`, LKG promotion, benchmark gate; contract suite shipped as `tenon check kernel` (runtime artifact); worker declared a replaceable plugin (built-in worker = LKG fallback) | agent upgrades a plugin, a worker and the kernel without downtime; a bad upgrade auto-rolls back with the reason returned to the agent |
 
 Order rationale: base and sandbox first (the safety floor), then the worker (what the spike proved),
 then the harness (what makes it a harness), then storage, then the hard rules, then the microVM.
@@ -217,6 +221,29 @@ manifest, profile}; `tenon rollback` = checkout + restart.
 "Better" must be measurable: kernel contract suite, worker conformance, harness e2e smoke, plus
 task-level metrics (success rate, cost) from the episodes table; a change is promoted only if it beats
 LKG on the benchmark set. Base holds LKG and the judge; it does not take part in the evolution.
+
+## 10. Readiness review (2026-08-18)
+
+Question: is v3.3 minimal-complete, everything replaceable by the agent at runtime, smooth for the
+agent, and is the guardian always on? Answer: close, with eight gaps; three block "the agent can
+replace everything", one blocks "usable". All folded into P3.x above.
+
+1. Blocks replaceability: plugins born inside the sandbox had no way to register (kernel spawns via
+   Port from the host) -> wire v2 socket listener (P3.1).
+2. Blocks replaceability: worker was the same binary as base, so replacing it meant replacing L0 ->
+   worker is an L2 plugin; the built-in worker is the LKG fallback (P3.7).
+3. Blocks replaceability: the agent had no hands -> management tools + config API + docs prompt
+   section (P3.3); failures return the reason to the agent.
+4. Blocks usability: no approval UX -> approval RPC + `tenon approve` (P3.5).
+5. Long sessions overflow without compaction -> budget-based truncation in harness-lite (P3.3).
+6. Keys must not enter the sandbox -> harness runs on the host; only tool calls cross (P3.3).
+7. Guardian robustness: base is one process -> OS-level supervision; state.sqlite copied at LKG
+   promotion; probe list fixed (P3.5).
+8. Rollback needs to know what to restore -> plugin/LKG manifests; contract suite as `tenon check
+   kernel` so the agent can verify a kernel before upgrading it (P3.5/P3.7).
+
+Still open (not blocking start): egress allowlist mechanics per backend (TSI/oci), benchmark task set,
+"crazy" heuristics beyond probes.
 
 ## 9. Open questions for review
 
