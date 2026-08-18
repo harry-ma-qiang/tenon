@@ -566,7 +566,7 @@ cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt 
 TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test
 ```
 
-92 tests: `sandbox` unit 5, `boot.rs` 8, `storage` 5, `base` unit 2
+91 tests: `sandbox` unit 5, `boot.rs` 8, `storage` 5, `base` unit 2
 (`token`, and `home::hash` — stable per home, distinct across homes), the 20-test
 adversarial suite, `sandbox`'s 2-test conformance suite, the 1-test gateway gate, the
 P3.2 worker suites (`worker/tests/fs_test.rs` 9, `snap_test.rs` 9, `pty_test.rs` 10,
