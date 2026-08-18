@@ -1,4 +1,5 @@
-use crate::bus::{BoxFut, Event, Log};
+use crate::bus::{BoxFut, EpisodeRow, Event, Log, ToolRow};
+use base64::Engine;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -129,6 +130,61 @@ impl Log for BaseLog {
                 )
                 .await?;
             Ok(rows(&answer))
+        })
+    }
+
+    fn tool_result<'a>(&'a self, row: ToolRow) -> BoxFut<'a, Result<i64, String>> {
+        Box::pin(async move {
+            let answer = self
+                .api
+                .env_lane(
+                    crate::api::LOG,
+                    "tool_results.append",
+                    json!({
+                        "event_id": row.event_id,
+                        "name": row.name,
+                        "status": row.status,
+                        "duration_ms": row.duration_ms,
+                        "blob_hash": row.blob_hash,
+                    }),
+                )
+                .await?;
+            Ok(answer.get("id").and_then(Value::as_i64).unwrap_or(0))
+        })
+    }
+
+    fn episode<'a>(&'a self, row: EpisodeRow) -> BoxFut<'a, Result<i64, String>> {
+        Box::pin(async move {
+            let answer = self
+                .api
+                .env_lane(
+                    crate::api::LOG,
+                    "episodes.append",
+                    json!({
+                        "session_id": row.session,
+                        "step": row.step,
+                        "action": row.action,
+                        "verifier_score": row.verifier_score,
+                        "cost": row.cost,
+                        "user_event": row.user_event,
+                    }),
+                )
+                .await?;
+            Ok(answer.get("id").and_then(Value::as_i64).unwrap_or(0))
+        })
+    }
+
+    fn blob<'a>(&'a self, bytes: Vec<u8>) -> BoxFut<'a, Result<String, String>> {
+        Box::pin(async move {
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let answer = self
+                .api
+                .env_lane(crate::api::LOG, "blobs.put", json!({"data": data}))
+                .await?;
+            match answer.get("hash").and_then(Value::as_str) {
+                Some(hash) => Ok(hash.to_string()),
+                None => Err("blobs.put answered without a hash".to_string()),
+            }
         })
     }
 }

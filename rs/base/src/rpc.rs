@@ -69,6 +69,16 @@ pub enum Cmd {
         limit: i64,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// The P3.4 tables behind one variant rather than seven: `episodes.*`,
+    /// `tool_results.*`, `blobs.*` and `state.retain` are all "one env's state
+    /// file, one accessor, one JSON answer", and spelling each of them as its
+    /// own `Cmd` would be seven identical shapes.
+    Records {
+        env: String,
+        method: String,
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     ConfigGet {
         env: String,
         reply: oneshot::Sender<Result<Value, String>>,

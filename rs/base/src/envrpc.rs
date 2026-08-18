@@ -1,10 +1,18 @@
 use crate::base::Base;
 use crate::rpc::Cmd;
+use base64::Engine;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
+use tenon_storage::{Retention, Store};
 use tokio::sync::oneshot;
 
 pub const APPROVAL_OFF: &str = "approvals not enabled";
+
+/// The tail an `episodes.tail`/`tool_results.tail` without an `n` answers with,
+/// and the ceiling any of them is clamped to.
+const TAIL: i64 = 200;
+const TAIL_MAX: i64 = 5_000;
 
 type Answer = Result<Value, String>;
 
@@ -136,22 +144,207 @@ impl Base {
             })
             .unwrap_or_else(|| "deny".to_string());
         let approved = mode == "auto";
+        let status = match approved {
+            true => tenon_storage::approvals::APPROVED,
+            false => tenon_storage::approvals::DENIED,
+        };
+        // The row outlives the event: P3.5's queue reads this table, and a
+        // verdict answered inline is still part of the history.
+        let id = self
+            .store_of(env)
+            .ok()
+            .and_then(|store| store.put_approval(env, reason, status).ok());
         self.emit(
             "approval.request",
             Some(env),
-            json!({"reason": reason, "approved": approved, "mode": mode}),
+            json!({"id": id, "reason": reason, "approved": approved, "mode": mode}),
         );
         Ok(json!({
-            "status": match approved {
-                true => "approved",
-                false => "denied",
-            },
+            "id": id,
+            "status": status,
             "auto": approved,
             "reason": match approved {
                 true => reason.to_string(),
                 false => APPROVAL_OFF.to_string(),
             },
         }))
+    }
+
+    fn store_of(&self, env: &str) -> Result<&Store, String> {
+        let Some(node) = self.nodes.get(env) else {
+            return Err(format!("unknown env {env}"));
+        };
+        node.store
+            .as_ref()
+            .ok_or_else(|| format!("env {env} has no state file"))
+    }
+
+    /// Everything the harness records beside the log. The harness never opens
+    /// sqlite: it sends one of these frames and base, the file's only writer,
+    /// performs it.
+    pub fn records(&mut self, env: &str, method: &str, params: &Value) -> Answer {
+        match method {
+            "episodes.append" => self.episodes_append(env, params),
+            "episodes.tail" => self.episodes_tail(env, params),
+            "tool_results.append" => self.tool_result_append(env, params),
+            "tool_results.tail" => self.tool_results_tail(env, params),
+            "blobs.put" => self.blobs_put(env, params),
+            "blobs.get" => self.blobs_get(env, params),
+            "state.retain" => self.state_retain(env),
+            other => Err(format!("unknown_method:{other}")),
+        }
+    }
+
+    /// One row per step of that env's loop. `state_hash` is computed here
+    /// rather than in the harness because base is what holds the workspace
+    /// history: the newest snapshot ref and the id of the user message the
+    /// step is answering are what identify the state the step started from.
+    fn episodes_append(&mut self, env: &str, params: &Value) -> Answer {
+        let store = self.store_of(env)?;
+        let session = text(params, "session_id");
+        if session.is_empty() {
+            return Err("episodes.append needs a session_id".to_string());
+        }
+        let step = params.get("step").and_then(Value::as_i64).unwrap_or(0);
+        let action = params.get("action").cloned().unwrap_or(Value::Null);
+        let cost = params.get("cost").cloned().unwrap_or_else(|| json!({}));
+        let score = params.get("verifier_score").and_then(Value::as_f64);
+        let user_event = params
+            .get("user_event")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let hash = match params.get("state_hash").and_then(Value::as_str) {
+            Some(given) => given.to_string(),
+            None => {
+                let head = store
+                    .head_snapshot()
+                    .ok()
+                    .flatten()
+                    .map(|row| row.reference)
+                    .unwrap_or_default();
+                state_hash(&head, user_event)
+            }
+        };
+        let id = store
+            .put_episode(&session, step, &hash, &action, score, &cost)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({"id": id, "state_hash": hash, "step": step}))
+    }
+
+    fn episodes_tail(&self, env: &str, params: &Value) -> Answer {
+        let rows = self
+            .store_of(env)?
+            .episodes_tail(limit(params))
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<Value> = rows.iter().filter_map(value).collect();
+        Ok(json!({"env": env, "count": rows.len(), "episodes": rows}))
+    }
+
+    fn tool_result_append(&mut self, env: &str, params: &Value) -> Answer {
+        let store = self.store_of(env)?;
+        let event_id = params.get("event_id").and_then(Value::as_i64).unwrap_or(0);
+        let name = text(params, "name");
+        let status = match text(params, "status").as_str() {
+            "" => "ok".to_string(),
+            given => given.to_string(),
+        };
+        let duration = params
+            .get("duration_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let hash = params.get("blob_hash").and_then(Value::as_str);
+        let id = store
+            .put_tool_result(event_id, &name, &status, duration, hash)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({"id": id}))
+    }
+
+    fn tool_results_tail(&self, env: &str, params: &Value) -> Answer {
+        let rows = self
+            .store_of(env)?
+            .tool_results_tail(limit(params))
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<Value> = rows.iter().filter_map(value).collect();
+        Ok(json!({"env": env, "count": rows.len(), "tool_results": rows}))
+    }
+
+    fn blobs_put(&mut self, env: &str, params: &Value) -> Answer {
+        let data = text(params, "data");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .map_err(|error| format!("blobs.put needs base64 data: {error}"))?;
+        let hash = self
+            .store_of(env)?
+            .put_blob(&bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({"hash": hash, "size": bytes.len()}))
+    }
+
+    /// The whole blob, or the window `{offset, len}` names — the incremental
+    /// read that keeps a 100 MB tool output pageable rather than loaded.
+    fn blobs_get(&self, env: &str, params: &Value) -> Answer {
+        let store = self.store_of(env)?;
+        let hash = text(params, "hash");
+        let Some(row) = store.blob(&hash).map_err(|error| error.to_string())? else {
+            return Err(format!("unknown blob {hash}"));
+        };
+        let offset = params.get("offset").and_then(Value::as_i64).unwrap_or(0);
+        let len = params.get("len").and_then(Value::as_i64);
+        let bytes = match len {
+            Some(len) => store
+                .open_blob(&hash, offset, len)
+                .map_err(|error| error.to_string())?,
+            None => store
+                .get_blob(&hash)
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default(),
+        };
+        Ok(json!({
+            "hash": hash,
+            "size": row.size,
+            "offset": offset,
+            "len": bytes.len(),
+            "created_at": row.created_at,
+            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }))
+    }
+
+    /// The retention policy from `config.yml`, run against one env's state
+    /// file. The newest snapshot ref is passed in as an LKG ref: it is what a
+    /// reset would restore, so it survives whatever the window says.
+    fn state_retain(&mut self, env: &str) -> Answer {
+        let config = self.config.retention.clone();
+        let store = self.store_of(env)?;
+        let head = store
+            .head_snapshot()
+            .ok()
+            .flatten()
+            .map(|row| row.reference)
+            .unwrap_or_default();
+        let policy = Retention {
+            keep_steps: config.keep_steps,
+            milestone_every: config.milestone_every,
+            keep_refs: match head.is_empty() {
+                true => vec![],
+                false => vec![head],
+            },
+            keep_events: config.keep_events,
+            blob_grace_ms: config.blob_grace_ms,
+        };
+        let out = store.retain(&policy).map_err(|error| error.to_string())?;
+        let left = json!({
+            "packs": store.pack_count().unwrap_or(0),
+            "blobs": store.blob_count().unwrap_or(0),
+            "events": store.event_count().unwrap_or(0),
+            "episodes": store.episode_count().unwrap_or(0),
+        });
+        let removed = serde_json::to_value(&out).unwrap_or(Value::Null);
+        self.emit(
+            "state.retain",
+            Some(env),
+            json!({"removed": removed, "left": left}),
+        );
+        Ok(json!({"ok": true, "env": env, "removed": removed, "left": left}))
     }
 
     pub fn on_env_cmd(&mut self, cmd: Cmd) {
@@ -172,6 +365,14 @@ impl Base {
             } => {
                 let _ = reply.send(self.events_tail(&env, after, limit));
             }
+            Cmd::Records {
+                env,
+                method,
+                params,
+                reply,
+            } => {
+                let _ = reply.send(self.records(&env, &method, &params));
+            }
             Cmd::ConfigGet { env, reply } => {
                 let _ = reply.send(self.config_get(&env));
             }
@@ -189,4 +390,35 @@ impl Base {
             _ => {}
         }
     }
+}
+
+fn limit(params: &Value) -> i64 {
+    params
+        .get("n")
+        .or_else(|| params.get("limit"))
+        .and_then(Value::as_i64)
+        .unwrap_or(TAIL)
+        .clamp(1, TAIL_MAX)
+}
+
+fn text(params: &Value, key: &str) -> String {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn value<T: serde::Serialize>(row: &T) -> Option<Value> {
+    serde_json::to_value(row).ok()
+}
+
+/// The state a step started from, in 16 hex chars: the workspace at that
+/// moment (the newest snapshot ref) plus the message being answered.
+fn state_hash(reference: &str, user_event: i64) -> String {
+    let sum = Sha256::digest(format!("{reference}:{user_event}").as_bytes());
+    sum.iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

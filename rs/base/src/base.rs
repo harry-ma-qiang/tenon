@@ -136,6 +136,7 @@ impl Base {
             | Cmd::HarnessExit { .. }
             | Cmd::EventsAppend { .. }
             | Cmd::EventsTail { .. }
+            | Cmd::Records { .. }
             | Cmd::ConfigGet { .. }
             | Cmd::ConfigPatch { .. }
             | Cmd::Approval { .. } => self.on_env_cmd(cmd),

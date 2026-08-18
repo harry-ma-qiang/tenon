@@ -27,13 +27,19 @@ impl Outcome {
         json!({"ok": self.ok, "denied": self.denied, "result": self.value})
     }
 
+    /// The whole result as text, before any cut: what goes to `blobs` when it
+    /// is too large for an event row.
+    pub fn body(&self) -> String {
+        match self.value.as_str() {
+            Some(text) => text.to_string(),
+            None => self.value.to_string(),
+        }
+    }
+
     /// What the model sees as the tool result: the reason on failure, the
     /// value on success, cut to a size a context window survives.
     pub fn text(&self) -> String {
-        let body = match self.value.as_str() {
-            Some(text) => text.to_string(),
-            None => self.value.to_string(),
-        };
+        let body = self.body();
         match body.chars().count() > RESULT_CHARS {
             true => body.chars().take(RESULT_CHARS).collect::<String>() + "\n[truncated]",
             false => body,
