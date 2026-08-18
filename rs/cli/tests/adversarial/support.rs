@@ -281,13 +281,16 @@ pub fn pids_by_sock(sock: &Path) -> Vec<i64> {
     })
 }
 
-/// Every pid whose /proc/<pid>/cmdline names this fixture's home directory:
-/// covers `tenon --home <home> start --foreground`, any generation.
+/// Every pid whose /proc/<pid>/cmdline names both this fixture's home directory
+/// and the binary under test: covers `tenon --home <home> start --foreground`,
+/// any generation, without counting the container engine's own processes —
+/// `podman exec ... TENON_GATEWAY=<home>/run/gw-root/gateway.sock tenon worker`
+/// carries the home path too while base is bringing a worker up.
 pub fn pids_by_home(home: &Path) -> Vec<i64> {
     let needle = home.to_string_lossy().to_string();
     scan_proc(|pid| {
         std::fs::read(format!("/proc/{pid}/cmdline"))
-            .map(|bytes| contains(&bytes, needle.as_bytes()))
+            .map(|bytes| contains(&bytes, needle.as_bytes()) && contains(&bytes, BIN.as_bytes()))
             .unwrap_or(false)
     })
 }

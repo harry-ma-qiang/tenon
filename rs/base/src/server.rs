@@ -71,6 +71,30 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         "health" | "tree" | "reload" => forward(method, &env, cmds, opts).await,
         "svc" => svc(body, &env, cmds, opts).await,
         "reset" => ask(cmds, |reply| Cmd::Reset { env, reply }).await,
+        "runtime.spawn" => {
+            let parent = body
+                .get("parent")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let overrides = body.get("overrides").cloned().unwrap_or_else(|| json!({}));
+            let id = peer.id();
+            ask(cmds, |reply| Cmd::Spawn {
+                peer: id,
+                parent,
+                overrides,
+                reply,
+            })
+            .await
+        }
+        "runtime.stop" => ask(cmds, |reply| Cmd::RuntimeStop { env, reply }).await,
+        "snap.list" => ask(cmds, |reply| Cmd::SnapList { env, reply }).await,
+        "snap.pull" => {
+            ask(cmds, |reply| Cmd::SnapPull {
+                env,
+                reply: Some(reply),
+            })
+            .await
+        }
         "sandbox.exec" => sandbox_exec(body, env, cmds).await,
         "sandbox.destroy" => ask(cmds, |reply| Cmd::SandboxDestroy { env, reply }).await,
         "stop" => ask(cmds, |reply| Cmd::Stop { reply }).await,
@@ -171,6 +195,10 @@ async fn node_json(node: &NodeView, opts: &Opts) -> Value {
         "registered": node.registered,
         "restarts": node.restarts,
         "sandbox": node.sandbox,
+        "parent": node.parent,
+        "depth": node.depth,
+        "children": node.children,
+        "worker": node.worker,
         "tree": tree,
     })
 }

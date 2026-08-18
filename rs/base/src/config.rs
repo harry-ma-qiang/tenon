@@ -11,6 +11,26 @@ pub struct Guardian {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Worker {
+    #[serde(default = "worker_boot_timeout_ms")]
+    pub boot_timeout_ms: u64,
+    #[serde(default = "pull_interval_ms")]
+    pub pull_interval_ms: u64,
+    #[serde(default = "keep_packs")]
+    pub keep_packs: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Envs {
+    #[serde(default = "max_total")]
+    pub max_total: usize,
+    #[serde(default = "max_depth")]
+    pub max_depth: u32,
+    #[serde(default = "child_ram_mb")]
+    pub ram_mb: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "root_env")]
     pub root_env: String,
@@ -26,6 +46,10 @@ pub struct Config {
     pub sandbox: String,
     #[serde(default)]
     pub guardian: Guardian,
+    #[serde(default)]
+    pub worker: Worker,
+    #[serde(default)]
+    pub envs: Envs,
 }
 
 fn root_env() -> String {
@@ -52,6 +76,30 @@ fn sandbox() -> String {
     "auto".to_string()
 }
 
+fn worker_boot_timeout_ms() -> u64 {
+    30_000
+}
+
+fn pull_interval_ms() -> u64 {
+    5_000
+}
+
+fn keep_packs() -> i64 {
+    40
+}
+
+fn max_total() -> usize {
+    8
+}
+
+fn max_depth() -> u32 {
+    3
+}
+
+fn child_ram_mb() -> u64 {
+    512
+}
+
 fn interval_ms() -> u64 {
     2_000
 }
@@ -69,6 +117,26 @@ impl Default for Guardian {
     }
 }
 
+impl Default for Worker {
+    fn default() -> Self {
+        Self {
+            boot_timeout_ms: worker_boot_timeout_ms(),
+            pull_interval_ms: pull_interval_ms(),
+            keep_packs: keep_packs(),
+        }
+    }
+}
+
+impl Default for Envs {
+    fn default() -> Self {
+        Self {
+            max_total: max_total(),
+            max_depth: max_depth(),
+            ram_mb: child_ram_mb(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -79,6 +147,8 @@ impl Default for Config {
             max_restarts: max_restarts(),
             sandbox: sandbox(),
             guardian: Guardian::default(),
+            worker: Worker::default(),
+            envs: Envs::default(),
         }
     }
 }

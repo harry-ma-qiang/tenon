@@ -1,8 +1,10 @@
 pub mod base;
 pub mod client;
 pub mod config;
+pub mod envfiber;
 pub mod frame;
 pub mod home;
+pub mod instance;
 pub mod integrity;
 pub mod lock;
 pub mod node;
@@ -11,7 +13,11 @@ pub mod release;
 pub mod rpc;
 pub mod server;
 pub mod signals;
+pub mod snap;
+pub mod spawn;
+pub mod state;
 pub mod token;
+pub mod worker;
 
 use crate::client::Client;
 use crate::config::Config;
@@ -91,6 +97,7 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         sandbox,
         opts.exit_on_detach,
         exits,
+        cmds.clone(),
     );
     tokio::spawn(server::serve(
         listener,

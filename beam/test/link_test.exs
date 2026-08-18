@@ -70,6 +70,7 @@ defmodule Tenon.Beam.LinkTest do
   test "proxies svc to a kernel service", %{base: base, ctx: ctx} do
     assert_receive {:base, %{"t" => "node.register"}}, 2_000
     :tenon.provide(ctx, :probe, fn :ping, [] -> "pong" end)
+
     Base.push(base, %{
       "t" => "svc",
       "id" => 11,

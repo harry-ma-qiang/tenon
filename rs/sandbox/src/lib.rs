@@ -33,6 +33,7 @@ impl Default for Policy {
 pub struct Spec {
     pub env: String,
     pub image: Option<String>,
+    pub binary: Option<PathBuf>,
     pub workspace: PathBuf,
     pub gateway: Option<String>,
     pub env_passthrough: Vec<String>,
@@ -61,6 +62,13 @@ pub trait Instance: Send + Sync {
     fn id(&self) -> &str;
     fn backend(&self) -> &'static str;
     fn attach_addr(&self) -> Endpoint;
+
+    /// Where the workspace and the `tenon` binary are found *inside* the
+    /// instance. They differ from the host paths only where the backend
+    /// relocates them (oci does, landlock and none do not), and the worker's
+    /// launch line and every handle path base hands back are written in these.
+    fn workspace_path(&self) -> String;
+    fn binary_path(&self) -> String;
     fn exec(&self, cmd: &str, args: &[String], timeout: Duration) -> Result<ExecOutcome>;
     fn destroy(&self) -> Result<()>;
 }
@@ -85,6 +93,14 @@ pub struct Skip {
 pub struct Detected {
     pub sandbox: Box<dyn Sandbox>,
     pub skipped: Vec<Skip>,
+}
+
+pub fn host_binary(spec: &Spec) -> String {
+    spec.binary
+        .clone()
+        .or_else(|| std::env::current_exe().ok())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "tenon".to_string())
 }
 
 pub fn gateway_dir(address: &str) -> Option<PathBuf> {
@@ -152,6 +168,7 @@ mod tests {
         Spec {
             env: "root".to_string(),
             image: None,
+            binary: None,
             workspace: PathBuf::from("/tmp/tenon-workspace"),
             gateway: None,
             env_passthrough: vec![],
@@ -169,6 +186,7 @@ mod tests {
         assert_eq!(instance.backend(), "none");
         assert_eq!(instance.attach_addr(), Endpoint::Direct);
         assert_eq!(instance.id(), "none:root");
+        assert_eq!(instance.workspace_path(), "/tmp/tenon-workspace");
         instance.destroy().unwrap();
     }
 
