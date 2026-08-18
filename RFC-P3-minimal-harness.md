@@ -1,9 +1,12 @@
 # RFC P3 — Minimal complete harness in Rust on the Tenon kernel (draft for review)
 
-Author: Fable, 2026-08-18. Status: draft v3.2 (after discussion), for Gemini/human review. Numbering:
+Author: Fable, 2026-08-18. Status: draft v3.3 (after discussion), for Gemini/human review. Numbering:
 P{m}.{n} from here on (P0 toolchain, P1 kernel, P2 loader/sdk/bridge are done; this is P3).
 v2 changes: one Rust binary; harness in Rust with the seam checklist; krun-only VM; change protocol,
 blue/green kernels and LKG added; qemu-tcg dropped.
+v3.3 changes: .gitignore-aware snapshots; no message-bus component: log = truth (SQLite events),
+kernel = live bus, one RPC schema over many transports (fd 3/4, vsock, UDS, HTTP/WS optional);
+Kafka/NATS/iceoryx2 only as future plugins if measured.
 v3.2 changes: in-memory workspace in a single RAM-capped VM (read-only base image + tmpfs overlay),
 per-step packs to the host as the truth, host files down to config + state.sqlite; SQLite kept
 (DuckDB reads it later); no message bus, UDS RPC in base, HTTP server optional.
@@ -106,6 +109,9 @@ develop against oci + landlock here; validate krun on a Mac (HVF) and in GitHub 
 - Model-facing tools are POSIX only (view/edit/write/bash + snapshot/time_travel). Single authority.
 - Snapshots are step-granular, not per syscall: the worker commits the workspace tree with gix at each
   tool-step boundary (post-execute hook) and before risky operations; GIT_DIR lives inside the image.
+  Snapshots respect `.gitignore` from day one: ignored artifacts (node_modules, target) are not kept
+  and must be rebuilt after a reset — the agent is expected to learn to be frugal; smarter policies
+  later.
   Rollback/diff/time-travel/CoW hypothesis workspaces are git operations inside the guest.
 - Durability: after each step the worker pushes the packfile to the host over the wire; the host
   stores it in `state.sqlite` and acknowledges. Guest git is a cache; the host copy is the truth for
@@ -179,10 +185,14 @@ then the harness (what makes it a harness), then storage, then the hard rules, t
 - Two BEAM nodes (guardian G read-only, agent A writable) from one payload; one RAM-capped VM by
   default with an in-memory workspace; host state = config + state.sqlite (two files; workspace.img
   optional); gix only inside the worker; per-step packs pushed to the host; DSH long tail opt-in.
-- Control plane: no message bus (the kernel is the bus; tokio channels inside base); base exposes a
-  UDS JSON-RPC (same frames as the wire) for CLI/TUI/guardian attach; HTTP client in the harness
-  (streaming model calls); HTTP server only as an optional feature (`tenon serve --http`) for
-  browsers/remote, not in the minimal set.
+- Control plane, three principles: (1) log = truth: the append-only `events` table is the commit log
+  (rowid = offset, consumers tail it, replay/resume come free, and it is queryable, which Kafka is
+  not); (2) kernel = live bus: emit/call in-VM (~1M/s) and over the wire (~30k rt/s) — the model is
+  the bottleneck by three orders of magnitude, so no ZeroMQ/iceoryx2 now; (3) one RPC schema, many
+  transports: the wire frames are the API; fd 3/4, vsock, base UDS JSON-RPC, and optional HTTP/WS
+  (`tenon serve --http`) are carriers of the same schema. No bus component; tokio channels inside
+  base. Kafka-class streaming (NATS JetStream/Redpanda) or zero-copy IPC become plugins mirroring the
+  same events only if thousands of agents across machines make it measurable.
 
 ## 8b. Change protocol, mutability tiers, always-online
 
