@@ -54,6 +54,26 @@ impl Home {
         self.root.join("run")
     }
 
+    pub fn envs_dir(&self) -> PathBuf {
+        self.root.join("envs")
+    }
+
+    pub fn env_dir(&self, env: &str) -> PathBuf {
+        self.envs_dir().join(env)
+    }
+
+    pub fn workspace_dir(&self, env: &str) -> PathBuf {
+        self.env_dir(env).join("workspace")
+    }
+
+    pub fn gateway_sock(&self, env: &str) -> PathBuf {
+        self.run().join(format!("gateway-{env}.sock"))
+    }
+
+    pub fn gateway_address(&self, env: &str) -> String {
+        format!("unix:{}", self.gateway_sock(env).display())
+    }
+
     pub fn sock(&self) -> PathBuf {
         self.run().join("base.sock")
     }

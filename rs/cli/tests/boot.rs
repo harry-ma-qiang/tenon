@@ -202,7 +202,11 @@ fn boot_registers_both_nodes_and_mounts_the_demo_plugin() {
     let root = fixture.node("root");
     assert_eq!(root["role"], "agent");
     assert_eq!(root["registered"], true);
-    assert_eq!(root["sandbox"], "none:root");
+    assert!(
+        root["sandbox"]["backend"] == "oci" || root["sandbox"]["backend"] == "landlock",
+        "unexpected sandbox on the default auto profile: {}",
+        root["sandbox"]
+    );
     let ids = fiber_ids(&root["tree"]);
     assert!(
         ids.contains(&"demo".to_string()),

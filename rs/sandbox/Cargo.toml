@@ -8,4 +8,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+landlock = "0.4"
 serde.workspace = true
+wait-timeout = "0.2"

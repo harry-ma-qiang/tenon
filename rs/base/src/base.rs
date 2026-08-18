@@ -2,77 +2,18 @@ use crate::config::Config;
 use crate::home::Home;
 use crate::node::{self, Exit, GUARDIAN};
 use crate::peer::Peer;
+use crate::rpc::{Cmd, NodeView, Snapshot};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tenon_sandbox::{Instance, Sandbox, Spec};
+use tenon_sandbox::{Endpoint, Instance, Sandbox, Spec};
 use tenon_storage::Store;
 use tokio::sync::{mpsc, oneshot};
 
 const BOOT_ABORT_GRACE_MS: u64 = 300;
-
-pub enum Cmd {
-    Boot {
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Register {
-        peer: Peer,
-        role: String,
-        env: String,
-        pid: i64,
-        token: String,
-        reply: oneshot::Sender<Result<Value, String>>,
-    },
-    Snapshot {
-        reply: oneshot::Sender<Snapshot>,
-    },
-    PeerOf {
-        env: String,
-        reply: oneshot::Sender<Option<Peer>>,
-    },
-    Reset {
-        env: String,
-        reply: oneshot::Sender<Result<Value, String>>,
-    },
-    Stop {
-        reply: oneshot::Sender<Result<Value, String>>,
-    },
-    AbortBoot {
-        reply: oneshot::Sender<Result<Value, String>>,
-    },
-    Subscribe {
-        peer: Peer,
-        env: Option<String>,
-        reply: oneshot::Sender<Value>,
-    },
-    Gone {
-        peer: u64,
-    },
-    Ready {
-        reply: oneshot::Sender<bool>,
-    },
-}
-
-pub struct NodeView {
-    pub env: String,
-    pub role: String,
-    pub pid: Option<i32>,
-    pub registered: bool,
-    pub restarts: u32,
-    pub sandbox: Option<String>,
-    pub peer: Option<Peer>,
-}
-
-pub struct Snapshot {
-    pub home: PathBuf,
-    pub release: PathBuf,
-    pub pid: u32,
-    pub exit_on_detach: bool,
-    pub attached: usize,
-    pub nodes: Vec<NodeView>,
-}
 
 struct Node {
     role: String,
@@ -81,7 +22,7 @@ struct Node {
     registered: bool,
     restarts: u32,
     peer: Option<Peer>,
-    sandbox: Option<Instance>,
+    sandbox: Option<Arc<dyn Instance>>,
     exited: Option<oneshot::Receiver<Option<i32>>>,
     token: String,
 }
@@ -99,6 +40,28 @@ pub struct Base {
     generation: u64,
     promoted: bool,
     stopping: bool,
+}
+
+fn sandbox_env_passthrough() -> Vec<String> {
+    std::env::var("TENON_SANDBOX_ENV")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn endpoint_repr(endpoint: &Endpoint) -> Value {
+    match endpoint {
+        Endpoint::Direct => json!("direct"),
+        Endpoint::Uds(path) => json!(format!("unix:{}", path.display())),
+        Endpoint::Tcp(host, port) => json!(format!("tcp:{host}:{port}")),
+    }
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -184,6 +147,14 @@ impl Base {
                 let outcome = self.reset(&env).await;
                 let _ = reply.send(outcome);
             }
+            Cmd::SandboxExec {
+                env,
+                cmd,
+                args,
+                timeout_ms,
+                reply,
+            } => self.sandbox_exec(env, cmd, args, timeout_ms, reply),
+            Cmd::SandboxDestroy { env, reply } => self.sandbox_destroy(&env, reply),
             Cmd::Stop { reply } => {
                 let _ = reply.send(Ok(json!({"ok": true})));
                 self.stop().await;
@@ -256,19 +227,25 @@ impl Base {
         Ok(())
     }
 
-    fn enter_sandbox(&mut self, role: &str, env: &str) -> Result<Option<Instance>, String> {
+    fn enter_sandbox(
+        &mut self,
+        role: &str,
+        env: &str,
+    ) -> Result<Option<Arc<dyn Instance>>, String> {
         if role == GUARDIAN {
             return Ok(None);
         }
         if let Some(node) = self.nodes.get_mut(env) {
             if let Some(old) = node.sandbox.take() {
-                let _ = self.sandbox.destroy(&old);
+                let _ = old.destroy();
             }
         }
         let spec = Spec {
             env: env.to_string(),
-            image: None,
-            workspace: self.home.root.join("workspace").join(env),
+            image: std::env::var("TENON_SANDBOX_IMAGE").ok(),
+            workspace: self.home.workspace_dir(env),
+            gateway: Some(self.home.gateway_address(env)),
+            env_passthrough: sandbox_env_passthrough(),
             policy: Default::default(),
             caps: vec![],
         };
@@ -276,6 +253,50 @@ impl Base {
             .spawn(&spec)
             .map(Some)
             .map_err(|error| error.to_string())
+    }
+
+    fn sandbox_exec(
+        &mut self,
+        env: String,
+        cmd: String,
+        args: Vec<String>,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    ) {
+        let Some(instance) = self.nodes.get(&env).and_then(|node| node.sandbox.clone()) else {
+            let _ = reply.send(Err(format!("env {env} has no sandbox instance")));
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
+            let outcome = instance.exec(&cmd, &args, Duration::from_millis(timeout_ms.max(1)));
+            let result = outcome
+                .map(|outcome| {
+                    json!({
+                        "status": outcome.status,
+                        "stdout": String::from_utf8_lossy(&outcome.stdout),
+                        "stderr": String::from_utf8_lossy(&outcome.stderr),
+                        "timed_out": outcome.timed_out,
+                    })
+                })
+                .map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        });
+    }
+
+    fn sandbox_destroy(&mut self, env: &str, reply: oneshot::Sender<Result<Value, String>>) {
+        let Some(node) = self.nodes.get_mut(env) else {
+            let _ = reply.send(Err(format!("unknown env {env}")));
+            return;
+        };
+        let Some(instance) = node.sandbox.take() else {
+            let _ = reply.send(Err(format!("env {env} has no sandbox instance")));
+            return;
+        };
+        self.emit("sandbox.destroy", Some(env), json!({"id": instance.id()}));
+        tokio::task::spawn_blocking(move || {
+            let _ = instance.destroy();
+        });
+        let _ = reply.send(Ok(json!({"ok": true})));
     }
 
     fn on_register(
@@ -466,7 +487,7 @@ impl Base {
                 node::terminate(pid, exited, grace).await;
             }
             if let Some(instance) = node.sandbox.take() {
-                let _ = self.sandbox.destroy(&instance);
+                let _ = instance.destroy();
             }
             let _ = self.store.put_env(&env, &node.role, None, "stopped");
         }
@@ -501,7 +522,13 @@ impl Base {
                     pid: node.pid,
                     registered: node.registered,
                     restarts: node.restarts,
-                    sandbox: node.sandbox.as_ref().map(|instance| instance.id.clone()),
+                    sandbox: node.sandbox.as_ref().map(|instance| {
+                        json!({
+                            "backend": instance.backend(),
+                            "id": instance.id(),
+                            "attach": endpoint_repr(&instance.attach_addr()),
+                        })
+                    }),
                     peer: node.peer.clone(),
                 })
                 .collect(),

@@ -1,6 +1,6 @@
-use crate::base::{Cmd, NodeView};
 use crate::frame;
 use crate::peer::Peer;
+use crate::rpc::{Cmd, NodeView};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
@@ -69,12 +69,51 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
     match method {
         "node.register" => register(body, peer, cmds).await,
         "health" | "tree" | "reload" => forward(method, &env, cmds, opts).await,
+        "svc" => svc(body, &env, cmds, opts).await,
         "reset" => ask(cmds, |reply| Cmd::Reset { env, reply }).await,
+        "sandbox.exec" => sandbox_exec(body, env, cmds).await,
+        "sandbox.destroy" => ask(cmds, |reply| Cmd::SandboxDestroy { env, reply }).await,
         "stop" => ask(cmds, |reply| Cmd::Stop { reply }).await,
         "status" => status(cmds, opts).await,
         "subscribe" => subscribe(peer, body, cmds).await,
         other => Err(format!("unknown_method:{other}")),
     }
+}
+
+async fn svc(body: &Value, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {
+    let node = peer_of(env, cmds).await?;
+    let params = json!({
+        "name": body.get("name").cloned().unwrap_or(Value::Null),
+        "method": body.get("method").cloned().unwrap_or(Value::Null),
+        "args": body.get("args").cloned().unwrap_or_else(|| json!([])),
+    });
+    node.request("svc", params, opts.timeout).await
+}
+
+async fn sandbox_exec(body: &Value, env: String, cmds: &Cmds) -> Answer {
+    let cmd = string(body, "cmd", "");
+    let args = body
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let timeout_ms = body
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000);
+    ask(cmds, |reply| Cmd::SandboxExec {
+        env,
+        cmd,
+        args,
+        timeout_ms,
+        reply,
+    })
+    .await
 }
 
 async fn register(body: &Value, peer: &Peer, cmds: &Cmds) -> Answer {
