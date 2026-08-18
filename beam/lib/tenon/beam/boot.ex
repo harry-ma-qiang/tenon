@@ -4,14 +4,16 @@ defmodule Tenon.Beam.Boot do
 
   `TENON_ROLE` (`guardian` or `agent`), `TENON_ENV` (the env name), `TENON_BASE_SOCK`
   (the base front door) and `TENON_PROFILE` (the yml entry list). It starts one kernel,
-  mounts `Tenon.Loader` on the profile, mounts `Tenon.Beam.Link`, and mounts
-  `Tenon.Beam.Guardian` as well when the role is `guardian`.
+  mounts `Tenon.Loader` on the profile, mounts `Tenon.Beam.Link`, mounts
+  `Tenon.Beam.Guardian` when the role is `guardian`, and mounts `Tenon.Beam.Gateway` when
+  the role is `agent`.
   """
 
   use GenServer
 
   require Logger
 
+  alias Tenon.Beam.Gateway
   alias Tenon.Beam.Guardian
   alias Tenon.Beam.Link
   alias Tenon.Beam.Registry
@@ -39,8 +41,19 @@ defmodule Tenon.Beam.Boot do
       :tenon.mount(ctx, %{module: Link, id: "link", config: link(role, env, kernel, loader)})
 
     guardian = if role == "guardian", do: mount_guardian(ctx, env), else: nil
+    gateway = if role == "agent", do: mount_gateway(ctx, env), else: nil
     Logger.info("tenon node: role #{role}, env #{env}, os pid #{System.pid()}")
-    {:ok, %{kernel: kernel, loader: loader, link: link, guardian: guardian, role: role, env: env}}
+
+    {:ok,
+     %{
+       kernel: kernel,
+       loader: loader,
+       link: link,
+       guardian: guardian,
+       gateway: gateway,
+       role: role,
+       env: env
+     }}
   end
 
   @impl GenServer
@@ -79,5 +92,17 @@ defmodule Tenon.Beam.Boot do
       {value, _rest} when value > 0 -> value
       _other -> default
     end
+  end
+
+  defp mount_gateway(ctx, env) do
+    address = System.get_env("TENON_GATEWAY", default_gateway(env))
+    config = %{address: address}
+    {:ok, fiber} = :tenon.mount(ctx, %{module: Gateway, id: "gateway", config: config})
+    fiber
+  end
+
+  defp default_gateway(env) do
+    home = System.get_env("TENON_HOME", Path.join(System.user_home!(), ".tenon"))
+    "unix:" <> Path.join([home, "run", "gateway-#{env}.sock"])
   end
 end

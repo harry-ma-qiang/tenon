@@ -12,9 +12,10 @@ base (rust)                      node (this release)
                                     +-- loader   (../loader, mounts the profile)
                                     +-- link     (this)
                                     +-- guardian (this, role = guardian only)
+                                    +-- gateway  (this, role = agent only) <--socket-- plugin
 ```
 
-Two plugins are mounted directly by `Tenon.Beam.Boot`, outside the loader, because they
+These plugins are mounted directly by `Tenon.Beam.Boot`, outside the loader, because they
 belong to the barebone and must not be reachable by an agent editing the profile.
 
 ## Boot
@@ -30,6 +31,7 @@ belong to the barebone and must not be reachable by an agent editing the profile
 | `TENON_GUARDIAN_TARGET` | guardian only, the env to watch (default `root`) |
 | `TENON_GUARDIAN_INTERVAL_MS` | guardian only, probe interval (default 2000) |
 | `TENON_GUARDIAN_FAILURES` | guardian only, consecutive failures before `reset` (default 6) |
+| `TENON_GATEWAY` | agent only, listen address: `unix:<path>` or `tcp:<host>:<port>` (default `unix:<TENON_HOME or ~/.tenon>/run/gateway-<TENON_ENV>.sock`) |
 
 `rel/env.sh.eex` sets `RELEASE_DISTRIBUTION=none` (no distribution, no epmd, no cookie) and
 `RELEASE_MODE=embedded` (all modules preloaded, no code loading from disk at runtime), so a
@@ -91,6 +93,20 @@ At `failures` strikes it sends `reset{env: target}` to base and starts over. It 
 only in the guardian node, and base is what actually performs the reset: the guardian never
 touches an OS process.
 
+## Gateway
+
+`Tenon.Beam.Gateway` is the in-sandbox registration path from RFC section 6: it listens on
+`TENON_GATEWAY` (`{:packet, 4}`, binary) and, for every accepted connection, calls
+`:tenon.mount(ctx, %{socket: sock, id: "gw-<n>"})` under its own ctx — a kernel
+socket-backed external fiber (`../kernel`, wire v1.2). One acceptor process loops on
+`:gen_tcp.accept/1` and hands each socket to a short-lived process that claims it
+(`:gen_tcp.controlling_process/2`, so the accept loop is never blocked on a slow or silent
+client) and mounts it; the `Gateway.Server` GenServer monitors each resulting fiber and
+logs accept/disconnect. Mounting under the gateway's own ctx means every connection fiber
+is a child of the gateway fiber, so unmounting the gateway (or its node dying) drops all of
+them for free, the same cascade that already unwinds any other parent/child mount.
+Mounted only in agent-role nodes — a guardian node has no sandbox to register plugins from.
+
 ## Tests
 
 ```
@@ -98,8 +114,12 @@ mix compile --warnings-as-errors && mix format --check-formatted
 mix credo --strict && mix test && MIX_ENV=prod mix release
 ```
 
-14 tests. `test/link_test.exs` (9) covers register, `health`, `tree`, `reload`, the unknown
+18 tests. `test/link_test.exs` (9) covers register, `health`, `tree`, `reload`, the unknown
 method, request correlation in both outcomes, the node-stop on close, and the failed load
 without a socket. `test/guardian_test.exs` (5) covers the quiet path, the reset after N
 failures, an unhealthy answer counting as a failure, recovery clearing the count, and the
-target name. Both run against `Tenon.Beam.Test.Base`, a fake base on a real unix socket.
+target name; both run against `Tenon.Beam.Test.Base`, a fake base on a real unix socket.
+`test/gateway_test.exs` (4) starts a kernel and a gateway on a temp UDS path and connects
+fake clients directly (no base needed): a `:tenon.svc` call reaches a connected client,
+disconnecting fails that client's fiber and drops its service, a second client gets its own
+fiber, and unmounting the gateway drops an active connection's service.
