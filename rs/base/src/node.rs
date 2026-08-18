@@ -61,6 +61,7 @@ pub fn spawn(
         .current_dir(home.run())
         .env("TENON_ROLE", &spec.role)
         .env("TENON_ENV", &spec.env)
+        .env("TENON_HOME", &home.root)
         .env("TENON_BASE_SOCK", &spec.sock)
         .env("TENON_PROFILE", &spec.profile)
         .env("TENON_GUARDIAN_TARGET", &spec.target)
@@ -73,7 +74,11 @@ pub fn spawn(
             config.guardian.failures.to_string(),
         )
         .env("TENON_NODE_TOKEN", &spec.token)
-        .env("RELEASE_TMP", home.run())
+        .env("RELEASE_TMP", home.run());
+    if spec.role != GUARDIAN {
+        command.env("TENON_GATEWAY", home.gateway_address(&spec.env));
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))

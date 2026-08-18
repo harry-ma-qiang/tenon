@@ -8,15 +8,16 @@ pub mod lock;
 pub mod node;
 pub mod peer;
 pub mod release;
+pub mod rpc;
 pub mod server;
 pub mod signals;
 pub mod token;
 
-use crate::base::Cmd;
 use crate::client::Client;
 use crate::config::Config;
 use crate::home::Home;
 use crate::lock::Lock;
+use crate::rpc::Cmd;
 use crate::signals::Signals;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

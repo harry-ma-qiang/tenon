@@ -49,7 +49,7 @@ fn max_restarts() -> u32 {
 }
 
 fn sandbox() -> String {
-    "none".to_string()
+    "auto".to_string()
 }
 
 fn interval_ms() -> u64 {
