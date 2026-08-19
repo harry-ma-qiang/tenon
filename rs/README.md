@@ -24,6 +24,7 @@ tenon start                      the base process
 | `harness` | the `tenon harness` role (P3.3): the agent loop, the llm adapter, the session log, the tools bus and the management tools, one host process per env |
 | `worker` | the `tenon worker` role (P3.2): one resident process inside the sandbox serving `bash`, `pty.*`, `fs.*` and `snap.*` over the wire |
 | `cli` | the `tenon` bin target and `build.rs`, which embeds the BEAM release |
+| `test-support` | dev-only: the boot fixture, the waits and the `/proc` helpers every integration suite shares (`node` feature adds the ones that dial base) |
 
 ## Build
 

@@ -27,4 +27,4 @@ http = ["tenon-base/http"]
 base64.workspace = true
 sha2.workspace = true
 libc.workspace = true
-tenon-harness = { path = "../harness" }
+tenon-test-support = { path = "../test-support", features = ["node"] }

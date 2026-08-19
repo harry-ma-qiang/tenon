@@ -1,43 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use tenon_test_support::Temp;
 use tenon_worker::snap::Snap;
-
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-struct Temp {
-    path: PathBuf,
-}
-
-impl Temp {
-    fn new(tag: &str) -> Self {
-        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let path =
-            std::env::temp_dir().join(format!("tenon-snap-{tag}-{}-{seq}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-
-    fn put(&self, rel: &str, text: &str) {
-        let target = self.path.join(rel);
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(target, text).unwrap();
-    }
-
-    fn read(&self, rel: &str) -> String {
-        std::fs::read_to_string(self.path.join(rel)).unwrap()
-    }
-
-    fn has(&self, rel: &str) -> bool {
-        self.path.join(rel).exists()
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 fn steps(listing: &serde_json::Value) -> Vec<u64> {
     listing["snapshots"]
@@ -53,7 +16,7 @@ fn commit_then_list_shows_step_one() {
     let temp = Temp::new("first");
     temp.put("a.txt", "alpha\n");
     temp.put("dir/b.txt", "beta\n");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
 
     let done = snap.commit(None).unwrap();
     assert_eq!(done["step"], 1);
@@ -73,7 +36,7 @@ fn commit_then_list_shows_step_one() {
 fn a_second_commit_makes_head_step_two() {
     let temp = Temp::new("second");
     temp.put("a.txt", "alpha\n");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
     snap.commit(Some("base")).unwrap();
 
     temp.put("a.txt", "alpha two\n");
@@ -96,12 +59,12 @@ fn an_ignored_file_is_not_snapshotted_and_survives_restore() {
     temp.put(".gitignore", "build/\n");
     temp.put("build/out.bin", "artifact\n");
     temp.put("keep.txt", "one\n");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
 
     let first = snap.commit(None).unwrap();
     assert_eq!(first["files"], 2);
 
-    std::fs::remove_file(temp.path.join("build/out.bin")).unwrap();
+    std::fs::remove_file(temp.path().join("build/out.bin")).unwrap();
     snap.restore("1").unwrap();
     assert!(
         !temp.has("build/out.bin"),
@@ -122,7 +85,7 @@ fn an_ignored_file_is_not_snapshotted_and_survives_restore() {
 fn restore_brings_back_old_content_and_removes_new_files() {
     let temp = Temp::new("restore");
     temp.put("a.txt", "alpha\n");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
     let first = snap.commit(None).unwrap();
 
     temp.put("a.txt", "alpha two\n");
@@ -145,7 +108,7 @@ fn restore_brings_back_old_content_and_removes_new_files() {
 fn diff_names_the_changed_file() {
     let temp = Temp::new("diff");
     temp.put("a.txt", "one\n");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
     snap.commit(None).unwrap();
 
     temp.put("a.txt", "one\ntwo\n");
@@ -174,7 +137,7 @@ fn diff_names_the_changed_file() {
 #[test]
 fn expire_keeps_the_recent_and_the_milestones() {
     let temp = Temp::new("expire");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
     for n in 1..=12 {
         temp.put("a.txt", &format!("value {n}\n"));
         snap.commit(None).unwrap();
@@ -201,7 +164,7 @@ fn a_pack_round_trips_into_a_fresh_workspace() {
     let target = Temp::new("packdst");
     source.put("a.txt", "alpha\n");
     source.put("dir/b.txt", "beta\n");
-    let origin = Snap::open(&source.path).unwrap();
+    let origin = Snap::open(source.path()).unwrap();
     origin.commit(Some("first")).unwrap();
     source.put("a.txt", "alpha two\n");
     let second = origin.commit(Some("second")).unwrap();
@@ -212,7 +175,7 @@ fn a_pack_round_trips_into_a_fresh_workspace() {
     assert_eq!(pack.head, second["ref"].as_str().unwrap());
     assert_eq!(pack.refs.len(), 2);
 
-    let file = spill.path.join("snaps.pack");
+    let file = spill.path().join("snaps.pack");
     std::fs::write(&file, &pack.bytes).unwrap();
     let entries: Vec<(u64, String, PathBuf)> = pack
         .refs
@@ -220,7 +183,7 @@ fn a_pack_round_trips_into_a_fresh_workspace() {
         .map(|(step, oid)| (*step, oid.clone(), file.clone()))
         .collect();
 
-    let restored = Snap::open(&target.path).unwrap();
+    let restored = Snap::open(target.path()).unwrap();
     let done = restored.apply(&entries, None).unwrap();
     assert_eq!(done["applied"], 2);
     assert_eq!(done["step"], 2);
@@ -238,7 +201,7 @@ fn a_pack_round_trips_into_a_fresh_workspace() {
 #[test]
 fn pack_since_carries_only_the_newer_commits() {
     let temp = Temp::new("packsince");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
     for n in 1..=3 {
         temp.put("a.txt", &format!("value {n}\n"));
         snap.commit(None).unwrap();
@@ -261,17 +224,17 @@ fn pack_since_carries_only_the_newer_commits() {
 fn open_is_idempotent_on_an_existing_workspace() {
     let temp = Temp::new("reopen");
     temp.put("a.txt", "alpha\n");
-    let snap = Snap::open(&temp.path).unwrap();
+    let snap = Snap::open(temp.path()).unwrap();
     snap.commit(None).unwrap();
-    assert_eq!(snap.root(), temp.path);
+    assert_eq!(snap.root(), temp.path());
 
-    let again = Snap::open(&temp.path).unwrap();
+    let again = Snap::open(temp.path()).unwrap();
     assert_eq!(again.list().unwrap()["count"], 1);
     assert_eq!(temp.read("a.txt"), "alpha\n");
     assert_eq!(again.head().unwrap().unwrap().0, 1);
 
     let fresh = Temp::new("emptyrepo");
-    let none = Snap::open(&fresh.path).unwrap();
+    let none = Snap::open(fresh.path()).unwrap();
     assert!(none.head().unwrap().is_none());
     assert_eq!(none.list().unwrap()["count"], 0);
     assert_eq!(none.pack(None).unwrap().step, 0);

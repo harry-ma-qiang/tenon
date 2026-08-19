@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{repo, skip, Fixture};
+use gate::{fixture, repo, skip, Fixture};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -139,7 +139,7 @@ async fn version(fixture: &Fixture) -> i64 {
 async fn the_change_protocol_promotes_verifies_and_rolls_back() {
     let Some(release) = skip(NAME) else { return };
     let server = fake::spawn(vec![]).await.expect("fake model");
-    let fixture = Fixture::new(NAME, release, &config(), &harness(&server.base_url));
+    let fixture = fixture(NAME, release, &config(), &harness(&server.base_url));
     fixture.start();
     fixture.ready(Duration::from_secs(180)).await;
 

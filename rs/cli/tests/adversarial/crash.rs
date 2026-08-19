@@ -6,14 +6,14 @@ fn killing_guardian_restarts_it_and_leaves_the_env_untouched() {
     let Some(fixture) = fixture("kill-guardian") else {
         return;
     };
-    fixture.start(&[]);
-    let guardian1 = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root1 = fixture.node("root")["pid"].as_i64().unwrap();
+    fixture.start();
+    let guardian1 = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root1 = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     kill(guardian1, "-9");
     let guardian2 = fixture.await_fresh("guardian", guardian1);
     assert_ne!(guardian1, guardian2);
-    assert_eq!(fixture.node("root")["pid"].as_i64().unwrap(), root1);
+    assert_eq!(fixture.cli_node("root")["pid"].as_i64().unwrap(), root1);
     assert!(
         alive(root1),
         "root went down when only the guardian was killed"
@@ -25,9 +25,9 @@ fn killing_both_nodes_restarts_both() {
     let Some(fixture) = fixture("kill-both") else {
         return;
     };
-    fixture.start(&[]);
-    let guardian1 = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root1 = fixture.node("root")["pid"].as_i64().unwrap();
+    fixture.start();
+    let guardian1 = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root1 = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     kill(guardian1, "-9");
     kill(root1, "-9");
@@ -44,12 +44,12 @@ fn restart_limit_stops_restarting_and_reports_give_up() {
     let Some(fixture) = fixture_with_config("restart-limit", Some("max_restarts: 1\n")) else {
         return;
     };
-    fixture.start(&[]);
-    let root1 = fixture.node("root")["pid"].as_i64().unwrap();
+    fixture.start();
+    let root1 = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     kill(root1, "-9");
     let root2 = fixture.await_fresh("root", root1);
-    assert_eq!(fixture.node("root")["restarts"], 1);
+    assert_eq!(fixture.cli_node("root")["restarts"], 1);
 
     kill(root2, "-9");
     wait_gone(&[root2], Duration::from_secs(5));
@@ -70,7 +70,7 @@ fn restart_limit_stops_restarting_and_reports_give_up() {
     );
 
     std::thread::sleep(Duration::from_secs(2));
-    let root = fixture.node("root");
+    let root = fixture.cli_node("root");
     assert_eq!(
         root["registered"], false,
         "base restarted root past its configured limit"
@@ -87,9 +87,9 @@ fn guardian_resets_a_frozen_agent_and_sigcont_does_not_confuse_base() {
     let Some(fixture) = fixture_with_config("guardian-freeze", Some(config)) else {
         return;
     };
-    fixture.start(&[]);
-    let guardian1 = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root1 = fixture.node("root")["pid"].as_i64().unwrap();
+    fixture.start();
+    let guardian1 = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root1 = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     kill(root1, "-STOP");
     let root2 = fixture.await_fresh("root", root1);
@@ -99,14 +99,14 @@ fn guardian_resets_a_frozen_agent_and_sigcont_does_not_confuse_base() {
         "the frozen agent survived the guardian reset"
     );
     assert_eq!(
-        fixture.node("guardian")["pid"].as_i64().unwrap(),
+        fixture.cli_node("guardian")["pid"].as_i64().unwrap(),
         guardian1,
         "the guardian itself should not have been touched"
     );
 
     kill(root1, "-CONT");
     std::thread::sleep(Duration::from_millis(500));
-    let status = fixture.status_result();
+    let status = fixture.cli_status_result();
     assert!(
         status.is_ok(),
         "status broke after SIGCONT to a dead, already-replaced pid"

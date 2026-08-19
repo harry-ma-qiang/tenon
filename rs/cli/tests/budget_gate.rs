@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{skip, Fixture};
+use gate::{fixture, skip};
 use serde_json::json;
 use std::time::Duration;
 use tenon_harness::fake::{self, Say};
@@ -24,7 +24,7 @@ async fn a_token_budget_halts_the_env_and_reset_clears_it() {
     let server = fake::spawn(vec![Say::Text("pong".to_string())])
         .await
         .expect("fake model");
-    let fixture = Fixture::new(NAME, release, "sandbox: oci\n", &harness(&server.base_url));
+    let fixture = fixture(NAME, release, "sandbox: oci\n", &harness(&server.base_url));
     fixture.start();
     fixture.ready(Duration::from_secs(120)).await;
 
@@ -96,7 +96,7 @@ async fn a_token_budget_halts_the_env_and_reset_clears_it() {
 async fn the_stop_file_halts_prompts_and_removing_it_resumes() {
     let Some(release) = skip(NAME) else { return };
     let server = fake::spawn(vec![]).await.expect("fake model");
-    let fixture = Fixture::new(
+    let fixture = fixture(
         "stop-file",
         release,
         "sandbox: oci\n",

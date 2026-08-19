@@ -1734,6 +1734,7 @@ dependencies = [
  "tenon-base",
  "tenon-harness",
  "tenon-sandbox",
+ "tenon-test-support",
  "tenon-worker",
  "tokio",
 ]
@@ -1785,6 +1786,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tenon-test-support"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tenon-base",
+ "tokio",
+]
+
+[[package]]
 name = "tenon-ui"
 version = "0.1.0"
 dependencies = [
@@ -1803,6 +1813,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tenon-sdk",
+ "tenon-test-support",
 ]
 
 [[package]]

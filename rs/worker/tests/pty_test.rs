@@ -1,41 +1,12 @@
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::time::{Duration, Instant};
+use tenon_test_support::Temp;
 use tenon_worker::pty::{bash, BashOutcome, BashReq, Ptys};
-
-static SEQ: AtomicU64 = AtomicU64::new(1);
-
-struct Temp {
-    path: PathBuf,
-}
-
-impl Temp {
-    fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "tenon-pty-test-{}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-            tag
-        ));
-        std::fs::create_dir_all(&path).expect("temp dir");
-        Self { path }
-    }
-
-    fn join(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 fn req(dir: &Temp, cmd: &str, pty: bool) -> BashReq {
     BashReq {
         cmd: cmd.to_string(),
-        cwd: dir.path.clone(),
+        cwd: dir.path().to_path_buf(),
         timeout_ms: 10_000,
         env: Vec::new(),
         pty,
@@ -156,8 +127,8 @@ fn small_output_has_no_spill_file() {
 #[test]
 fn session_open_send_read_close() {
     let dir = Temp::new("session");
-    let ptys = Ptys::new(&dir.path);
-    assert_eq!(ptys.root(), dir.path.as_path());
+    let ptys = Ptys::new(dir.path());
+    assert_eq!(ptys.root(), dir.path());
     let opened = ptys.open(None, None, &[], 0, 0).expect("open");
     let id = opened["session"].as_u64().expect("session id");
     let pid = opened["pid"].as_i64().expect("pid") as i32;
@@ -194,7 +165,7 @@ fn session_open_send_read_close() {
 #[test]
 fn session_reports_env_cwd_and_liveness() {
     let dir = Temp::new("env");
-    let ptys = Ptys::new(&dir.path);
+    let ptys = Ptys::new(dir.path());
     let env = vec![("TENON_MARKER".to_string(), "on".to_string())];
     let opened = ptys
         .open(Some("echo $TENON_MARKER; pwd"), None, &env, 100, 40)
@@ -220,7 +191,7 @@ fn session_reports_env_cwd_and_liveness() {
 #[test]
 fn unknown_session_is_a_loud_error() {
     let dir = Temp::new("unknown");
-    let ptys = Ptys::new(&dir.path);
+    let ptys = Ptys::new(dir.path());
     assert!(ptys.read(4242, 0).is_err());
     assert!(ptys.send(4242, "x").is_err());
     assert!(ptys.close(4242).is_err());
@@ -230,7 +201,7 @@ fn unknown_session_is_a_loud_error() {
 #[test]
 fn close_all_leaves_nothing_behind() {
     let dir = Temp::new("closeall");
-    let ptys = Ptys::new(&dir.path);
+    let ptys = Ptys::new(dir.path());
     let mut pids = Vec::new();
     for _ in 0..3 {
         let opened = ptys.open(None, None, &[], 0, 0).expect("open");
@@ -250,7 +221,7 @@ fn close_all_leaves_nothing_behind() {
 #[test]
 fn no_fd_leak_across_sessions_and_calls() {
     let dir = Temp::new("fds");
-    let ptys = Ptys::new(&dir.path);
+    let ptys = Ptys::new(dir.path());
     let opened = ptys.open(None, None, &[], 0, 0).expect("warmup open");
     ptys.close(opened["session"].as_u64().expect("id"))
         .expect("warmup close");

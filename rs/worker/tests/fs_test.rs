@@ -1,39 +1,5 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use tenon_test_support::Temp;
 use tenon_worker::fs::Fs;
-
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-struct Temp {
-    path: PathBuf,
-}
-
-impl Temp {
-    fn new(tag: &str) -> Self {
-        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let path =
-            std::env::temp_dir().join(format!("tenon-fs-{tag}-{}-{seq}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-
-    fn put(&self, rel: &str, text: &str) {
-        let target = self.path.join(rel);
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(target, text).unwrap();
-    }
-
-    fn read(&self, rel: &str) -> String {
-        std::fs::read_to_string(self.path.join(rel)).unwrap()
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 fn ten_lines() -> String {
     (1..=10)
@@ -47,7 +13,7 @@ fn ten_lines() -> String {
 fn view_returns_a_range_and_a_whole_file() {
     let temp = Temp::new("view");
     temp.put("data.txt", &ten_lines());
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     let window = fs.view("data.txt", Some(2), Some(4)).unwrap();
     assert_eq!(window["path"], "data.txt");
@@ -69,14 +35,14 @@ fn view_returns_a_range_and_a_whole_file() {
 fn view_rejects_a_directory() {
     let temp = Temp::new("viewdir");
     temp.put("sub/x.txt", "x\n");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
     assert!(fs.view("sub", None, None).is_err());
 }
 
 #[test]
 fn write_then_view_round_trips() {
     let temp = Temp::new("write");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     let first = fs.write("deep/nest/note.txt", "hello\nworld\n").unwrap();
     assert_eq!(first["path"], "deep/nest/note.txt");
@@ -95,7 +61,7 @@ fn write_then_view_round_trips() {
 fn edit_replaces_a_unique_string() {
     let temp = Temp::new("edit");
     temp.put("code.rs", "let a = 1;\nlet b = 2;\n");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     let done = fs.edit("code.rs", "let b = 2;", "let b = 3;").unwrap();
     assert_eq!(done["replaced"], 1);
@@ -107,7 +73,7 @@ fn edit_replaces_a_unique_string() {
 fn edit_fails_loudly_without_a_match() {
     let temp = Temp::new("editnone");
     temp.put("code.rs", "let a = 1;\n");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     let error = fs.edit("code.rs", "let z = 9;", "x").unwrap_err();
     assert!(
@@ -122,7 +88,7 @@ fn edit_fails_loudly_without_a_match() {
 fn edit_fails_loudly_on_two_matches() {
     let temp = Temp::new("edittwo");
     temp.put("code.rs", "same\nsame\n");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     let error = fs.edit("code.rs", "same", "other").unwrap_err();
     assert!(
@@ -144,7 +110,7 @@ fn grep_walks_nested_dirs_and_skips_ignored_files() {
     temp.put("build/out.txt", "needle 8\n");
     temp.put(".tenon-out/spill.log", "needle 9\n");
     temp.put(".tenon-snap/objects/x", "needle 10\n");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     let found = fs.grep(r"needle \d+", None).unwrap();
     assert_eq!(found["count"], 1, "{found}");
@@ -167,7 +133,7 @@ fn glob_finds_rust_files() {
     temp.put("notes.txt", "");
     temp.put("build/gen.rs", "");
     temp.put(".gitignore", "build/\n");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     let found = fs.glob("**/*.rs").unwrap();
     let paths: Vec<String> = found["paths"]
@@ -197,7 +163,7 @@ fn glob_finds_rust_files() {
 fn paths_outside_the_workspace_are_rejected() {
     let temp = Temp::new("escape");
     temp.put("inside.txt", "ok\n");
-    let fs = Fs::new(&temp.path);
+    let fs = Fs::new(temp.path());
 
     for path in ["../etc/passwd", "a/../../etc/passwd", "/etc/passwd"] {
         let error = fs.view(path, None, None).unwrap_err();
@@ -210,7 +176,7 @@ fn paths_outside_the_workspace_are_rejected() {
         assert!(fs.grep("x", Some(path)).is_err());
     }
 
-    let inside = temp.path.join("inside.txt");
+    let inside = temp.path().join("inside.txt");
     let absolute = fs.view(inside.to_str().unwrap(), None, None).unwrap();
     assert_eq!(absolute["path"], "inside.txt");
     assert_eq!(

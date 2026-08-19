@@ -6,10 +6,10 @@ fn double_start_refuses_and_first_keeps_running() {
     let Some(fixture) = fixture("double-start") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
     let base1 = fixture.base_pid();
-    let guardian1 = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root1 = fixture.node("root")["pid"].as_i64().unwrap();
+    let guardian1 = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root1 = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     let (ok2, text2) = fixture.run_timeout(&["start"], Duration::from_secs(20));
 
@@ -37,10 +37,10 @@ fn stale_socket_and_ready_file_recover_on_next_start() {
     let Some(fixture) = fixture("stale-recover") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
     let base1 = fixture.base_pid();
-    let guardian1 = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root1 = fixture.node("root")["pid"].as_i64().unwrap();
+    let guardian1 = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root1 = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     kill(base1, "-9");
     wait_gone(&[base1], Duration::from_secs(5));
@@ -50,7 +50,7 @@ fn stale_socket_and_ready_file_recover_on_next_start() {
         "expected a crashed base to leave stale run/ files behind"
     );
 
-    fixture.start(&[]);
+    fixture.start();
     let ready_immediately_after_start =
         std::fs::read_to_string(fixture.home.join("run/base.ready")).unwrap_or_default();
     assert_ne!(
@@ -62,10 +62,10 @@ fn stale_socket_and_ready_file_recover_on_next_start() {
 
     let base2 = fixture.base_pid();
     assert_ne!(base1, base2, "recovered start reused the old base pid");
-    let guardian2 = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root2 = fixture.node("root")["pid"].as_i64().unwrap();
-    assert!(fixture.node("guardian")["registered"] == true);
-    assert!(fixture.node("root")["registered"] == true);
+    let guardian2 = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root2 = fixture.cli_node("root")["pid"].as_i64().unwrap();
+    assert!(fixture.cli_node("guardian")["registered"] == true);
+    assert!(fixture.cli_node("root")["registered"] == true);
     assert!(alive(guardian2) && alive(root2));
 }
 
@@ -74,19 +74,19 @@ fn reset_storm_leaves_no_orphans() {
     let Some(fixture) = fixture("reset-storm") else {
         return;
     };
-    fixture.start(&[]);
-    let guardian0 = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let mut root_pids = vec![fixture.node("root")["pid"].as_i64().unwrap()];
+    fixture.start();
+    let guardian0 = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let mut root_pids = vec![fixture.cli_node("root")["pid"].as_i64().unwrap()];
 
     for round in 0..5 {
-        let (ok, text) = fixture.run(&["reset"]);
+        let (ok, text) = fixture.run_text(&["reset"]);
         assert!(ok, "reset #{round} failed: {text}");
         let last = *root_pids.last().unwrap();
         root_pids.push(fixture.await_fresh("root", last));
     }
 
     assert_eq!(
-        fixture.node("guardian")["pid"].as_i64().unwrap(),
+        fixture.cli_node("guardian")["pid"].as_i64().unwrap(),
         guardian0,
         "the guardian pid changed across a reset storm that never touched it"
     );
@@ -107,10 +107,10 @@ fn stop_while_a_reset_is_in_flight() {
     let Some(fixture) = fixture("stop-vs-reset") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
     let base = fixture.base_pid();
-    let guardian = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root = fixture.node("root")["pid"].as_i64().unwrap();
+    let guardian = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     std::thread::scope(|scope| {
         let reset = scope.spawn(|| fixture.run_timeout(&["reset"], Duration::from_secs(20)));
@@ -195,7 +195,7 @@ fn twenty_parallel_status_calls_during_a_reset() {
     let Some(fixture) = fixture("concurrency") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
 
     std::thread::scope(|scope| {
         let fx = &fixture;
@@ -203,7 +203,7 @@ fn twenty_parallel_status_calls_during_a_reset() {
         let statuses: Vec<_> = (0..20)
             .map(|i| {
                 scope.spawn(move || {
-                    let result = fx.status_result();
+                    let result = fx.cli_status_result();
                     (i, result)
                 })
             })

@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{skip, Fixture};
+use gate::{fixture, skip, Fixture};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
@@ -31,19 +31,6 @@ fn write_probe(fixture: &Fixture, name: &str, body: &str) -> String {
     sum.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-async fn base_events(fixture: &Fixture, kind: &str) -> Vec<Value> {
-    fixture
-        .rpc("events.tail", json!({"env": "base", "limit": 5000}))
-        .await
-        .expect("events.tail base")["events"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|event| event["kind"] == kind)
-        .collect()
-}
-
 async fn await_event(fixture: &Fixture, kind: &str, limit: Duration) -> Value {
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
@@ -62,7 +49,7 @@ async fn await_event(fixture: &Fixture, kind: &str, limit: Duration) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wedged_env_is_reset_by_the_probes_and_only_signed_extra_probes_load() {
     let Some(release) = skip(NAME) else { return };
-    let fixture = Fixture::new(NAME, release, "sandbox: oci\n", HARNESS);
+    let fixture = fixture(NAME, release, "sandbox: oci\n", HARNESS);
     let good = write_probe(&fixture, "ok.sh", "#!/bin/sh\nexit 0\n");
     write_probe(&fixture, "tampered.sh", "#!/bin/sh\nexit 0\n");
     std::fs::write(fixture.home.join("config.yml"), config(&good, "0bad0")).unwrap();
@@ -70,13 +57,13 @@ async fn a_wedged_env_is_reset_by_the_probes_and_only_signed_extra_probes_load()
     let node = fixture.ready(Duration::from_secs(180)).await;
 
     // a. the signed probe loaded, the one whose hash does not match did not
-    let loaded = base_events(&fixture, "probes.loaded").await;
+    let loaded = fixture.base_events("probes.loaded").await;
     assert_eq!(
         loaded.first().map(|row| row["data"]["count"].clone()),
         Some(json!(1)),
         "{loaded:?}"
     );
-    let rejected = base_events(&fixture, "probes.rejected").await;
+    let rejected = fixture.base_events("probes.rejected").await;
     let reason = rejected
         .first()
         .map(|row| {

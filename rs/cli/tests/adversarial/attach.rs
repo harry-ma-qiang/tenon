@@ -45,12 +45,12 @@ fn attach_with_exit_on_detach_stops_everything_on_disconnect() {
     let Some(fixture) = fixture("attach-solo") else {
         return;
     };
-    fixture.start(&["--exit-on-detach"]);
+    fixture.start_with(&["--exit-on-detach"]);
     let base = fixture.base_pid();
-    let guardian = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root = fixture.node("root")["pid"].as_i64().unwrap();
+    let guardian = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
-    let mut child = fixture.spawn_attach(&[]);
+    let mut child = fixture.spawn(&["attach"]);
     wait_for_attach_line(&mut child);
 
     let _ = child.kill();
@@ -73,13 +73,13 @@ fn two_attaches_one_disconnect_keeps_running() {
     let Some(fixture) = fixture("attach-two") else {
         return;
     };
-    fixture.start(&["--exit-on-detach"]);
+    fixture.start_with(&["--exit-on-detach"]);
     let base = fixture.base_pid();
-    let guardian = fixture.node("guardian")["pid"].as_i64().unwrap();
-    let root = fixture.node("root")["pid"].as_i64().unwrap();
+    let guardian = fixture.cli_node("guardian")["pid"].as_i64().unwrap();
+    let root = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
-    let mut a1 = fixture.spawn_attach(&[]);
-    let mut a2 = fixture.spawn_attach(&[]);
+    let mut a1 = fixture.spawn(&["attach"]);
+    let mut a2 = fixture.spawn(&["attach"]);
     wait_for_attach_line(&mut a1);
     wait_for_attach_line(&mut a2);
 
@@ -95,7 +95,7 @@ fn two_attaches_one_disconnect_keeps_running() {
         alive(guardian) && alive(root),
         "nodes stopped after one of two attaches detached"
     );
-    let status = fixture.status_result();
+    let status = fixture.cli_status_result();
     assert!(
         status.is_ok(),
         "base stopped responding with a subscriber left: {status:?}"

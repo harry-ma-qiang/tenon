@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{collect, skip, Fixture};
+use gate::{collect, fixture, skip};
 use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -19,21 +19,6 @@ fn harness(base_url: &str) -> String {
         "llm:\n  provider: openai\n  base_url: {base_url}\n  model: fake-model\n  \
          api_key_env: TENON_TEST_NO_KEY\n  retry_base_ms: 20\nmax_steps: 6\napproval: deny\n"
     )
-}
-
-/// Boot, restore, privilege and probe facts are base-wide, so they are in the
-/// barebone's own log rather than the env's.
-async fn base_events(fixture: &Fixture, kind: &str) -> Vec<serde_json::Value> {
-    fixture
-        .rpc("events.tail", json!({"env": "base", "limit": 5000}))
-        .await
-        .expect("events.tail base")["events"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|event| event["kind"] == kind)
-        .collect()
 }
 
 async fn gone(path: &Path, limit: Duration) -> bool {
@@ -55,13 +40,14 @@ async fn gone(path: &Path, limit: Duration) -> bool {
 async fn a_detach_stops_everything_and_the_next_start_replays_the_workspace_and_the_log() {
     let Some(release) = skip(NAME) else { return };
     let server = fake::spawn(vec![]).await.expect("fake model");
-    let fixture = Fixture::new(NAME, release, CONFIG, &harness(&server.base_url));
+    let fixture = fixture(NAME, release, CONFIG, &harness(&server.base_url));
     let (ok, out, err) = fixture.run(&["start", "--exit-on-detach"]);
     assert!(ok, "start failed: {out}{err}\n{}", fixture.log());
     fixture.ready(Duration::from_secs(180)).await;
 
     // a. env_user was asked for and could not be granted: base said so and carried on
-    let privilege = base_events(&fixture, "env.privilege")
+    let privilege = fixture
+        .base_events("env.privilege")
         .await
         .into_iter()
         .next()
@@ -150,7 +136,7 @@ async fn a_detach_stops_everything_and_the_next_start_replays_the_workspace_and_
         "an uncommitted file survived the replay"
     );
     assert!(
-        !base_events(&fixture, "env.restored").await.is_empty(),
+        !fixture.base_events("env.restored").await.is_empty(),
         "no env.restored event\n{}",
         fixture.log()
     );

@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{release, Fixture};
+use gate::{fixture, skip_release, Fixture};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -11,16 +11,6 @@ const NAME: &str = "manifest-gate";
 const CONFIG: &str = "sandbox: none\n";
 const HARNESS: &str = "llm:\n  provider: openai\n  base_url: http://127.0.0.1:1\n  \
 model: fake-model\n  api_key_env: TENON_TEST_NO_KEY\nmax_steps: 2\napproval: deny\n";
-
-fn skip() -> Option<std::path::PathBuf> {
-    match release() {
-        Some(dir) => Some(dir),
-        None => {
-            println!("skipping {NAME}: no beam release, set TENON_RELEASE_DIR");
-            None
-        }
-    }
-}
 
 fn install(fixture: &Fixture, name: &str, version: &str, hash: &str) {
     let dir = fixture
@@ -50,8 +40,10 @@ fn lkg(fixture: &Fixture) -> Value {
 /// differs when they moved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_lkg_manifest_is_written_at_promotion_and_checked_before_a_rollback() {
-    let Some(release) = skip() else { return };
-    let fixture = Fixture::new(NAME, release, CONFIG, HARNESS);
+    let Some(release) = skip_release(NAME) else {
+        return;
+    };
+    let fixture = fixture(NAME, release, CONFIG, HARNESS);
     install(&fixture, "echo", "1.0.0", "sha256:echo");
     fixture.start();
     assert!(

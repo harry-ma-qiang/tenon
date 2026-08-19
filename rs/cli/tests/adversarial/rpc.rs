@@ -6,7 +6,7 @@ fn garbage_bytes_do_not_crash_base() {
     let Some(fixture) = fixture("rpc-garbage") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
     let base = fixture.base_pid();
 
     let mut stream = raw_connect(&fixture.sock());
@@ -16,7 +16,7 @@ fn garbage_bytes_do_not_crash_base() {
 
     assert!(alive(base), "base died on a garbage frame");
     assert!(
-        fixture.status_result().is_ok(),
+        fixture.cli_status_result().is_ok(),
         "base stopped answering after a garbage frame"
     );
 }
@@ -26,7 +26,7 @@ fn oversized_frame_header_is_rejected_not_fatal() {
     let Some(fixture) = fixture("rpc-oversize") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
     let base = fixture.base_pid();
 
     let mut stream = raw_connect(&fixture.sock());
@@ -37,7 +37,7 @@ fn oversized_frame_header_is_rejected_not_fatal() {
 
     assert!(alive(base), "base died on an oversized frame header");
     assert!(
-        fixture.status_result().is_ok(),
+        fixture.cli_status_result().is_ok(),
         "base stopped answering after an oversized frame"
     );
 }
@@ -47,7 +47,7 @@ fn unknown_method_answers_an_error_and_the_connection_stays_useful() {
     let Some(fixture) = fixture("rpc-unknown") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
 
     let mut stream = raw_connect(&fixture.sock());
     send_frame(
@@ -73,12 +73,12 @@ fn a_half_open_connection_does_not_block_other_clients() {
     let Some(fixture) = fixture("rpc-halfopen") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
 
     let _idle = raw_connect(&fixture.sock());
     for i in 0..5 {
         assert!(
-            fixture.status_result().is_ok(),
+            fixture.cli_status_result().is_ok(),
             "status call {i} blocked by an idle half-open peer"
         );
     }
@@ -89,8 +89,8 @@ fn node_register_from_an_untrusted_peer_should_not_hijack_a_running_env() {
     let Some(fixture) = fixture("rpc-hijack") else {
         return;
     };
-    fixture.start(&[]);
-    let real_pid = fixture.node("root")["pid"].as_i64().unwrap();
+    fixture.start();
+    let real_pid = fixture.cli_node("root")["pid"].as_i64().unwrap();
 
     let mut stream = raw_connect(&fixture.sock());
     send_frame(
@@ -100,7 +100,7 @@ fn node_register_from_an_untrusted_peer_should_not_hijack_a_running_env() {
     .expect("send forged node.register");
     std::thread::sleep(Duration::from_millis(300));
 
-    let root = fixture.node("root");
+    let root = fixture.cli_node("root");
     assert_eq!(
         root["pid"].as_i64().unwrap(),
         real_pid,

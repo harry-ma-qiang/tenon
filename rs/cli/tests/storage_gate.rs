@@ -1,12 +1,11 @@
+mod gate;
+
 use base64::Engine;
+use gate::{fixture, skip};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
-use tenon_base::client::Client;
+use std::time::Duration;
 use tenon_harness::fake::{self, Fake, Say};
 
-const BIN: &str = env!("CARGO_BIN_EXE_tenon");
 const NAME: &str = "storage-gate";
 const SPEW: &str = "python3 -c \"print('x' * 20000)\"";
 
@@ -17,171 +16,11 @@ const CONFIG: &str = "sandbox: oci\n\
 worker:\n  pull_interval_ms: 60000\n\
 retention:\n  keep_steps: 5\n  milestone_every: 10\n  keep_events: 50\n  blob_grace_ms: 0\n";
 
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn release() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("TENON_RELEASE_DIR") {
-        let dir = PathBuf::from(dir);
-        return dir.join("bin/tenon_beam").is_file().then_some(dir);
-    }
-    let dir = repo().join("beam/_build/prod/rel/tenon_beam");
-    dir.join("bin/tenon_beam").is_file().then_some(dir)
-}
-
-fn oci_available() -> bool {
-    std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .any(|dir| dir.join("podman").is_file() || dir.join("docker").is_file())
-        })
-        .unwrap_or(false)
-}
-
-fn skip() -> Option<PathBuf> {
-    if !oci_available() {
-        println!("skipping {NAME}: neither podman nor docker found in PATH");
-        return None;
-    }
-    match release() {
-        Some(dir) => Some(dir),
-        None => {
-            println!(
-                "skipping {NAME}: no beam release. Build it with \
-                 `cd beam && MIX_ENV=prod mix release` or set TENON_RELEASE_DIR"
-            );
-            None
-        }
-    }
-}
-
-struct Fixture {
-    home: PathBuf,
-    release: PathBuf,
-}
-
-impl Fixture {
-    fn new(release: PathBuf, base_url: &str) -> Self {
-        let home = std::env::temp_dir().join(format!("tenon-it-{}-{NAME}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(home.join("profiles/root")).unwrap();
-        std::fs::write(home.join("config.yml"), CONFIG).unwrap();
-        std::fs::write(
-            home.join("profiles/root/harness.yml"),
-            format!(
-                "llm:\n  provider: openai\n  base_url: {base_url}\n  model: fake-model\n  \
-                 api_key_env: TENON_TEST_NO_KEY\n  retry_base_ms: 20\nmax_steps: 4\napproval: deny\n"
-            ),
-        )
-        .unwrap();
-        Self { home, release }
-    }
-
-    fn run(&self, args: &[&str]) -> (bool, String, String) {
-        let output = Command::new(BIN)
-            .arg("--home")
-            .arg(&self.home)
-            .args(args)
-            .env("TENON_RELEASE_DIR", &self.release)
-            .output()
-            .expect("run tenon");
-        (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        )
-    }
-
-    fn start(&self) {
-        let (ok, out, err) = self.run(&["start"]);
-        assert!(ok, "start failed: {out}{err}\n{}", self.log());
-    }
-
-    fn log(&self) -> String {
-        ["base", "guardian", "root", "harness-root"]
-            .iter()
-            .map(|name| {
-                let path = self.home.join(format!("run/{name}.log"));
-                let body = std::fs::read_to_string(&path).unwrap_or_default();
-                format!("--- {name}.log\n{body}")
-            })
-            .collect()
-    }
-
-    async fn client(&self) -> Client {
-        Client::connect(&self.home.join("run/base.sock"))
-            .await
-            .expect("connect to base")
-    }
-
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.client()
-            .await
-            .call(method, params)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn node(&self, env: &str) -> Value {
-        self.rpc("status", json!({})).await.expect("status")["nodes"]
-            .as_array()
-            .expect("nodes")
-            .iter()
-            .find(|node| node["env"] == env)
-            .cloned()
-            .unwrap_or(Value::Null)
-    }
-
-    async fn ready(&self, limit: Duration) -> Value {
-        let deadline = Instant::now() + limit;
-        let mut last = Value::Null;
-        while Instant::now() < deadline {
-            last = self.node("root").await;
-            if last["worker"]["state"] == "ready" && last["harness"]["state"] == "ready" {
-                return last;
-            }
-            tokio::time::sleep(Duration::from_millis(400)).await;
-        }
-        panic!("root never became ready: {last}\n{}", self.log());
-    }
-
-    async fn tool(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.rpc(
-            "svc",
-            json!({"env": "root", "name": "worker", "method": method, "args": [params]}),
-        )
-        .await
-    }
-
-    async fn events(&self) -> Vec<Value> {
-        self.rpc("events.tail", json!({"env": "root", "limit": 5000}))
-            .await
-            .expect("events.tail")["events"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn reap_all_containers(&self) {
-        let _ = Command::new(BIN)
-            .arg("--home")
-            .arg(&self.home)
-            .args(["sandbox", "reap", "--all"])
-            .env("TENON_RELEASE_DIR", &self.release)
-            .output();
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        if self.home.join("run/base.ready").is_file() {
-            let _ = self.run(&["stop"]);
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        self.reap_all_containers();
-        let _ = std::fs::remove_dir_all(&self.home);
-    }
+fn harness(base_url: &str) -> String {
+    format!(
+        "llm:\n  provider: openai\n  base_url: {base_url}\n  model: fake-model\n  \
+         api_key_env: TENON_TEST_NO_KEY\n  retry_base_ms: 20\nmax_steps: 4\napproval: deny\n"
+    )
 }
 
 fn kept(steps: &[i64], keep_steps: i64, milestone_every: i64) -> Vec<i64> {
@@ -195,14 +34,16 @@ fn kept(steps: &[i64], keep_steps: i64, milestone_every: i64) -> Vec<i64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_loop_records_episodes_tool_results_and_blobs_and_retention_bounds_them() {
-    let Some(release) = skip() else { return };
+    let Some(release) = skip(NAME) else {
+        return;
+    };
     let server: Fake = fake::spawn(vec![
         Say::Tool("bash".to_string(), json!({"cmd": SPEW})),
         Say::Text("that was a lot of x".to_string()),
     ])
     .await
     .expect("fake model");
-    let fixture = Fixture::new(release, &server.base_url);
+    let fixture = fixture(NAME, release, CONFIG, &harness(&server.base_url));
     fixture.start();
     fixture.ready(Duration::from_secs(120)).await;
 
@@ -365,13 +206,18 @@ async fn the_loop_records_episodes_tool_results_and_blobs_and_retention_bounds_t
     for round in 0..12 {
         fixture
             .tool(
+                "root",
                 "fs.write",
                 json!({"path": format!("step{round}.txt"), "content": format!("{round}\n")}),
             )
             .await
             .expect("fs.write");
         fixture
-            .tool("snap.commit", json!({"label": format!("step{round}")}))
+            .tool(
+                "root",
+                "snap.commit",
+                json!({"label": format!("step{round}")}),
+            )
             .await
             .expect("snap.commit");
         fixture
