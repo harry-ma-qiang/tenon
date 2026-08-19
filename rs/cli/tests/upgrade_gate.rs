@@ -2,7 +2,7 @@ mod gate;
 
 use gate::{repo, skip, Fixture};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tenon_harness::fake::{self, Say};
 
@@ -77,7 +77,7 @@ fn sdk() -> PathBuf {
     repo().join("sdk/py")
 }
 
-fn plugin_spec(script: &PathBuf, args: &[&str]) -> Value {
+fn plugin_spec(script: &Path, args: &[&str]) -> Value {
     let mut argv = vec![script.display().to_string()];
     argv.extend(args.iter().map(|arg| arg.to_string()));
     json!({
@@ -181,8 +181,9 @@ async fn the_change_protocol_promotes_verifies_and_rolls_back() {
     assert!(
         manifest["plugins"]
             .as_array()
-            .map(|rows| rows.iter().any(|row| row["name"] == json!("demo")
-                && row["version"] == json!("2.0.0")))
+            .map(|rows| rows
+                .iter()
+                .any(|row| row["name"] == json!("demo") && row["version"] == json!("2.0.0")))
             .unwrap_or(false),
         "the lkg manifest does not pin demo@2.0.0: {manifest}"
     );
@@ -265,7 +266,13 @@ async fn the_change_protocol_promotes_verifies_and_rolls_back() {
         "selfcheck": {"method": "selfcheck", "expect": "ok"},
         "spec": plugin_spec(&sabotage, &[]),
     });
-    let proposed = propose(&fixture, "plugin", artifact, "a canary that breaks the loop").await;
+    let proposed = propose(
+        &fixture,
+        "plugin",
+        artifact,
+        "a canary that breaks the loop",
+    )
+    .await;
     let id = proposed["id"].as_i64().expect("an upgrade id");
     let done = settled(&fixture, id, Duration::from_secs(240)).await;
     assert_eq!(done["status"], "rolled_back", "{done}");
@@ -369,7 +376,10 @@ async fn kernel(fixture: &Fixture, server: &fake::Fake) {
     let id = proposed["id"].as_i64().expect("an upgrade id");
     let (done, saw_green) = settled_watching(fixture, id, Duration::from_secs(300)).await;
     assert_eq!(done["status"], "promoted", "{done}\n{}", fixture.log());
-    assert!(saw_green, "tenon status never showed both nodes during the switch");
+    assert!(
+        saw_green,
+        "tenon status never showed both nodes during the switch"
+    );
 
     let status = fixture.rpc("status", json!({})).await.expect("status");
     let names: Vec<String> = status["nodes"]
@@ -381,7 +391,11 @@ async fn kernel(fixture: &Fixture, server: &fake::Fake) {
         })
         .unwrap_or_default();
     assert!(!names.iter().any(|env| env.contains("~green")), "{names:?}");
-    assert_eq!(names.iter().filter(|env| *env == "root").count(), 1, "{names:?}");
+    assert_eq!(
+        names.iter().filter(|env| *env == "root").count(),
+        1,
+        "{names:?}"
+    );
     let node = fixture.node("root").await;
     assert_ne!(node["pid"], before, "node A was never replaced");
 
@@ -389,13 +403,20 @@ async fn kernel(fixture: &Fixture, server: &fake::Fake) {
     fixture.ready(Duration::from_secs(180)).await;
     server.say(vec![Say::Text("still answering".to_string())]);
     let (ok, out, err) = fixture.run(&["run", "are you there", "--timeout", "120"]);
-    assert!(ok, "tenon run after the switch failed: {out}{err}\n{}", fixture.log());
+    assert!(
+        ok,
+        "tenon run after the switch failed: {out}{err}\n{}",
+        fixture.log()
+    );
     assert!(out.contains("still answering"), "{out}");
 }
 
-fn shipped_beam(release: &PathBuf) -> String {
+fn shipped_beam(release: &Path) -> String {
     let lib = release.join("lib");
-    for entry in std::fs::read_dir(&lib).expect("read the release lib").flatten() {
+    for entry in std::fs::read_dir(&lib)
+        .expect("read the release lib")
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().to_string();
         if name == "tenon" || name.starts_with("tenon-") {
             let beam = entry.path().join("ebin/tenon.beam");

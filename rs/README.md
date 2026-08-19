@@ -1238,8 +1238,8 @@ gone) start failing on load rather than on logic — seen twice in whole-suite r
 every time the suite runs alone (`cargo test -p tenon-cli --test adversarial`, 195 s). The
 numbers below are from the whole suite plus that separate adversarial run.
 
-129 tests in the crates below (`cargo test --all-features` prints 153: `rs/ui` brings its own
-24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 16
+131 tests in the crates below (`cargo test --all-features` prints 155: `rs/ui` brings its own
+24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 16, `base` unit 16
 (`token`, `home::hash` — stable per home, distinct across homes — the two `ui` model builders,
 the http form decoder, the runtime contract's two, the probe approver, the three LKG-manifest
 ones, the three privilege-plan ones and the two service-unit ones), the 20-test adversarial
@@ -1335,7 +1335,10 @@ off stdout, and then: `GET /` is 200 with a `<pre>` page naming `root` and the p
 on another connection is resolved through `POST /approve/<id>` and the blocked caller sees
 `approved`, and an unknown path is 404.
 
-`storage` (14) is one test per table plus two the phase is about: `retain` over 100 packs
+`storage` (16) is one test per table plus two the phase is about, and two more for P3.7's:
+an `upgrades` row walked from `proposed` through a phase list to `rolled_back` with its
+reason (and the two "no such row" answers), and `benchmarks` keeping exactly one `lkg` row
+per env and label, superseded by the next promotion and never crossing labels. The rest: `retain` over 100 packs
 keeping exactly the newest five, every tenth and one LKG ref (and dropping the 85 others
 with their snapshot rows), and a file built by hand in the pre-`schema_version` shape that
 comes back migrated with its old rows intact and its new tables usable. The rest are round

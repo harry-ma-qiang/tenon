@@ -387,6 +387,63 @@ fn migrates_a_file_written_before_schema_versions_existed() {
     assert_eq!(again.episode_count().unwrap(), 1);
 }
 
+#[test]
+fn upgrade_rows_carry_every_phase_and_their_terminal_state() {
+    let (_dir, store) = store();
+    let id = store
+        .put_upgrade("root", "plugin", "{\"name\":\"demo\"}", "v2", "proposed")
+        .unwrap();
+    let other = store
+        .put_upgrade("child", "kernel", "{}", "", "proposed")
+        .unwrap();
+    assert!(store
+        .set_upgrade(id, "canary", None, "[{\"phase\":\"snapshot\"}]")
+        .unwrap());
+    assert!(store
+        .set_upgrade(
+            id,
+            "rolled_back",
+            Some("selfcheck failed"),
+            "[{\"phase\":\"snapshot\"},{\"phase\":\"rollback\"}]"
+        )
+        .unwrap());
+    let row = store.upgrade(id).unwrap().unwrap();
+    assert_eq!(row.status, "rolled_back");
+    assert_eq!(row.reason.as_deref(), Some("selfcheck failed"));
+    assert!(row.phases.contains("rollback"));
+    assert!(row.updated_at >= row.created_at);
+    assert_eq!(store.upgrades(Some("root"), 10).unwrap().len(), 1);
+    assert_eq!(store.upgrades(None, 10).unwrap().len(), 2);
+    assert_eq!(store.upgrades(None, 10).unwrap()[0].id, other);
+    assert!(store.upgrade(9_999).unwrap().is_none());
+    assert!(!store.set_upgrade(9_999, "promoted", None, "[]").unwrap());
+}
+
+#[test]
+fn one_lkg_benchmark_row_per_env_and_label() {
+    let (_dir, store) = store();
+    store
+        .put_benchmark("root", "fake", None, (4, 4, 1.0, 100), true)
+        .unwrap();
+    store
+        .put_benchmark("root", "fake", Some(1), (4, 2, 0.5, 90), false)
+        .unwrap();
+    let lkg = store.lkg_benchmark("root", "fake").unwrap().unwrap();
+    assert_eq!(lkg.success_rate, 1.0);
+    assert_eq!(lkg.cost, 100);
+    assert_eq!(lkg.upgrade_id, None);
+
+    let fresh = store
+        .put_benchmark("root", "fake", Some(2), (4, 3, 0.75, 80), true)
+        .unwrap();
+    let lkg = store.lkg_benchmark("root", "fake").unwrap().unwrap();
+    assert_eq!(lkg.id, fresh, "the newest promotion is the baseline");
+    assert_eq!(lkg.success_rate, 0.75);
+    assert!(store.lkg_benchmark("root", "real").unwrap().is_none());
+    assert!(store.lkg_benchmark("child", "fake").unwrap().is_none());
+    assert_eq!(store.benchmarks(Some("root"), 10).unwrap().len(), 3);
+}
+
 mod tempdir {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
