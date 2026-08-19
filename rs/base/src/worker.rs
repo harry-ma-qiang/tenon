@@ -19,6 +19,29 @@ pub struct Pulled {
     pub bytes: Vec<u8>,
 }
 
+/// Waits until the env's gateway is actually accepting connections. A unix
+/// gateway is a file that appears; a tcp gateway is a port that starts
+/// answering, and there is no file to watch for it.
+async fn listening(gateway: &str, deadline: tokio::time::Instant) -> Result<(), String> {
+    loop {
+        if let Some(path) = gateway.strip_prefix("unix:") {
+            if Path::new(path).exists() {
+                return Ok(());
+            }
+        } else if let Some(address) = gateway.strip_prefix("tcp:") {
+            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                return Ok(());
+            }
+        } else {
+            return Err(format!("bad gateway address {gateway}"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("gateway {gateway} never came up"));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Starts the resident worker inside an env's sandbox instance and reports
 /// back once it answers on the wire. Every step runs off the actor's task: the
 /// container exec is a blocking call and the readiness poll is a round trip
@@ -27,13 +50,13 @@ pub fn boot(
     env: String,
     instance: Arc<dyn Instance>,
     peer: Peer,
-    gateway_sock: PathBuf,
+    gateway: String,
     timeout: Duration,
     cmds: mpsc::UnboundedSender<Cmd>,
 ) {
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + timeout;
-        if let Some(error) = launch(&env, instance, &gateway_sock, deadline).await.err() {
+        if let Some(error) = launch(&env, instance, &gateway, deadline).await.err() {
             let _ = cmds.send(Cmd::WorkerReady {
                 env,
                 pid: None,
@@ -60,18 +83,26 @@ pub fn boot(
 async fn launch(
     env: &str,
     instance: Arc<dyn Instance>,
-    gateway_sock: &Path,
+    gateway: &str,
     deadline: tokio::time::Instant,
 ) -> Result<(), String> {
-    while !gateway_sock.exists() {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("gateway {} never appeared", gateway_sock.display()));
-        }
-        tokio::time::sleep(POLL).await;
+    listening(gateway, deadline).await?;
+    // A VM backend boots the worker as the guest init, which is why the wait
+    // above matters for it too: there is no second chance to connect, and the
+    // guest starts the moment the instance is told to.
+    let address = gateway.to_string();
+    let owned = instance.clone();
+    let name = env.to_string();
+    let took = tokio::task::spawn_blocking(move || owned.start_worker(&name, &address))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    if took {
+        return Ok(());
     }
     let workspace = instance.workspace_path();
     let binary = instance.binary_path();
-    let address = format!("unix:{}", gateway_sock.display());
+    let address = gateway;
     let line = format!(
         "cd {workspace} && TENON_GATEWAY={address} TENON_ENV={env} nohup {binary} worker \
          --workspace {workspace} >> {workspace}/{LOG} 2>&1 </dev/null & echo started"

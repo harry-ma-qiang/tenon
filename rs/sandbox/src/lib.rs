@@ -1,4 +1,4 @@
-mod krun;
+pub mod krun;
 mod landlock;
 mod none;
 mod oci;
@@ -41,6 +41,10 @@ pub struct Spec {
     pub caps: Vec<String>,
     pub home_hash: String,
     pub base_pid: i32,
+    /// Where a backend that needs a prepared root filesystem looks for one:
+    /// `<images>/<image>/rootfs`. Only krun reads it; oci pulls by reference
+    /// and landlock has no root of its own.
+    pub images: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,6 +75,16 @@ pub trait Instance: Send + Sync {
     fn binary_path(&self) -> String;
     fn exec(&self, cmd: &str, args: &[String], timeout: Duration) -> Result<ExecOutcome>;
     fn destroy(&self) -> Result<()>;
+
+    /// Starts the resident worker inside the instance and reports whether the
+    /// backend took the job. `false` — every backend that can `exec` into a
+    /// live instance — leaves base to run its own launch line. `true` means the
+    /// worker is the instance's init and base must not try to start it again;
+    /// a VM backend has no exec, so the boot of the guest *is* the boot of the
+    /// worker and it can only happen once the gateway is listening.
+    fn start_worker(&self, _env: &str, _gateway: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub trait Sandbox: Send + Sync {
@@ -82,6 +96,14 @@ pub trait Sandbox: Send + Sync {
     /// pid is still alive; returns the number reaped.
     fn reap(&self, _home_hash: &str, _all: bool) -> Result<usize> {
         Ok(0)
+    }
+
+    /// The gateway address this backend needs for `env`, given the address base
+    /// would use on its own (a unix socket in the env's gateway directory).
+    /// `None` keeps that default. A VM backend answers with a `tcp:` address
+    /// because a host unix socket is not a path the guest has.
+    fn gateway_address(&self, _env: &str, _default: &str) -> Option<String> {
+        None
     }
 }
 
@@ -176,6 +198,7 @@ mod tests {
             caps: vec![],
             home_hash: "deadbeef0000".to_string(),
             base_pid: std::process::id() as i32,
+            images: None,
         }
     }
 
@@ -197,7 +220,34 @@ mod tests {
 
     #[test]
     fn krun_always_names_a_reason_here() {
-        assert!(krun::probe().is_err());
+        let reason = krun::probe()
+            .err()
+            .expect("no hypervisor and no libkrun on this box");
+        assert!(reason.starts_with("krun unavailable: "), "{reason}");
+    }
+
+    #[test]
+    fn detection_reports_the_krun_reason_it_skipped_on() {
+        let detected = detect();
+        if detected.sandbox.backend() == "krun" {
+            return;
+        }
+        let skip = detected
+            .skipped
+            .iter()
+            .find(|skip| skip.backend == "krun")
+            .expect("krun is probed first, so it is either chosen or skipped with a reason");
+        assert_eq!(Some(skip.reason.clone()), krun::unavailable());
+    }
+
+    #[test]
+    fn only_a_vm_backend_moves_the_gateway_off_its_unix_socket() {
+        let default = "unix:/home/x/.tenon/run/gw-root/gateway.sock";
+        assert_eq!(NoSandbox.gateway_address("root", default), None);
+        assert_eq!(
+            krun::Krun.gateway_address("root", default),
+            Some(krun::gateway_address("root"))
+        );
     }
 
     #[test]

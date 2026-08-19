@@ -22,11 +22,12 @@ impl Base {
         }
         node.worker = WorkerState::Booting;
         let timeout = Duration::from_millis(self.config.worker.boot_timeout_ms);
+        let gateway = self.gateway_address(env);
         worker::boot(
             env.to_string(),
             instance,
             peer,
-            self.home.gateway_sock(env),
+            gateway,
             timeout,
             self.cmds.clone(),
         );

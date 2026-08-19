@@ -328,6 +328,27 @@ pub async fn sandbox_reap(home: Option<PathBuf>, all: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// Unpacks an OCI image into this home's image store. A local operation like
+/// `rollback`: it needs no base, only the home, because a root filesystem is a
+/// human's input to a boot rather than something a running system fetches.
+pub async fn image_pull(home: Option<PathBuf>, reference: &str, name: Option<&str>) -> Result<i32> {
+    let home = Home::resolve(home)?;
+    let images = home.images_dir();
+    std::fs::create_dir_all(&images)?;
+    let name = name.unwrap_or("default").to_string();
+    let reference = reference.to_string();
+    let rootfs = tokio::task::spawn_blocking(move || {
+        tenon_sandbox::krun::image::pull(&images, &reference, &name)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!(error))??;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"rootfs": rootfs.display().to_string()}))?
+    );
+    Ok(0)
+}
+
 fn line(event: &Value) -> String {
     format!(
         "{} {} {} {}",

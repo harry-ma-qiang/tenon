@@ -105,6 +105,18 @@ impl Base {
         0
     }
 
+    /// The address that env's gateway listens on and everything reaching it
+    /// dials. Base's own answer is a unix socket per env; a sandbox backend
+    /// whose guest cannot see a host socket path — krun — replaces it with a
+    /// loopback TCP address, and node A, the harness and the worker are all
+    /// handed the same string.
+    pub fn gateway_address(&self, env: &str) -> String {
+        let default = self.home.gateway_address(env);
+        self.sandbox
+            .gateway_address(env, &default)
+            .unwrap_or(default)
+    }
+
     pub(crate) fn boot(&mut self) -> Result<(), String> {
         let root = self.config.root_env.clone();
         self.emit(
@@ -148,6 +160,7 @@ impl Base {
             env,
             token.clone(),
             profile,
+            self.gateway_address(env),
             self.probes.joined(),
         );
         let running = node::spawn(

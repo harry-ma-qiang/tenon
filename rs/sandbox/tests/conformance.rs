@@ -44,6 +44,7 @@ fn check(name: &str) {
         caps: vec![],
         home_hash: home_hash.clone(),
         base_pid: std::process::id() as i32,
+        images: None,
     };
     let instance = sandbox.spawn(&spec).expect("spawn");
 
@@ -171,4 +172,67 @@ fn oci_backend_conformance() {
 #[test]
 fn landlock_backend_conformance() {
     check("landlock");
+}
+
+/// The krun conformance run, which no machine without a hypervisor can perform:
+/// it boots a real microVM. Every reason it cannot run is printed and the test
+/// passes, because a skipped backend is a fact about the host, not a failure of
+/// the code. `scripts/krun-smoke.sh` sets the two variables and runs exactly
+/// this test on a KVM or HVF machine.
+#[test]
+fn krun_backend_conformance() {
+    if let Some(reason) = tenon_sandbox::krun::unavailable() {
+        println!("skipping krun: {reason}");
+        return;
+    }
+    let Some(rootfs) = std::env::var_os("TENON_KRUN_ROOTFS").map(PathBuf::from) else {
+        println!("skipping krun: TENON_KRUN_ROOTFS unset (tenon sandbox image pull writes one)");
+        return;
+    };
+    let Some(binary) = std::env::var_os("TENON_BIN").map(PathBuf::from) else {
+        println!("skipping krun: TENON_BIN unset (the tenon binary runs `sandbox vmm`)");
+        return;
+    };
+    assert!(rootfs.is_dir(), "TENON_KRUN_ROOTFS is not a directory");
+    assert!(binary.is_file(), "TENON_BIN is not a file");
+
+    let suffix = unique_suffix();
+    let workspace = workspace("krun", suffix);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let status = tenon_sandbox::krun::smoke(&binary, &rootfs, &workspace, "conformance.txt", 512)
+        .expect("boot the smoke microVM");
+    assert_eq!(status, 0, "the guest exited {status}");
+    let seen = std::fs::read_to_string(workspace.join("conformance.txt"))
+        .expect("host cannot see what the guest wrote over virtio-fs");
+    assert!(seen.contains("hello-tenon"), "unexpected body: {seen:?}");
+
+    let spec = Spec {
+        env: format!("conf-krun-{suffix}"),
+        image: Some(rootfs.display().to_string()),
+        binary: Some(binary.clone()),
+        workspace: workspace.clone(),
+        gateway: Some(tenon_sandbox::krun::gateway_address("root")),
+        env_passthrough: vec![],
+        policy: Policy::default(),
+        caps: vec![],
+        home_hash: format!("conf{suffix:x}"),
+        base_pid: std::process::id() as i32,
+        images: None,
+    };
+    let sandbox = backend("krun").expect("the krun backend");
+    let instance = sandbox.spawn(&spec).expect("spawn");
+    assert_eq!(instance.backend(), "krun");
+    assert_eq!(instance.workspace_path(), "/workspace");
+    assert!(
+        instance.exec("sh", &[], Duration::from_secs(1)).is_err(),
+        "a microVM must not pretend to have an exec"
+    );
+    assert!(
+        instance
+            .start_worker(&spec.env, &tenon_sandbox::krun::gateway_address("root"))
+            .expect("start the worker as the guest init"),
+        "krun owns the worker launch"
+    );
+    instance.destroy().expect("destroy");
+    let _ = std::fs::remove_dir_all(&workspace);
 }

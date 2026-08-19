@@ -20,7 +20,7 @@ tenon start                      the base process
 |---|---|
 | `base` | home layout, config, UDS RPC server, the node supervisor actor, LKG, release payload |
 | `storage` | the state files: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, versioned schema, `events`, `envs`, `packs`, `snapshots`, `tool_results`, `blobs`, `episodes`, `memory_*`, `embeddings`, `approvals`, retention |
-| `sandbox` | the `Sandbox` trait plus `none`, `oci` (podman/docker) and `landlock` backends; `krun` is a P3.6 placeholder |
+| `sandbox` | the `Sandbox` trait plus the `none`, `oci` (podman/docker), `landlock` and `krun` (libkrun microVM) backends |
 | `harness` | the `tenon harness` role (P3.3): the agent loop, the llm adapter, the session log, the tools bus and the management tools, one host process per env |
 | `worker` | the `tenon worker` role (P3.2): one resident process inside the sandbox serving `bash`, `pty.*`, `fs.*` and `snap.*` over the wire |
 | `cli` | the `tenon` bin target and `build.rs`, which embeds the BEAM release |
@@ -156,9 +156,10 @@ directory looking for `kernel/src/tenon.erl`.
 under (the guardian never gets one). `auto` (the default) probes in this order and uses
 the first that works, `tenon_sandbox::detect()`:
 
-1. **krun** — a P3.6 placeholder. Always reports unavailable here: `/dev/kvm absent` on
-   this box, `krun backend arrives in P3.6` wherever `/dev/kvm` exists but the backend
-   itself is not implemented yet.
+1. **krun** — the VM backend (P3.6, below). Available only where a hypervisor *and*
+   libkrun are both present; the reason names whichever half is missing. On this box:
+   `krun unavailable: /dev/kvm absent (no hardware virtualisation on this host);
+   libkrun not found (tried libkrun.so.1, libkrun.so): ...`.
 2. **oci** — `podman` preferred, `docker` as a fallback, whichever is first found on
    `PATH`. Unavailable if neither binary exists.
 3. **landlock** — Linux 5.13+, process-level. Unavailable if the running kernel has no
@@ -235,6 +236,100 @@ crashing.
 carried through but not enforced by either real backend yet — RFC section 14, open
 question 4). Landlock has no resource-limit concept; a future P3.5 privilege-drop pass
 may pair it with cgroups for that.
+
+
+## The krun backend (P3.6)
+
+The only VM backend, and the only one whose isolation is a hardware boundary rather than a
+kernel feature. It cannot run on this dev box — an aarch64 cloud VM with no `/dev/kvm` and
+no libkrun — so everything below is written against the documented C API, compiled, unit
+tested, and left with a conformance run that skips itself here and passes on a machine that
+has a hypervisor. `scripts/krun-smoke.sh` is that run.
+
+**No build-time link dependency.** libkrun is opened with `dlopen` (`libloading`) the first
+time anything asks whether krun is available, never linked. A `tenon` binary built on a
+machine without libkrun therefore runs everywhere and simply reports the backend as
+unavailable; one built *with* libkrun present gains nothing at build time. `TENON_LIBKRUN`
+names a specific library file; otherwise `libkrun.so.1`, `libkrun.so` (Linux) or
+`libkrun.dylib`, `libkrun.1.dylib` (macOS) are tried in that order.
+
+**The API version targeted is libkrun 1.9 (`include/libkrun.h`, ABI stable across 1.x).**
+Required symbols, all resolved before the backend calls itself available:
+
+| Symbol | Used for |
+|---|---|
+| `krun_set_log_level` | libkrun's own logging, level 1 |
+| `krun_create_ctx` | one configuration context per microVM |
+| `krun_set_vm_config(ctx, vcpus, ram_mib)` | 1 vCPU and the env's `policy.ram_mb` — the hard RAM cap of RFC section 8 |
+| `krun_set_root` | the prepared root filesystem directory |
+| `krun_add_virtiofs(ctx, tag, host_path)` | the workspace, tag `/workspace`, which is also its mount point in the guest |
+| `krun_set_workdir` | `/workspace` |
+| `krun_set_env(ctx, envp)` | `TENON_GATEWAY`, `TENON_ENV`, `TENON_WORKSPACE`, `PATH`, `HOME` and whatever `TENON_SANDBOX_ENV` forwards |
+| `krun_set_exec(ctx, path, argv, NULL)` | `/usr/local/bin/tenon worker --workspace /workspace`. `envp` is `NULL` on purpose: `krun_set_env` above is the environment, and passing both would leave libkrun merging two lists |
+| `krun_start_enter` | enters the microVM. It never returns on success — libkrun takes over the process and `exit()`s it with the guest init's status |
+
+Optional, resolved if present and each worth exactly one feature when it is not:
+`krun_free_ctx`, `krun_set_port_map` (TSI inbound host→guest ports), `krun_add_vsock_port`
+(a guest vsock port bridged to a host unix socket — the fallback path described below),
+`krun_set_rlimits` (`policy.pids_max` as `RLIMIT_NPROC`, resource 6), `krun_set_console_output`
+(the guest console into `envs/<env>/krun-console.log`).
+
+**One process per microVM.** `krun_start_enter` never returns and `fork()` out of a threaded
+tokio runtime may only call async-signal-safe functions, so base re-execs *itself*:
+`tenon sandbox vmm --config <file>` is a fresh, single-threaded process that reads the JSON
+config, drives the calls above in order, and enters the VM. The pid of that process is the
+lifetime of the microVM; `destroy` sends it SIGTERM, waits 3 s, then SIGKILL, and always
+`wait`s, so no VMM is ever left as a zombie. The config file lives in `envs/<env>/krun.json`,
+outside the virtio-fs share, because the guest must not be able to read or rewrite it.
+
+**The worker is the guest init, so base does not launch it.** There is no exec into a live
+microVM: `Instance::exec` on a krun instance returns
+`krun has no exec into a live microVM: the worker is the guest init`, and `sandbox.exec`
+answers with that string. Instead `Instance::start_worker(env, gateway)` — a trait method
+whose default returns `false`, so oci and landlock keep their `sh -c` launch line — returns
+`true` here and boots the VM. Base calls it only once that env's gateway is *accepting
+connections*, which matters more for a VM than for a container: the guest gets one chance to
+connect and it starts the moment the instance is told to.
+
+**Gateway over TSI, on TCP.** The gateway is a plugin in node A, which is a host process
+under every backend; what changes under krun is that the guest has no path to a host unix
+socket. libkrun's TSI forwards the guest's socket calls to the host network stack, so the
+backend answers `Sandbox::gateway_address` with `tcp:127.0.0.1:<port>` and base hands that
+same string to node A (which listens on it — the gateway plugin has taken `tcp:host:port`
+since P3.1), to the harness, and to the worker inside the guest as `TENON_GATEWAY`. The port
+is `TENON_KRUN_GATEWAY_PORT` (default 10000) plus a stable FNV-1a offset of the env name
+inside a 512-port span, so a restarted env keeps the port its gateway already listens on. If
+a libkrun build has no TSI, `krun_add_vsock_port(port, host_unix_socket)` is the documented
+alternative — it bridges a guest vsock port straight onto the env's existing gateway socket —
+and it is resolved and wired into the VMM config (`vsock_ports`), but it needs a guest that
+dials `AF_VSOCK` and the worker does not, so the default shape leaves it empty.
+
+**Root filesystems: `tenon sandbox image pull`.** A microVM boots from a directory, not from
+an image reference, so images are unpacked ahead of time:
+
+```
+tenon sandbox image pull alpine:3.20 --name default   # -> ~/.tenon/images/default/rootfs
+```
+
+podman first, docker second (`pull`, `create`, `export -o`, `tar -x`, `rm -f` — a flattened
+export, because a VM root is a plain tree and not a layered store), and skopeo + umoci as the
+third path when neither engine is installed. The unpack goes to `<images>/.<name>.staging`
+and is renamed into place, so an interrupted pull never leaves half an image for a boot to
+find. `config.sandbox: krun` with no prepared image fails with the command that fixes it
+rather than pulling during a boot. The host's own `tenon` binary is copied into the root at
+`/usr/local/bin/tenon` on every spawn (unchanged bytes are skipped) — the VM equivalent of
+the oci backend's read-only bind mount — which means the binary and the guest root must
+agree on libc: a glibc build needs a glibc image, and `alpine` needs the musl static build
+noted under "Build".
+
+**Conformance.** `sandbox/tests/conformance.rs::krun_backend_conformance` prints the precise
+reason and passes when the backend is unavailable, when `TENON_KRUN_ROOTFS` is unset, or when
+`TENON_BIN` is unset. With all three it boots a real microVM off that root, runs one command
+in it with the workspace shared over virtio-fs, asserts the host can read what the guest
+wrote and that the guest exited 0, then spawns a full instance and asserts the shape base
+depends on: `workspace_path` is `/workspace`, `exec` refuses, `start_worker` takes the job,
+`destroy` leaves nothing running. `scripts/krun-smoke.sh [image]` prepares everything and
+runs exactly that test on a KVM or HVF host.
 
 
 ## The worker (P3.2)
@@ -1443,3 +1538,25 @@ accumulate across CI runs.
 50. **`install-service` writes and enables, but never starts.** A unit that starts base the
     moment it is installed would boot a home the human has not chosen yet, possibly beside
     a base already running from a shell. The command prints the one line to run.
+
+51. **The krun backend `dlopen`s libkrun rather than linking it.** The RFC's reuse list says
+    `libkrun-sys`, which is a build-time link dependency: it would make `tenon` unbuildable
+    on any machine without libkrun headers and unrunnable on any machine without the
+    library, for a backend that is unavailable on most of them anyway. `libloading` moves
+    the whole question to first use, where the answer is already a reason string the
+    detection prints.
+52. **A krun instance has no `exec`, and the worker is the guest init.** libkrun starts one
+    process and that process is the guest; there is no `podman exec` equivalent. So the
+    `Instance` trait grew `start_worker(env, gateway) -> bool` (default `false`, which is
+    what oci and landlock answer) and base asks the backend before running its own launch
+    line. `sandbox.exec` against a krun env returns the reason instead of an outcome.
+53. **The gateway address is a backend decision, not a home decision.** `Sandbox::gateway_address`
+    lets a backend replace base's per-env unix socket with something its guest can reach;
+    krun answers `tcp:127.0.0.1:<stable per-env port>` and node A, the harness and the
+    worker are all handed that one string. Everything else still gets the unix socket, so
+    nothing about oci or landlock changed.
+54. **`runtime.spawn` under krun is not wired.** A child env is mounted as an external fiber
+    by base dialing the *parent's* gateway, and that dial is a `UnixStream` — under a
+    tcp gateway it has nothing to connect to. Spawning children is an oci/landlock
+    capability in P3.6; teaching `envfiber` the tcp carrier is a small change and belongs
+    with the P3.7 worker/plugin work, next to the rest of the transport cleanup.

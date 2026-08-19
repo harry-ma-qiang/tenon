@@ -106,6 +106,13 @@ impl Home {
         format!("unix:{}", self.gateway_sock(env).display())
     }
 
+    /// Prepared root filesystems, one directory per image name, shared by every
+    /// env: `tenon sandbox image pull` writes them and the krun backend reads
+    /// them. Nothing here is per-env, so nothing here is agent-writable.
+    pub fn images_dir(&self) -> PathBuf {
+        self.root.join("images")
+    }
+
     pub fn sock(&self) -> PathBuf {
         self.run().join("base.sock")
     }

@@ -134,6 +134,30 @@ enum SandboxCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Unpack an OCI image into <home>/images/<name>/rootfs, the root
+    /// filesystem a microVM boots from. podman, docker or skopeo + umoci.
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
+    /// One microVM, in its own process: the krun backend re-execs this.
+    /// libkrun takes over the process and exits it with the guest's status.
+    Vmm {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageCommand {
+    /// Pull and unpack an image reference, e.g. `alpine:3.20`
+    Pull {
+        /// The image reference an engine can resolve
+        reference: String,
+        /// The name it is stored and referred to under; defaults to `default`
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
 }
 
 fn main() {
@@ -168,6 +192,9 @@ fn run() -> Result<i32> {
             argv.extend(args);
             Ok(tenon_worker::run(&argv))
         }
+        Command::Sandbox {
+            command: SandboxCommand::Vmm { config },
+        } => tenon_sandbox::krun::vmm::main(&tenon_sandbox::krun::vmm::read(&config)?),
         command => runtime()?.block_on(dispatch(cli.home, command)),
     }
 }
@@ -231,6 +258,10 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
         }
         Command::Sandbox { command } => match command {
             SandboxCommand::Reap { all } => tenon_base::sandbox_reap(home, all).await,
+            SandboxCommand::Image {
+                command: ImageCommand::Pull { reference, name },
+            } => tenon_base::image_pull(home, &reference, name.as_deref()).await,
+            SandboxCommand::Vmm { .. } => unreachable!("handled before"),
         },
         Command::Harness { .. } | Command::Worker { .. } => unreachable!("handled before"),
     }

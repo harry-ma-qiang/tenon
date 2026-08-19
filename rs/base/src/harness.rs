@@ -46,6 +46,7 @@ pub fn spawn(
     home: &Home,
     env: &str,
     config: &Value,
+    gateway: &str,
     runtime_token: &str,
     privilege: &crate::privilege::Plan,
     generation: u64,
@@ -67,7 +68,7 @@ pub fn spawn(
         .env("TENON_ENV", env)
         .env("TENON_HOME", &home.root)
         .env("TENON_BASE_SOCK", home.sock())
-        .env("TENON_GATEWAY", home.gateway_address(env))
+        .env("TENON_GATEWAY", gateway)
         .env("TENON_HARNESS_CONFIG", config.to_string())
         .env("TENON_RUNTIME_TOKEN", runtime_token);
     if let Some(name) = config
@@ -162,6 +163,7 @@ impl Base {
             }
         };
         let generation = self.nodes.get(env).map(|node| node.generation).unwrap_or(0);
+        let gateway = self.gateway_address(env);
         let Some(node) = self.nodes.get_mut(env) else {
             return;
         };
@@ -175,6 +177,7 @@ impl Base {
             &self.home,
             env,
             &config,
+            &gateway,
             &runtime_token,
             &self.privilege,
             generation,
