@@ -190,7 +190,10 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             })
             .await
         }
-        "reset" => ask(cmds, |reply| Cmd::Reset { env, reply }).await,
+        "reset" => {
+            let probes = strings(body, "probes");
+            ask(cmds, |reply| Cmd::Reset { env, probes, reply }).await
+        }
         "runtime.spawn" => {
             let parent = body
                 .get("parent")
@@ -405,6 +408,17 @@ where
     let (tx, rx) = oneshot::channel();
     cmds.send(build(tx)).map_err(|_| "base_gone".to_string())?;
     rx.await.map_err(|_| "base_gone".to_string())?
+}
+
+fn strings(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn string(body: &Value, key: &str, fallback: &str) -> String {

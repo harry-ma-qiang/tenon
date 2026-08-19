@@ -12,7 +12,11 @@ defmodule Tenon.Beam.Test.Base do
     {pid, path}
   end
 
-  @spec answer(pid(), String.t(), {:ok, term()} | {:error, term()}) :: :ok
+  @spec answer(
+          pid(),
+          String.t() | {String.t(), String.t()},
+          {:ok, term()} | {:error, term()} | :ignore
+        ) :: :ok
   def answer(pid, method, reply), do: GenServer.call(pid, {:answer, method, reply})
 
   @spec push(pid(), map()) :: :ok
@@ -70,8 +74,9 @@ defmodule Tenon.Beam.Test.Base do
     send(server, {:accepted, socket})
   end
 
-  defp reply(%{"t" => method, "id" => id}, state) do
-    case Map.fetch(state.answers, method) do
+  defp reply(%{"t" => method, "id" => id} = frame, state) do
+    case fetch(state.answers, method, Map.get(frame, "name")) do
+      {:ok, :ignore} -> state
       {:ok, {:ok, result}} -> push_now(state, %{"t" => "rep", "id" => id, "result" => result})
       {:ok, {:error, error}} -> push_now(state, %{"t" => "rep", "id" => id, "error" => error})
       :error -> state
@@ -79,6 +84,15 @@ defmodule Tenon.Beam.Test.Base do
   end
 
   defp reply(_frame, state), do: state
+
+  defp fetch(answers, method, nil), do: Map.fetch(answers, method)
+
+  defp fetch(answers, method, name) do
+    case Map.fetch(answers, {method, name}) do
+      :error -> Map.fetch(answers, method)
+      found -> found
+    end
+  end
 
   defp push_now(state, frame) do
     :gen_tcp.send(state.socket, Frame.encode(frame))

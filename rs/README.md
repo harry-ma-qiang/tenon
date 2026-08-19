@@ -68,6 +68,7 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `state.sqlite` | the host state file, one writer: base |
 | `profiles/root/tenon.yml` | the default profile: one demo external plugin |
 | `profiles/root/registry.yml` | the `name => spec` rows the loader resolves against |
+| `probes/` | extra guardian probe executables; only the ones `probes.extra` lists with a matching sha256 are ever run |
 | `profiles/guardian/` | an empty entry list; G mounts only barebone plugins |
 | `erts/<version>-<sha>/` | the extracted BEAM release, read-only to base and to the nodes |
 | `run/base.sock` | the front door |
@@ -124,6 +125,9 @@ sandbox: auto              # auto | oci | landlock | none
 guardian:
   interval_ms: 2000
   failures: 6
+  probe_timeout_ms: 5000   # a probe call slower than this is a wedge
+probes:
+  extra: []                # [{file, sha256}] under <home>/probes/
 worker:
   boot_timeout_ms: 30000   # from "sandbox up" to the worker answering on the wire
   pull_interval_ms: 5000   # how often base pulls new snapshot packs off each worker
@@ -637,6 +641,53 @@ budget_reset_on_reset: true
 budget_tick_ms: 5000
 ```
 
+## Guardian probes (P3.5)
+
+RFC section 5.2's watch, as a fixed set of probes in the guardian node plus the extra ones
+base approved. The guardian owns no process and performs no reset: every probe is a frame
+to base, and the verdict it can act on is one more frame, `reset{env, probes}`.
+
+| Probe | What it asks | Fails when |
+|---|---|---|
+| `base` | `status` | base does not answer; the row it answers with is what the next three read |
+| `env` | `health{env}` | the env's node does not answer `{ok: true}` |
+| `tree` | `tree{env}` | the kernel tree is missing or its root fiber is not `active` |
+| `worker` | `svc worker.ping` | base says that env's worker is `ready` and it does not answer `pong`, or base says `failed` |
+| `harness` | `svc loop.ping` | the same for the harness's `loop` service |
+| `wedged` | — | any probe call above took `probe_timeout_ms` or longer |
+| `budgets` | the `base` row | that env's `budget.halted` is set |
+| `violations` | `events.tail{env, after}` | a new event of kind `violation` or `budget.exceeded` is in that env's log |
+
+- **A booting env is not a failing env.** The worker and harness probes read base's own
+  view of the lifecycle first: `off` and `booting` owe no answer, `ready` owes a `pong`,
+  `failed` is a failure. That is what keeps the guardian from resetting an env during the
+  ten seconds its container takes to come up.
+- **Violations are counted once.** The probe carries the id of the newest event it has
+  seen and asks for what came after it, so one `budget.exceeded` row is one failing pass
+  rather than a permanent one.
+- `guardian.failures` consecutive passes with at least one failing probe (default 6) send
+  `reset{env, probes}`; base emits **`guardian.reset`** with those names into that env's
+  log before performing the reset. A pass with no failures clears the count.
+- `guardian.probe_timeout_ms` (default 5000) is both the deadline of every probe call —
+  the `link` service takes it per request now — and the line above which a call is a wedge.
+
+**Extra probes are signed by being in base's config.** A probe plugin is an executable in
+`<home>/probes/`, run with the env name as its only argument; a non-zero exit is a failing
+probe named after the file. Base checks every entry of `probes.extra` before the guardian
+node is started and passes only the survivors in `TENON_GUARDIAN_PROBES`:
+
+```yaml
+probes:
+  extra:
+    - file: disk.sh          # a plain name; no path, no ..
+      sha256: 9f86d0818...   # must match the file, which must be executable
+```
+
+Anything else is a `probes.rejected` event naming the file and the reason (`sha256 is X,
+the config says Y`, `is not executable`, `does not exist`, `no sha256 in the config`), and
+the guardian never learns about it. Humans edit base's config; agents cannot, without a
+gated `config.patch{target: "base"}`. Accepted probes are one `probes.loaded` event.
+
 ## The runtime contract (P3.5)
 
 RFC section 2's last row, as an RPC. A runtime is one environment's world — node A, its
@@ -731,7 +782,7 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `health{env}` | guardian, CLI | forwarded to that env's node |
 | `tree{env}` | CLI | forwarded; the node's kernel tree |
 | `reload{env}` | CLI | forwarded; `Tenon.Loader.reload/1` in that node |
-| `reset{env}` | guardian, CLI | kill, restore LKG, restart. Refused for `guardian` |
+| `reset{env,probes?}` | guardian, CLI | kill, restore LKG, restart. Refused for `guardian`. `probes` are the guardian's failing probe names and are logged as `guardian.reset` first |
 | `svc{env,name,method,args}` | CLI | forwarded to that env's node as a `svc` frame; the node proxies it to `:tenon.svc/4` against its own kernel root ctx and answers with the plugin's result or error |
 | `sandbox.exec{env,cmd,args,timeout}` | CLI | run `cmd args..` inside that env's sandbox instance (`timeout` ms, default 30000); answers `{status,stdout,stderr,timed_out}`. A test aid — the worker's tool surface is the agent-facing path |
 | `snap.pull{env}` | CLI | ask that env's worker for everything committed since the last stored pack and store it; answers `{step, ref, bytes, pulled}`. Runs on a timer too |
@@ -742,7 +793,7 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `plugin{env,op,plugin_id?,spec?}` | harness, CLI | forwarded to that env's node: `list`, `mount` (a `{module}` or `{cmd,args,env}` spec), `unmount`, `restart`. The fiber's id travels as `plugin_id` because `id` is the frame's own correlation id |
 | `session.create{env}` / `session.prompt{env,session_id,text}` (both refused while that env is halted or the kill switch is on) / `session.status` / `session.history` / `session.resume` | CLI | forwarded to that env's harness as `svc{name: "loop"}`; how `tenon run` drives the agent |
 | `events.append{env,kind,data}` | harness | one row in `state-<env>.sqlite`'s `events`, fanned out to every subscriber as an `{"t":"event","scope":"env"}` frame. Base is that file's only writer |
-| `events.tail{env,after?,limit?}` | harness, CLI | that env's session log from `after` on |
+| `events.tail{env,after?,limit?}` | harness, CLI | that env's session log from `after` on; `env: "base"` reads the barebone's own log (boot, LKG, probes, sandbox) instead |
 | `episodes.append{env,session_id,step,action,verifier_score?,cost,user_event?,state_hash?}` | harness | one `episodes` row; the state hash is computed here from the newest snapshot ref and `user_event` unless one is given |
 | `episodes.tail{env,n?}` | CLI, plugins | the newest `n` episodes (default 200, capped at 5000), oldest first |
 | `tool_results.append{env,event_id,name,status,duration_ms,blob_hash?}` | harness | one `tool_results` row against a `tool/result` event |

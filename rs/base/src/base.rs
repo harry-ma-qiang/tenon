@@ -34,6 +34,7 @@ pub struct Base {
     pub pending: BTreeMap<i64, crate::approvals::Pending>,
     pub killed: Option<String>,
     pub runtimes: BTreeMap<String, crate::runtime::Runtime>,
+    pub probes: crate::probes::Approved,
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -73,6 +74,7 @@ impl Base {
             pending: BTreeMap::new(),
             killed: None,
             runtimes: BTreeMap::new(),
+            probes: crate::probes::Approved::default(),
         }
     }
 
@@ -108,6 +110,7 @@ impl Base {
             None,
             json!({"release": self.release, "sandbox": self.sandbox.backend()}),
         );
+        self.load_probes();
         self.start(GUARDIAN, GUARDIAN, None)?;
         self.start("agent", &root, None)
     }
@@ -134,7 +137,15 @@ impl Base {
         self.home
             .prepare_env(env)
             .map_err(|error| error.to_string())?;
-        let spec = node::spec(&self.config, &self.home, role, env, token.clone(), profile);
+        let spec = node::spec(
+            &self.config,
+            &self.home,
+            role,
+            env,
+            token.clone(),
+            profile,
+            self.probes.joined(),
+        );
         let running = node::spawn(
             &spec,
             &self.config,

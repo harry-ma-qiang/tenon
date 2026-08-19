@@ -16,6 +16,7 @@ pub struct Spec {
     pub sock: PathBuf,
     pub target: String,
     pub token: String,
+    pub probes: String,
 }
 
 pub struct Running {
@@ -30,6 +31,7 @@ pub struct Exit {
     pub code: Option<i32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spec(
     config: &Config,
     home: &Home,
@@ -37,6 +39,7 @@ pub fn spec(
     env: &str,
     token: String,
     profile: String,
+    probes: String,
 ) -> Spec {
     Spec {
         role: role.to_string(),
@@ -45,6 +48,7 @@ pub fn spec(
         sock: home.sock(),
         target: config.root_env.clone(),
         token,
+        probes,
     }
 }
 
@@ -80,6 +84,11 @@ pub fn spawn(
             "TENON_GUARDIAN_FAILURES",
             config.guardian.failures.to_string(),
         )
+        .env(
+            "TENON_GUARDIAN_PROBE_TIMEOUT_MS",
+            config.guardian.probe_timeout_ms.to_string(),
+        )
+        .env("TENON_GUARDIAN_PROBES", &spec.probes)
         .env("TENON_NODE_TOKEN", &spec.token)
         .env("RELEASE_TMP", home.run());
     if spec.role != GUARDIAN {

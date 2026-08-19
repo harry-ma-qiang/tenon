@@ -30,7 +30,9 @@ belong to the barebone and must not be reachable by an agent editing the profile
 | `TENON_PROFILE` | path of the profile entry list; `registry.yml` next to it supplies the `name => spec` rows |
 | `TENON_GUARDIAN_TARGET` | guardian only, the env to watch (default `root`) |
 | `TENON_GUARDIAN_INTERVAL_MS` | guardian only, probe interval (default 2000) |
-| `TENON_GUARDIAN_FAILURES` | guardian only, consecutive failures before `reset` (default 6) |
+| `TENON_GUARDIAN_FAILURES` | guardian only, consecutive failing passes before `reset` (default 6) |
+| `TENON_GUARDIAN_PROBE_TIMEOUT_MS` | guardian only, deadline of one probe call and the line above which it counts as wedged (default 5000) |
+| `TENON_GUARDIAN_PROBES` | guardian only, `:`-separated paths of the extra probe executables base approved |
 | `TENON_GATEWAY` | agent only, listen address: `unix:<path>` or `tcp:<host>:<port>` (default `unix:<TENON_HOME or ~/.tenon>/run/gateway-<TENON_ENV>.sock`) |
 
 `rel/env.sh.eex` sets `RELEASE_DISTRIBUTION=none` (no distribution, no epmd, no cookie) and
@@ -87,11 +89,26 @@ tests use them, base never sets them.
 ## Guardian
 
 `Tenon.Beam.Guardian` injects `link`, so it stays `pending` until `Link` is active. Every
-`interval` it asks base `health{env: target}`. Anything other than `{"ok": true}` — an
-error reply, a timeout, an unhealthy answer — is a strike; a good answer clears the count.
-At `failures` strikes it sends `reset{env: target}` to base and starts over. It is mounted
-only in the guardian node, and base is what actually performs the reset: the guardian never
-touches an OS process.
+`interval` it runs one pass of `Tenon.Beam.Guardian.Probes` against `target`; a pass with
+at least one failing probe is a strike, a clean pass clears the count, and at `failures`
+strikes it sends `reset{env: target, probes: [names]}` to base and starts over. It is
+mounted only in the guardian node, and base is what actually performs the reset: the
+guardian never touches an OS process.
+
+The core set is fixed, in this order: `base` (base's own `status`, whose row for the target
+env the next probes read), `env` (`health`), `tree` (the kernel tree's root fiber is
+`active`), `worker` (`svc worker.ping`), `harness` (`svc loop.ping`), `budgets` (that env's
+`budget.halted`) and `violations` (new `violation` / `budget.exceeded` rows in its log,
+counted once by carrying the newest event id). Any probe call that reaches
+`probe_timeout` also fails as `wedged`; `probe_timeout` is passed to `Link.request/4` as
+the per-call deadline, so a wedged base cannot hold a probe pass for the 15 s the ordinary
+`link` timeout allows. The worker and harness probes ask for a `pong` only when base's
+status says that piece is `ready` — an env that is still booting owes no answer.
+
+Extra probes are executables base approved (`TENON_GUARDIAN_PROBES`), run with the env name
+as their only argument under the same timeout; a non-zero exit is a failing probe named
+after the file. Which files those are is base's decision (sha256 in base's config), never
+the guardian's.
 
 ## Gateway
 
@@ -114,11 +131,17 @@ mix compile --warnings-as-errors && mix format --check-formatted
 mix credo --strict && mix test && MIX_ENV=prod mix release
 ```
 
-18 tests. `test/link_test.exs` (9) covers register, `health`, `tree`, `reload`, the unknown
+32 tests. `test/link_test.exs` (9) covers register, `health`, `tree`, `reload`, the unknown
 method, request correlation in both outcomes, the node-stop on close, and the failed load
-without a socket. `test/guardian_test.exs` (5) covers the quiet path, the reset after N
-failures, an unhealthy answer counting as a failure, recovery clearing the count, and the
-target name; both run against `Tenon.Beam.Test.Base`, a fake base on a real unix socket.
+without a socket. `test/guardian_test.exs` (15) covers one test per probe kind — base not answering, an
+unhealthy env, a root fiber that is not active, a worker and a harness that do not answer
+`ping`, a booting worker that is deliberately not a failure, a worker base reports as
+failed, a halted budget, a violation row counted once, a call that outlives
+`probe_timeout` failing as `wedged`, and an extra probe that exits non-zero while its
+approved sibling passes — plus the quiet path, the reset after N failing passes carrying
+the probe names, recovery clearing the count, and the target name. Both run against
+`Tenon.Beam.Test.Base`, a fake base on a real unix socket that answers per method (and per
+service name for `svc`, so the worker and harness probes can be failed separately).
 `test/gateway_test.exs` (4) starts a kernel and a gateway on a temp UDS path and connects
 fake clients directly (no base needed): a `:tenon.svc` call reaches a connected client,
 disconnecting fails that client's fiber and drops its service, a second client gets its own

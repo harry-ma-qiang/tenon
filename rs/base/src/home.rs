@@ -56,6 +56,13 @@ impl Home {
         self.root.join("run")
     }
 
+    /// Where an extra guardian probe must live to be loadable at all; base
+    /// checks each one against the sha256 in its own config before the
+    /// guardian node is told about it.
+    pub fn probes_dir(&self) -> PathBuf {
+        self.root.join("probes")
+    }
+
     pub fn envs_dir(&self) -> PathBuf {
         self.root.join("envs")
     }
@@ -145,6 +152,7 @@ impl Home {
             self.erts(),
             self.run(),
             self.lkg(),
+            self.probes_dir(),
         ] {
             std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }

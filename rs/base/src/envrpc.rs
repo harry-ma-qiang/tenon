@@ -66,12 +66,20 @@ impl Base {
         }
     }
 
+    /// `env: "base"` reads the barebone's own log instead of an env's: boot,
+    /// LKG, probe and sandbox facts are base-wide and belong to no env.
     pub fn events_tail(&self, env: &str, after: i64, limit: i64) -> Answer {
-        let Some(node) = self.nodes.get(env) else {
-            return Err(format!("unknown env {env}"));
-        };
-        let Some(store) = node.store.as_ref() else {
-            return Err(format!("env {env} has no state file"));
+        let store = match env {
+            "base" => &self.store,
+            _ => {
+                let Some(node) = self.nodes.get(env) else {
+                    return Err(format!("unknown env {env}"));
+                };
+                let Some(store) = node.store.as_ref() else {
+                    return Err(format!("env {env} has no state file"));
+                };
+                store
+            }
         };
         let events = store
             .events_since(after, limit.clamp(1, 20_000))

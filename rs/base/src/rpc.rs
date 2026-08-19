@@ -25,6 +25,7 @@ pub enum Cmd {
     },
     Reset {
         env: String,
+        probes: Vec<String>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     SandboxExec {
