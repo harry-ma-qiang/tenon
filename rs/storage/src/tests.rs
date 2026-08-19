@@ -444,6 +444,58 @@ fn one_lkg_benchmark_row_per_env_and_label() {
     assert_eq!(store.benchmarks(Some("root"), 10).unwrap().len(), 3);
 }
 
+#[test]
+fn envelopes_batch_dedups_and_replays_by_offset() {
+    let (_dir, store) = store();
+    let rows = vec![
+        crate::EnvelopeRow {
+            event_id: "e1",
+            topic: "session/a",
+            env: Some("root"),
+            ts: 1,
+            body: "{\"n\":1}",
+        },
+        crate::EnvelopeRow {
+            event_id: "e2",
+            topic: "session/b",
+            env: Some("root"),
+            ts: 2,
+            body: "{\"n\":2}",
+        },
+    ];
+    let offsets = store.append_envelopes(&rows).unwrap();
+    assert_eq!(offsets, vec![1, 2]);
+    assert_eq!(store.envelopes_head().unwrap(), 2);
+    let dup = store.append_envelopes(&rows[0..1]).unwrap();
+    assert_eq!(dup, vec![1], "duplicate event_id keeps its offset");
+    assert_eq!(store.envelope_count().unwrap(), 2);
+    let since = store.envelopes_since(1, Some("root"), 10).unwrap();
+    assert_eq!(since.len(), 1);
+    assert_eq!(since[0].0, 2);
+}
+
+#[test]
+fn kv_rows_are_env_scoped_with_prefix_range_and_lease() {
+    let (_dir, store) = store();
+    store.kv_set("a", "/x/1", b"one", 1, None, None).unwrap();
+    store
+        .kv_set("a", "/x/2", b"two", 2, Some(50), Some("L1"))
+        .unwrap();
+    store.kv_set("b", "/x/1", b"other", 3, None, None).unwrap();
+    assert_eq!(store.kv_get("a", "/x/1").unwrap().unwrap().value, b"one");
+    assert!(store.kv_get("a", "/x/9").unwrap().is_none());
+    assert_eq!(store.kv_range("a", "/x/").unwrap().len(), 2);
+    assert_eq!(store.kv_range("b", "/x/").unwrap().len(), 1);
+    assert_eq!(
+        store.kv_by_lease("L1").unwrap(),
+        vec![("a".into(), "/x/2".into())]
+    );
+    assert_eq!(store.kv_expired(100).unwrap().len(), 1);
+    assert_eq!(store.kv_max_rev().unwrap(), 3);
+    assert!(store.kv_del("a", "/x/1").unwrap());
+    assert_eq!(store.kv_range("a", "/x/").unwrap().len(), 1);
+}
+
 mod tempdir {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
