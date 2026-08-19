@@ -1,6 +1,8 @@
 use crate::base::Base;
+use crate::params::{i64_or, parse, text};
 use crate::rpc::Cmd;
 use base64::Engine;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -243,20 +245,12 @@ impl Base {
     /// step is answering are what identify the state the step started from.
     fn episodes_append(&mut self, env: &str, params: &Value) -> Answer {
         let store = self.store_of(env)?;
-        let session = text(params, "session_id");
-        if session.is_empty() {
+        let row: Episode = parse(params)?;
+        if row.session_id.is_empty() {
             return Err("episodes.append needs a session_id".to_string());
         }
-        let step = params.get("step").and_then(Value::as_i64).unwrap_or(0);
-        let action = params.get("action").cloned().unwrap_or(Value::Null);
-        let cost = params.get("cost").cloned().unwrap_or_else(|| json!({}));
-        let score = params.get("verifier_score").and_then(Value::as_f64);
-        let user_event = params
-            .get("user_event")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let hash = match params.get("state_hash").and_then(Value::as_str) {
-            Some(given) => given.to_string(),
+        let hash = match row.state_hash {
+            Some(given) => given,
             None => {
                 let head = store
                     .head_snapshot()
@@ -264,13 +258,20 @@ impl Base {
                     .flatten()
                     .map(|row| row.reference)
                     .unwrap_or_default();
-                state_hash(&head, user_event)
+                state_hash(&head, row.user_event)
             }
         };
         let id = store
-            .put_episode(&session, step, &hash, &action, score, &cost)
+            .put_episode(
+                &row.session_id,
+                row.step,
+                &hash,
+                &row.action,
+                row.verifier_score,
+                &row.cost,
+            )
             .map_err(|error| error.to_string())?;
-        Ok(json!({"id": id, "state_hash": hash, "step": step}))
+        Ok(json!({"id": id, "state_hash": hash, "step": row.step}))
     }
 
     fn episodes_tail(&self, env: &str, params: &Value) -> Answer {
@@ -284,19 +285,19 @@ impl Base {
 
     fn tool_result_append(&mut self, env: &str, params: &Value) -> Answer {
         let store = self.store_of(env)?;
-        let event_id = params.get("event_id").and_then(Value::as_i64).unwrap_or(0);
-        let name = text(params, "name");
-        let status = match text(params, "status").as_str() {
-            "" => "ok".to_string(),
-            given => given.to_string(),
+        let row: ToolResult = parse(params)?;
+        let status = match row.status.is_empty() {
+            true => "ok".to_string(),
+            false => row.status,
         };
-        let duration = params
-            .get("duration_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let hash = params.get("blob_hash").and_then(Value::as_str);
         let id = store
-            .put_tool_result(event_id, &name, &status, duration, hash)
+            .put_tool_result(
+                row.event_id,
+                &row.name,
+                &status,
+                row.duration_ms,
+                row.blob_hash.as_deref(),
+            )
             .map_err(|error| error.to_string())?;
         Ok(json!({"id": id}))
     }
@@ -330,7 +331,7 @@ impl Base {
         let Some(row) = store.blob(&hash).map_err(|error| error.to_string())? else {
             return Err(format!("unknown blob {hash}"));
         };
-        let offset = params.get("offset").and_then(Value::as_i64).unwrap_or(0);
+        let offset = i64_or(params, "offset", 0);
         let len = params.get("len").and_then(Value::as_i64);
         let bytes = match len {
             Some(len) => store
@@ -452,12 +453,41 @@ fn limit(params: &Value) -> i64 {
         .clamp(1, TAIL_MAX)
 }
 
-fn text(params: &Value, key: &str) -> String {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+fn empty_object() -> Value {
+    json!({})
+}
+
+/// One step of an env's loop, as `episodes.append` carries it.
+#[derive(Deserialize)]
+struct Episode {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    step: i64,
+    #[serde(default)]
+    action: Value,
+    #[serde(default = "empty_object")]
+    cost: Value,
+    #[serde(default)]
+    verifier_score: Option<f64>,
+    #[serde(default)]
+    user_event: i64,
+    #[serde(default)]
+    state_hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ToolResult {
+    #[serde(default)]
+    event_id: i64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    duration_ms: i64,
+    #[serde(default)]
+    blob_hash: Option<String>,
 }
 
 fn value<T: serde::Serialize>(row: &T) -> Option<Value> {

@@ -46,12 +46,7 @@ impl Runtime {
 }
 
 fn field(object: &Value, key: &str, name: &str) -> Result<String, String> {
-    let value = object
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let value = crate::params::text(object, key).trim().to_string();
     match value.is_empty() {
         true => Err(format!("runtime contract: {name}.{key} is required")),
         false => Ok(value),

@@ -24,7 +24,7 @@ pub async fn task(
     };
     events.call("subscribe", scope.clone()).await?;
     let created = calls.call("session.create", scope.clone()).await?;
-    let Some(session) = created.get("session_id").and_then(Value::as_str) else {
+    let Some(session) = crate::params::str_of(&created, "session_id") else {
         bail!("the harness answered session.create with {created}");
     };
     let session = session.to_string();

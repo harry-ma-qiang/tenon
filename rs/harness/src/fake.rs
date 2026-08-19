@@ -102,10 +102,7 @@ async fn handle(
         )
         .await;
     }
-    let stream_mode = request
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let stream_mode = tenon_base::params::bool_or(&request, "stream", false);
     match stream_mode {
         true => sse(&mut stream, &say).await,
         false => json_reply(&mut stream, 200, &whole(&say)).await,

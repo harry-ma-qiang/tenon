@@ -2,6 +2,7 @@ use crate::bus::{Answer, Bus, Gate};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use tenon_base::params;
 
 pub const MANAGE: &str = "manage";
 const RESULT_CHARS: usize = 8_000;
@@ -180,10 +181,8 @@ impl Tools {
             Ok(Value::Array(items)) => items.into_iter().next().unwrap_or(request),
             Ok(Value::Object(map)) => {
                 let deny = Value::Object(map);
-                let reason = deny
-                    .get("deny")
-                    .and_then(Value::as_str)
-                    .or_else(|| deny.get("reason").and_then(Value::as_str))
+                let reason = params::str_of(&deny, "deny")
+                    .or_else(|| params::str_of(&deny, "reason"))
                     .unwrap_or("denied")
                     .to_string();
                 return Outcome {
@@ -226,13 +225,13 @@ impl Tools {
         let params = args.first().cloned().unwrap_or(Value::Null);
         match method {
             "register" => {
-                let name = string(&params, "name");
+                let name = params::text(&params, "name");
                 if name.is_empty() {
                     return Err("tools.register needs a name".to_string());
                 }
                 let target = params.get("target").cloned().unwrap_or(Value::Null);
-                let service = string(&target, "service");
-                let method = string(&target, "method");
+                let service = params::text(&target, "service");
+                let method = params::text(&target, "method");
                 if service.is_empty() || method.is_empty() {
                     return Err("tools.register needs target {service, method}".to_string());
                 }
@@ -245,18 +244,14 @@ impl Tools {
                     schema,
                     service,
                     method,
-                    owner: params
-                        .get("owner")
-                        .and_then(Value::as_str)
-                        .unwrap_or("plugin")
-                        .to_string(),
-                    priority: params.get("priority").and_then(Value::as_i64).unwrap_or(0),
+                    owner: params::text_or(&params, "owner", "plugin"),
+                    priority: params::i64_or(&params, "priority", 0),
                 }))
             }
-            "unregister" => Ok(json!({"ok": self.unregister(&string(&params, "name"))})),
+            "unregister" => Ok(json!({"ok": self.unregister(&params::text(&params, "name"))})),
             "list" => Ok(self.list()),
             "execute" => {
-                let name = string(&params, "name");
+                let name = params::text(&params, "name");
                 let args = params.get("args").cloned().unwrap_or(json!({}));
                 let call_id = params
                     .get("callId")
@@ -267,14 +262,6 @@ impl Tools {
             other => Err(format!("unknown method {other}")),
         }
     }
-}
-
-fn string(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {

@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
 use tenon_base::client::Client;
+use tenon_base::params::{array, i64_or, str_of, text, value};
 use tokio::sync::Mutex;
 
 /// Nothing base answers should take this long; a call that does is a wedge,
@@ -117,15 +118,12 @@ impl Gate for ApiGate {
                     json!({"reason": reason, "kind": "tool"}),
                 )
                 .await?;
-            let status = answer
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("denied");
+            let status = str_of(&answer, "status").unwrap_or("denied");
             match status {
                 "approved" => Ok(()),
                 other => Err(format!(
                     "tool {name} needs a human and the approval is {other}: {}",
-                    answer.get("reason").and_then(Value::as_str).unwrap_or("")
+                    str_of(&answer, "reason").unwrap_or("")
                 )),
             }
         })
@@ -229,23 +227,13 @@ impl Log for BaseLog {
 }
 
 pub fn rows(answer: &Value) -> Vec<Event> {
-    answer
-        .get("events")
-        .and_then(Value::as_array)
-        .map(|events| {
-            events
-                .iter()
-                .map(|row| Event {
-                    id: row.get("id").and_then(Value::as_i64).unwrap_or(0),
-                    at: row.get("at").and_then(Value::as_i64).unwrap_or(0),
-                    kind: row
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    data: row.get("data").cloned().unwrap_or(Value::Null),
-                })
-                .collect()
+    array(answer, "events")
+        .iter()
+        .map(|row| Event {
+            id: i64_or(row, "id", 0),
+            at: i64_or(row, "at", 0),
+            kind: text(row, "kind"),
+            data: value(row, "data"),
         })
-        .unwrap_or_default()
+        .collect()
 }

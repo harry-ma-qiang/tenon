@@ -1,6 +1,7 @@
 use crate::bus::Answer;
 use serde_json::{json, Value};
 use std::sync::Mutex;
+use tenon_base::params::{i64_or, str_of, text, u64_or};
 
 const EXTEND: &str = "\
 How to extend Tenon. You are running inside a Tenon environment and may change it while \
@@ -106,13 +107,13 @@ impl Prompt {
                 if name.is_empty() {
                     return Err("prompt.register needs a name".to_string());
                 }
-                let order = params.get("order").and_then(Value::as_i64).unwrap_or(0);
+                let order = i64_or(&params, "order", 0);
                 let id = self.register(&name, order, &text(&params, "text"));
                 Ok(json!({"ok": true, "id": id, "name": name}))
             }
             "unregister" => {
-                let id = params.get("id").and_then(Value::as_u64).unwrap_or(0);
-                let name = params.get("name").and_then(Value::as_str);
+                let id = u64_or(&params, "id", 0);
+                let name = str_of(&params, "name");
                 Ok(json!({"ok": self.unregister(id, name)}))
             }
             "list" => Ok(self.list()),
@@ -120,12 +121,4 @@ impl Prompt {
             other => Err(format!("unknown method {other}")),
         }
     }
-}
-
-fn text(params: &Value, key: &str) -> String {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
