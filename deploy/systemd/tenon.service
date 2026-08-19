@@ -1,0 +1,18 @@
+[Unit]
+Description=Tenon barebone (base, guardian node G, root environment)
+Documentation=https://github.com/harry-ma-qiang/tenon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=@TENON_BIN@ start --foreground --home @TENON_HOME@
+Environment=TENON_HOME=@TENON_HOME@
+Restart=always
+RestartSec=2
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+WorkingDirectory=@TENON_HOME@
+
+[Install]
+WantedBy=default.target

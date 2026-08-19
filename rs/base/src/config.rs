@@ -120,6 +120,10 @@ pub struct Config {
     pub max_restarts: u32,
     #[serde(default = "sandbox")]
     pub sandbox: String,
+    /// The OS user an env's host-side processes run as, when base may change
+    /// uid at all. `none` (the default) keeps them base's own user.
+    #[serde(default = "env_user")]
+    pub env_user: String,
     #[serde(default)]
     pub guardian: Guardian,
     #[serde(default)]
@@ -164,6 +168,10 @@ fn max_restarts() -> u32 {
 
 fn sandbox() -> String {
     "auto".to_string()
+}
+
+fn env_user() -> String {
+    crate::privilege::NONE.to_string()
 }
 
 fn worker_boot_timeout_ms() -> u64 {
@@ -301,6 +309,7 @@ impl Default for Config {
             request_timeout_ms: request_timeout_ms(),
             max_restarts: max_restarts(),
             sandbox: sandbox(),
+            env_user: env_user(),
             guardian: Guardian::default(),
             probes: Probes::default(),
             worker: Worker::default(),

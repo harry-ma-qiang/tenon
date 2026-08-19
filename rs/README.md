@@ -123,6 +123,7 @@ stop_grace_ms: 5000       # SIGTERM, then SIGKILL, per node
 request_timeout_ms: 10000 # a health/tree/reload request to a node
 max_restarts: 5           # unexpected deaths of one env before base gives up
 sandbox: auto              # auto | oci | landlock | none
+env_user: none            # the OS user an env's host-side processes run as
 guardian:
   interval_ms: 2000
   failures: 6
@@ -642,6 +643,43 @@ budget_reset_on_reset: true
 budget_tick_ms: 5000
 ```
 
+## OS supervision and the per-env privilege drop (P3.5)
+
+**The barebone under a service manager.** `deploy/` holds the two units (`deploy/README.md`
+explains every line) and `tenon install-service --user` renders them for this binary and
+this home: `$XDG_CONFIG_HOME/systemd/user/tenon.service` plus `systemctl --user
+daemon-reload && enable` on Linux, `~/Library/LaunchAgents/com.tenon.base.plist` plus the
+`launchctl` lines to run on macOS, and the unit printed with the two commands to run when
+there is no service manager to talk to. `--print` writes nothing. It never starts base.
+The unit runs `start --foreground` (the daemonising path would hide base behind a
+`setsid` wrapper), `Restart=always` (nothing else restarts base) and `KillMode=mixed`, so
+base's own ordered shutdown — flush packs, destroy instances, stop envs deepest-first,
+then G — is not raced by a SIGTERM to the whole cgroup.
+
+Base runs no user code: it spawns processes, owns sockets and files, and answers frames;
+every agent-influenced thing is behind a process boundary. So the release profile sets
+`panic = "abort"`: a panic in base is a bug humans shipped, and an abort the supervisor
+restarts from is a better answer than a half-unwound actor still holding the front door.
+`cargo test` builds the dev profile and still unwinds.
+
+**`env_user`.** With `env_user: <name>` in `config.yml`, an env's *host-side* processes —
+its node A and its harness — are `setgid`/`setuid`'d to that user in the forked child
+before `execve`, and that env's own directories (`envs/<env>/`, `run/gw-<env>/`,
+`profiles/<env>/`, `state-<env>.sqlite`, its two logs) are chowned to it. Base's own files,
+the front door and the guardian node are never touched.
+
+```yaml
+env_user: none      # none (the default) | a user name
+```
+
+Resolution happens once per boot and is **best effort by design**: `none` is off, an
+unknown user and a base that may not change uid (not root, no `CAP_SETUID`) both log one
+line on stderr, emit `env.privilege` with `dropping: false` and the reason, and keep
+running unprivileged. The alternative — refusing to boot an env that would otherwise be
+supervised — trades a real barebone for a theoretical one. `env.chown` records the
+handover per env when the drop is on. Only the unprivileged path is tested here (this box
+has no root); the plan itself, the passwd lookup and the paths handed over are unit tests.
+
 ## Manifests, the LKG manifest and `tenon rollback` (P3.5)
 
 Two manifests, one shape. A **plugin manifest** is what makes a version installable and
@@ -796,6 +834,7 @@ public surface — and it works with JavaScript off.
 | `tenon serve --http ADDR [--env NAME]` | the same UI as a localhost web page (cargo feature `http`, off by default) |
 | `tenon stop [--all]` | stop every env, then G, then base; `--all` also reaps this home's dead-base sandbox leftovers afterward |
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
+| `tenon install-service --user [--print]` | write the OS service unit for this binary and home, and enable it where there is a user service manager; `--print` prints it instead. Never starts base |
 | `tenon status [--lkg]` | one JSON document: base, both nodes, and each node's fiber tree. `--lkg` prints what the last promotion pinned and verifies it instead, without needing a running base, and exits non-zero when a hash moved |
 | `tenon rollback [--force]` | restore the LKG config, profiles and state copy. Verifies every pinned hash first and refuses with what differs; `--force` overrides. Refuses while base is running |
 | `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
@@ -805,6 +844,18 @@ public surface — and it works with JavaScript off.
 
 `--exit-on-detach` stops everything when the last **subscriber** disconnects. `status` and
 `stop` connect without subscribing, so only `attach` holds the door open.
+
+**Detach, exit, replay.** The shutdown that follows the last detach is the same one
+`stop` runs, and it is ordered: base asks every live worker for whatever it has committed
+since the last stored pack and stores it (`base.flush`, 5 s per env), checkpoints every
+state file, then destroys the instances and stops the envs deepest-first. The **next**
+`start` treats the first boot of an env like a `reset`: the workspace is wiped, every
+stored pack is staged into `.tenon-restore/` and the fresh worker folds them into a new
+`.tenon-snap` and checks the newest ref out (`env.restored`). So a committed file comes
+back inside a brand-new sandbox and an uncommitted one does not — replay is restoring the
+latest snapshot, never re-executing steps (RFC section 11). The session log is untouched
+by any of this, so `session.history` and `session.resume` answer for a session the
+previous boot ran.
 
 ## RPC
 
@@ -1348,3 +1399,12 @@ accumulate across CI runs.
     must still be installed with the same hash (has an agent replaced a plugin version
     under a name the pinned profile resolves). Packs are the workspace history and are
     restored by `reset`, not by `rollback`.
+49. **The privilege drop covers the host-side processes of an env, not the sandbox.**
+    Node A and the harness are what `setuid` reaches; the worker already runs inside a
+    container (its uid is the image's) or under Landlock (where it is the same process
+    tree the drop applies to). RFC section 4 asks for "per-env OS privilege drop"; this is
+    the half that is base's to give, and it is best effort — an unprivileged base logs the
+    reason and keeps supervising rather than refusing to boot.
+50. **`install-service` writes and enables, but never starts.** A unit that starts base the
+    moment it is installed would boot a home the human has not chosen yet, possibly beside
+    a base already running from a shell. The command prints the one line to run.

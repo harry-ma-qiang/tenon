@@ -35,6 +35,7 @@ pub struct Base {
     pub killed: Option<String>,
     pub runtimes: BTreeMap<String, crate::runtime::Runtime>,
     pub probes: crate::probes::Approved,
+    pub privilege: crate::privilege::Plan,
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -75,6 +76,7 @@ impl Base {
             killed: None,
             runtimes: BTreeMap::new(),
             probes: crate::probes::Approved::default(),
+            privilege: crate::privilege::Plan::Off,
         }
     }
 
@@ -111,6 +113,7 @@ impl Base {
             json!({"release": self.release, "sandbox": self.sandbox.backend()}),
         );
         self.load_probes();
+        self.load_privilege();
         self.start(GUARDIAN, GUARDIAN, None)?;
         self.start("agent", &root, None)
     }
@@ -137,6 +140,7 @@ impl Base {
         self.home
             .prepare_env(env)
             .map_err(|error| error.to_string())?;
+        self.hand_over(role, env);
         let spec = node::spec(
             &self.config,
             &self.home,
@@ -151,6 +155,7 @@ impl Base {
             &self.config,
             &self.home,
             &self.release,
+            &self.privilege,
             generation,
             self.exits.clone(),
         )
@@ -202,7 +207,18 @@ impl Base {
                 .unwrap_or_default(),
             budget,
         };
+        let first = previous.is_none() && role != GUARDIAN;
         self.nodes.insert(env.to_string(), node);
+        // A fresh sandbox is an empty workspace: on the first start of an env
+        // in this base process the stored packs are staged the same way a
+        // `reset` stages them, so `start` after `stop` replays the workspace
+        // instead of inheriting whatever the last boot left on the host.
+        if first {
+            let staged = self.stage_restore(env);
+            if let Some(node) = self.nodes.get_mut(env) {
+                node.restore = staged;
+            }
+        }
         self.runtimes.remove(env);
         self.write_runtime_token(env, &runtime_token);
         let _ = self
@@ -431,6 +447,7 @@ impl Base {
     pub(crate) async fn stop(&mut self) {
         self.stopping = true;
         self.emit("base.stop", None, json!({"ok": true}));
+        self.flush_envs().await;
         self.stop_nodes(Duration::from_millis(self.config.stop_grace_ms))
             .await;
     }
