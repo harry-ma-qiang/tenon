@@ -5,14 +5,14 @@ fn corrupt_profile_is_restored_from_lkg_on_reset() {
     let Some(fixture) = fixture("lkg-profile") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
     let profile = fixture.home.join("profiles/root/tenon.yml");
     let lkg_profile = fixture.home.join("lkg/profiles/root/tenon.yml");
     let good = std::fs::read(&lkg_profile).expect("lkg profile copy should exist after boot");
 
     std::fs::write(&profile, b"not: [valid, yaml, {{{").expect("corrupt the live profile");
 
-    let (ok, text) = fixture.run(&["reset"]);
+    let (ok, text) = fixture.run_text(&["reset"]);
     assert!(ok, "reset failed: {text}");
     let response: serde_json::Value = serde_json::from_str(&text).expect("reset json");
     assert_eq!(
@@ -41,7 +41,7 @@ fn corrupt_state_sqlite_is_restored_from_lkg_on_reset() {
     let Some(fixture) = fixture("lkg-state") else {
         return;
     };
-    fixture.start(&[]);
+    fixture.start();
     let state = fixture.home.join("state.sqlite");
     let lkg_state = fixture.home.join("lkg/state.sqlite");
     assert!(
@@ -55,7 +55,7 @@ fn corrupt_state_sqlite_is_restored_from_lkg_on_reset() {
         .and_then(|file| file.set_len(0))
         .expect("truncate the live state.sqlite");
 
-    let (ok, text) = fixture.run(&["reset"]);
+    let (ok, text) = fixture.run_text(&["reset"]);
     assert!(ok, "reset failed: {text}");
 
     let after = std::fs::read(&state).expect("state.sqlite should still exist after reset");
@@ -67,7 +67,7 @@ fn corrupt_state_sqlite_is_restored_from_lkg_on_reset() {
     );
 
     assert!(
-        fixture.status_result().is_ok(),
+        fixture.cli_status_result().is_ok(),
         "base stopped answering after a state.sqlite corruption"
     );
 }

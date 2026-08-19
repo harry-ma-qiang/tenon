@@ -101,7 +101,7 @@ fn a_leaked_container_with_a_dead_base_is_reaped_on_next_start() {
     let mut leaked = LeakedContainer::create(cli, "stale-env", &home_hash, dead_pid());
     assert!(leaked.exists(), "the leaked container was not created");
 
-    fixture.start(&[]);
+    fixture.start();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut gone = false;
@@ -120,7 +120,7 @@ fn a_leaked_container_with_a_dead_base_is_reaped_on_next_start() {
     leaked.removed = true;
 
     assert!(
-        fixture.node("root")["registered"] == true,
+        fixture.cli_node("root")["registered"] == true,
         "the real root env failed to come up while the reap ran"
     );
 }

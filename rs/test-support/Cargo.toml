@@ -1,0 +1,17 @@
+[package]
+name = "tenon-test-support"
+description = "Fixtures, waits and process helpers shared by the tenon test suites"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+tenon-base = { path = "../base", optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+node = ["dep:tenon-base", "dep:tokio"]

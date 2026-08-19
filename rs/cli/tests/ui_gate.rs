@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{skip, Fixture, BIN};
+use gate::{fixture, skip, Fixture, BIN};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -25,7 +25,7 @@ fn harness(base_url: &str) -> String {
 async fn attach_ui_renders_a_frame_in_a_pty_and_quits_on_q() {
     let Some(release) = skip(NAME) else { return };
     let server = fake::spawn(vec![]).await.expect("fake model");
-    let fixture = Fixture::new(NAME, release, "sandbox: oci\n", &harness(&server.base_url));
+    let fixture = fixture(NAME, release, "sandbox: oci\n", &harness(&server.base_url));
     fixture.start();
     fixture.ready(Duration::from_secs(120)).await;
 
@@ -79,7 +79,7 @@ async fn serve_http_renders_the_page_prompts_and_answers_an_approval() {
     let server = fake::spawn(vec![Say::Text("web pong".to_string())])
         .await
         .expect("fake model");
-    let fixture = Fixture::new(
+    let fixture = fixture(
         "http-gate",
         release,
         "sandbox: oci\n",

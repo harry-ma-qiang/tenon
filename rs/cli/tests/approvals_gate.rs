@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{collect, skip, Fixture};
+use gate::{collect, fixture, skip};
 use serde_json::json;
 use std::time::Duration;
 use tenon_harness::fake::{self, Say};
@@ -27,7 +27,7 @@ fn harness(base_url: &str) -> String {
 async fn a_gated_tool_blocks_until_a_human_approves_denies_or_the_row_expires() {
     let Some(release) = skip(NAME) else { return };
     let server = fake::spawn(vec![]).await.expect("fake model");
-    let fixture = Fixture::new(NAME, release, &config(), &harness(&server.base_url));
+    let fixture = fixture(NAME, release, &config(), &harness(&server.base_url));
     fixture.start();
     fixture.ready(Duration::from_secs(120)).await;
 

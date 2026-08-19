@@ -1,6 +1,6 @@
 mod gate;
 
-use gate::{release, Fixture};
+use gate::{fixture, skip_release, Fixture};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,16 +13,6 @@ const CONFIG: &str = "sandbox: none\n";
 
 const HARNESS: &str = "llm:\n  provider: openai\n  base_url: http://127.0.0.1:1\n  \
 model: fake-model\n  api_key_env: TENON_TEST_NO_KEY\nmax_steps: 2\napproval: deny\n";
-
-fn skip() -> Option<std::path::PathBuf> {
-    match release() {
-        Some(dir) => Some(dir),
-        None => {
-            println!("skipping {NAME}: no beam release, set TENON_RELEASE_DIR");
-            None
-        }
-    }
-}
 
 /// A health endpoint of the `http` kind: what a runtime that is not a BEAM
 /// plugin — DSH behind the bridge — declares instead of a service method.
@@ -74,8 +64,10 @@ fn register(token: &str, manifest: Value, health: Value) -> Value {
 /// is refused with the reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_runtime_registers_only_when_it_meets_the_contract_and_answers_its_probe() {
-    let Some(release) = skip() else { return };
-    let fixture = Fixture::new(NAME, release, CONFIG, HARNESS);
+    let Some(release) = skip_release(NAME) else {
+        return;
+    };
+    let fixture = fixture(NAME, release, CONFIG, HARNESS);
     fixture.start();
 
     // a. base registers the default runtime on behalf of its own env
