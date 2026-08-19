@@ -1535,3 +1535,131 @@ seeds default and 1. `podman ps -a --filter label=tenon.home` empty afterwards.
 P3.8: the zero-behaviour-change simplify pass, and the debts still open — `envfiber` over tcp
 (which is also what blue/green under krun needs), the musl shape as a release matrix entry,
 and a benchmark task set that is a real gate rather than a smoke test.
+
+## 29. P3.8 result: the simplify pass, and what the audit got wrong (2026-08-19)
+
+A zero-behaviour-change pass over the Rust half: no wire frame, RPC method, config key, CLI
+flag or file-layout change, every test kept, the suites green before and after. The interesting
+result is not the code that went away but the gap between what a line-by-line audit predicted
+and what a tree with no comments and no dead code actually has to give.
+
+### Lines
+
+| Crate | src before | src after | tests before | tests after |
+|---|---:|---:|---:|---:|
+| `rs/base` | 10192 | 10261 | – | – |
+| `rs/cli` | 340 | 340 | 5369 | 3843 |
+| `rs/harness` | 2874 | 2785 | 859 | 859 |
+| `rs/sandbox` | 1849 | 1849 | 238 | 238 |
+| `rs/storage` | 1827 | 1827 | – | – |
+| `rs/ui` | 1025 | 1025 | 179 | 179 |
+| `rs/worker` | 1636 | 1635 | 779 | 679 |
+| `rs/test-support` | – | 697 | – | – |
+| `sdk/rs` | 735 | 740 | – | – |
+| **total** | **20478** | **21159** | **7424** | **5798** |
+
+27902 lines of Rust before, 26957 after: **−945, or −3.4%**, against a target of 15-20%. The
+test scaffolding is where it came from — 7424 lines of integration test down to 5798 plus a
+697-line shared crate, **−12.5%** with every assertion and all 75 test functions kept. Product
+source moved by 16 lines net, and that is after *adding* `base/params.rs` (122) and
+`base/hash.rs` (40), two thirds of which is their own unit tests.
+
+Elixir was measured and left alone: `Tenon.Beam.Frame` is already the single encoder,
+`beam/test/support/base.ex` is already the single fake base, and the only repeated helpers
+(`stop(kernel)`, `fixture(name)` in two loader test files) are two call sites, under the bar.
+180 ExUnit tests before and after, credo strict clean.
+
+### `refactor.md` predicted ~4500 lines; there were ~950
+
+Worth writing down honestly, because the three predictions failed in three different ways.
+
+**Typed RPC params (predicted ~1000, delivered ~90).** The premise was that handlers unwrap
+`serde_json::Value` by hand in five-line chains. They do, but the chains are five lines
+*because rustfmt breaks them*, not because they carry logic, and a `#[derive(Deserialize)]`
+struct costs one line per field plus a `#[serde(default)]` attribute — the same size, for the
+common one- and two-field case. Worse, it is not behaviour-preserving: `params.get("limit")
+.and_then(Value::as_i64).unwrap_or(500)` answers 500 for `{"limit": "x"}`, and serde answers
+an error. Every front-door parameter is attacker-reachable, so that difference is real. What
+paid was the boring half: one `base/params.rs` with `text`, `i64_or`, `object`, `strings` and
+friends replaced five copies of the same private helper (`server.rs`, `envrpc.rs`, `ui.rs`,
+`prompt.rs`, `tools.rs`) and about 90 lines of chains, keeping the permissive semantics
+exactly. `parse::<T>()` and derive structs went only where the params blob has five or more
+fields and every caller is one of ours: `episodes.append` and `tool_results.append`.
+
+**Shared test fixtures (predicted ~2500, delivered ~1600).** This one was real. Six copies of
+`Fixture`, five of `release()`/`oci_available()`/`skip()`, two of the `/proc` pid scanners and
+three of `Temp` collapsed into `rs/test-support`, a dev-only workspace member with a `node`
+feature so `cargo test -p tenon-worker` does not build sqlite to get a temp directory.
+`CARGO_BIN_EXE_tenon` exists only in the cli crate's own test targets, so the crate is handed
+the binary path rather than finding it, and `cli/tests/gate/mod.rs` shrank from 235 lines to a
+25-line shim that supplies it. The async gate fixture and the synchronous adversarial one
+became one type with two constructors: `Spec { lock, reap_pids, limit }` is the whole
+difference, and the pair of `status`/`node` accessors (through `tenon status` and through the
+socket) live side by side as `cli_status`/`status`.
+
+**Wire frame helpers (predicted ~500, delivered ~25).** `frame::rep_id`/`rep_req` replaced six
+hand-built reply frames in `server.rs`, `envfiber.rs` and the harness wire, and two private
+ones in `sdk/rs`. A `req(t, fields)` constructor was written and deleted again: at every call
+site `json!({"t": "provide", "name": name})` is already shorter than any function call, and
+the only place that merges fields into a frame is `Client::call`, which is one site. Frames
+stay byte-identical for free — `serde_json`'s map is a `BTreeMap` here, so key order is
+sorted whatever order the keys were inserted in — and `frame.rs` now asserts that against the
+literals it replaced.
+
+### Dead code: five items in 24k lines
+
+`cargo machete` found one unused dependency (`libc` in `tenon-harness`), and an index of all
+757 `pub` definitions against every non-comment occurrence in 634 repo files found five dead
+items: `approvals::ASK`, `bus::Fut`, `tenon_harness::ROLE`, `tenon_worker::ROLE` (both masked
+from a naive grep by `base::harness::ROLE`, which is live) and `llm::Client::has_key`. All
+five are gone. Nine `pub` items in `sdk/rs` have no caller in this repo — `Next::waterfall`,
+`Next::on/off/unprovide`, the `Plugin` accessors — and stay: `sdk/rs` is the Rust half of a
+three-language plugin API whose parity with `sdk/py` and `sdk/ts` is the point.
+
+Seven hand-written `sha256`-to-hex loops became `base/hash.rs` (`hex`, `sha256`, `short`).
+A duplicate-window scan over the whole tree afterwards finds 27 repeated five-line windows
+across files, all of them structural: a `Cmd` variant's fields mirrored in the actor state, an
+import list, a row struct that crosses a crate boundary. There is no third copy of anything
+left to delete.
+
+### What was deliberately not simplified
+
+- **`rpc.rs` + `cmds.rs` (461 lines).** Every front-door command is spelled three times: the
+  `Cmd` variant, the `on_cmd` arm, the `server.rs` dispatch arm. A macro or a boxed-closure
+  `Cmd` would delete perhaps 300 lines and would be an architecture change, not a
+  simplification: the enum is what makes the actor's vocabulary greppable and exhaustive.
+- **The harness wire vs `sdk/rs`.** They look like the same protocol twice and are not
+  convergible without behaviour change. `sdk/rs` is blocking and single-threaded with `Rc`
+  handlers and a re-entrant settle loop, which is what lets a plugin call back into the kernel
+  from inside a handler; `harness/wire.rs` is tokio, spawns a task per inbound `svc` so a
+  minute-long tool call does not block the next frame, and shares one `Arc<Wire>` sender.
+  Making the SDK async would put tokio in every external plugin's dependency tree and change
+  its public API; making the harness blocking is not possible at all. They already share the
+  one piece that can be shared, `tenon_base::frame`.
+- **`rs/worker`'s own extractors.** `worker` depends on `tenon-sdk`, not on `tenon-base`, so
+  it cannot use `base::params`; its five local helpers are already the deduplicated form and
+  moving them into the SDK would widen a published API to save nine lines.
+- **`rs/cli/tests` below 3800 lines.** What is left is assertions and the YAML and Python
+  fixtures each gate needs. Cutting further means cutting coverage.
+
+### One pre-existing bug found by the pass
+
+`privilege.rs`'s two unit tests wrote the same `/tmp/tenon-passwd-<pid>` file. `fs::write`
+truncates, so one test's write raced the other's read and the pair failed intermittently
+(seen once during this pass, not reproduced in the three runs after the fix). One file per
+test.
+
+### Gates
+
+`cargo build --release`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo fmt --check` clean after every commit. 188 Rust tests before, 193 after (+5: the unit
+tests of `params`, `frame` and `hash`), 0 failures — 126 workspace, 47 cli gates, 20
+adversarial on its own. `sdk/rs` builds and is clippy/fmt clean. kernel 66, loader 69, cli 7,
+beam 38, credo strict clean, all unchanged. `podman ps -a --filter label=tenon.home` empty
+afterwards.
+
+The one failure seen is the pre-existing one `rs/README.md` and section 28 already record: the
+adversarial suite run in parallel inside `cargo test -p tenon-cli --tests` (CI's `--skip
+adversarial` filters test *names*, and no adversarial test is named "adversarial", so it runs
+there too) fails its teardown assertion in about one run in three (2 of 6 runs here). It was reproduced on the
+unmodified tree during this pass, before any test file was touched.
