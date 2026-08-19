@@ -923,7 +923,7 @@ or `null` for the guardian.
 | the harness of an env dies | log `harness.exit`, start a fresh one against the same node (up to `max_restarts`); the env, its sandbox and its worker are untouched |
 | an env node dies | log `node.exit`, restore its LKG profile, restart it, up to `max_restarts`. The old sandbox instance is `destroy`ed before the new one is spawned |
 | G dies | the same, plus a loud line on stderr; the env keeps running |
-| the guardian sees N bad health answers | it sends `reset{env}`; base performs it (old sandbox instance destroyed, new one spawned, same as an env restart) |
+| the guardian sees N failing probe passes | it sends `reset{env, probes}`; base logs `guardian.reset` with the failing probe names and performs the reset (old sandbox instance destroyed, new one spawned, same as an env restart) |
 
 ## Tests
 
@@ -947,19 +947,54 @@ gone) start failing on load rather than on logic — seen twice in whole-suite r
 every time the suite runs alone (`cargo test -p tenon-cli --test adversarial`, 195 s). The
 numbers below are from the whole suite plus that separate adversarial run.
 
-113 tests in the crates below (`cargo test --all-features` prints 137: `rs/ui` brings its own
-24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 5
-(`token`, `home::hash` — stable per home, distinct across homes — the two `ui` model builders
-and the http form decoder), the 20-test adversarial suite, `sandbox`'s 2-test conformance
-suite, the 1-test gateway gate, the
+128 tests in the crates below (`cargo test --all-features` prints 152: `rs/ui` brings its own
+24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 16
+(`token`, `home::hash` — stable per home, distinct across homes — the two `ui` model builders,
+the http form decoder, the runtime contract's two, the probe approver, the three LKG-manifest
+ones, the three privilege-plan ones and the two service-unit ones), the 20-test adversarial
+suite, `sandbox`'s 2-test conformance suite, the 1-test gateway gate, the
 P3.2 worker suites (`worker/tests/fs_test.rs` 9, `snap_test.rs` 9, `pty_test.rs` 10,
 `cli/tests/worker_wire.rs` 3), the two P3.2 gates (`cli/tests/worker_boot.rs` 1,
 `cli/tests/spawn_gate.rs` 1), the P3.3 suites (`harness/tests/llm_test.rs` 5,
 `loop_test.rs` 12, `cli/tests/harness_gate.rs` 1, `harness_model.rs` 1), the P3.4 gate
-(`cli/tests/storage_gate.rs` 1) and the three P3.5 gates
-(`cli/tests/approvals_gate.rs` 1, `budget_gate.rs` 2, `ui_gate.rs` 2), which share
+(`cli/tests/storage_gate.rs` 1) and the seven P3.5 gates
+(`cli/tests/approvals_gate.rs` 1, `budget_gate.rs` 2, `ui_gate.rs` 2, `contract_gate.rs` 1,
+`guardian_gate.rs` 1, `manifest_gate.rs` 1, `replay_gate.rs` 1), which share
 `cli/tests/gate/mod.rs` — one fixture (temp home, `config.yml`, `profiles/root/harness.yml`,
-container reap on `Drop`) instead of three copies of the one `harness_gate.rs` grew.
+container reap on `Drop`) instead of seven copies of the one `harness_gate.rs` grew.
+
+`cli/tests/contract_gate.rs` (1, needs only a release — `sandbox: none`, so no container and
+7 s here) is the runtime-contract gate: base's own default runtime shows up in `status` with
+a sha256 manifest and `loop.ping` as its health target, an outside runtime registers with the
+env's `run/rt-root.token` against an `rpc` target and another against a real `http` health
+endpoint (the DSH-through-the-bridge shape of `bridge/dsh/README.md`), and four refusals —
+a 503 health endpoint, a forged token, a manifest without a version, an unknown health kind —
+each come back with the reason, are logged as `runtime.refused`, and leave the last good
+runtime in place.
+
+`cli/tests/guardian_gate.rs` (1, skipped without oci or a release, ~23 s here) is the probe
+gate: a boot whose `probes.extra` lists one script with the right sha256 and one with a wrong
+one logs `probes.loaded{count: 1}` and `probes.rejected` naming the file and the hash it
+found; then `SIGSTOP` on the harness makes the `harness` probe wedge, and within two probe
+passes base logs `guardian.reset` carrying the failing probe names and the env comes back
+with a fresh harness pid.
+
+`cli/tests/manifest_gate.rs` (1, needs only a release, 3.5 s here) is the LKG-manifest gate:
+a boot with a plugin installed under `plugins/echo@1.0.0/` writes `lkg/manifest.json` with
+every field of RFC section 10 and the plugin pinned by hash, `tenon status --lkg` reports
+`verified: true`, a plugin whose hash then moves makes `tenon rollback` refuse non-zero
+naming the plugin (and `status --lkg` exit non-zero with `verified: false`), and with the
+plugin back a broken live `config.yml` is restored from the LKG.
+
+`cli/tests/replay_gate.rs` (1, skipped without oci or a release, ~13 s here) is the
+exit-on-detach and replay gate, and the unprivileged half of `env_user`: a boot with
+`env_user: nobody` logs `env.privilege{dropping: false}` with the reason and carries on; an
+`attach` holds the door while a scripted turn writes and commits a file with the pull timer
+turned off (`snap.list` is still empty); dropping that subscriber makes base push the pack,
+flush and exit, socket and ready file gone; and the next `start` brings up a fresh sandbox
+whose workspace has the committed file back and the uncommitted one gone (`env.restored`),
+while `session.history` and `session.resume` still answer for the session the first boot
+ran.
 
 `cli/tests/approvals_gate.rs` (1, skipped without oci or a release, ~15 s here) is the P3.5
 approvals gate: one boot whose profile lists `bash` under `gated_tools` and whose mode is `ask`

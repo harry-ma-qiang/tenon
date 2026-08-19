@@ -1146,3 +1146,124 @@ BEAM: `mix compile --warnings-as-errors`, `mix format --check-formatted`, `mix c
 P3.5b: the runtime contract and `runtime.register`, the guardian's probe set beyond health, OS
 supervision (systemd --user / launchd), state copies at LKG promotion, manifests, per-env
 privilege drop and exit-on-detach replay. Then P3.6, krun and the release CI.
+
+## 26. P3.5b result: the runtime contract, the probe set, manifests and OS supervision (2026-08-19)
+
+The half of P3.5 that is about *being supervisable*. A runtime now registers with base and is
+probed before base believes it; the guardian watches seven things instead of one; the LKG is a
+manifest with hashes a rollback verifies; the barebone ships its own systemd and launchd units;
+an env's host-side processes can run as another user; and a detach really does stop everything
+and replay it on the next start.
+
+### Lines
+
+Rust: +~1.3k (base `runtime.rs` 366, `manifest.rs` 328, `privilege.rs` 294, `probes.rs` 157,
+`service.rs` 146, plus config/CLI/snap wiring), harness +2 (`loop.ping`). BEAM: +150
+(`Guardian.Probes`) and the guardian server rewritten around it; loader +100
+(`Manifest`). Tests: +4 Rust gates, +10 guardian tests, +5 loader tests, +11 Rust unit tests.
+
+### The contract is a function, and the probe is base's
+
+`runtime.register` could have been a row base writes down. It is not: `contract/2` is a pure
+function that refuses a manifest by field name, and then **base calls the health target the
+runtime declared** — an `rpc` target as a `svc` frame into that env's node, an `http` target as
+a plain GET. A runtime that claims a health endpoint and does not answer it is refused with
+`health probe failed: ... status 503`, which is the only kind of claim worth recording. The
+default runtime goes through exactly the same path: base registers it on behalf of its own
+harness/worker/node A once the harness answers, with `loop.ping` as the target, so the
+contract's health claim and the guardian's harness probe are literally the same call.
+
+The one thing the contract needed that did not exist: an identity for a runtime base did not
+spawn. The node token is bound to an exact OS pid, which is what makes `node.register`
+unforgeable and what makes it useless here. So there is a second per-env token, handed to the
+harness in its environment and written to `run/rt-<env>.token` at mode 0600 — as protected as
+the front-door socket, and dead when the env restarts. That is the file a DSH runtime reads.
+
+### A booting env is not a failing env
+
+The probe set (base, env, tree, worker, harness, wedged, budgets, violations) was easy; making
+it not fire during boot was the design. First cut had the worker probe ping `worker.ping`
+unconditionally, which on a four-core box means an env being reset by its guardian ten seconds
+into its first boot, forever. The fix is that the `base` probe runs first and caches base's own
+row for that env, and the worker/harness probes read the lifecycle out of it: `off` and
+`booting` owe nothing, `ready` owes a `pong`, `failed` is a failure. Base knows the lifecycle;
+the guardian should ask rather than guess.
+
+`wedged` is not a probe, it is a property of the pass: any probe call that reaches
+`probe_timeout_ms` fails under that name too, which is what made the gate test possible —
+`SIGSTOP` on the harness, and two passes later base logs `guardian.reset` with the names.
+`Link.request/4` had to grow a per-call deadline for this; the 15 s default would have made one
+wedge swallow seven probe passes.
+
+Extra probes are "signed by config": an executable in `<home>/probes/`, listed in base's
+`probes.extra` with its sha256, checked by base before the guardian node is even started, and
+passed in as paths. Everything else is a `probes.rejected` event naming the file and the reason.
+The guardian decides nothing about what may run — it runs what base handed it.
+
+### Two manifests, one shape
+
+`plugins/<name>@<version>/manifest.json` makes a plugin version resolvable by name (the loader
+reads the directory on every compose, so `echo` and `echo@1.0.0` are both mountable names), and
+`lkg/manifest.json` pins what a promotion promoted. `tenon rollback` recomputes every hash
+before restoring anything: the LKG copies must still hash to what was written (a corrupt LKG
+must never be restored over a live home) and every pinned plugin must still be installed with
+the same hash. A mismatch prints `what / pinned / found` per line and refuses; `--force`
+overrides. It also refuses while base is up, because `state.sqlite` has exactly one writer and
+copying over it would destroy the thing being rescued.
+
+### The unprivileged path is the interesting one
+
+`env_user` drops uid/gid before `execve` for an env's node A and harness, and chowns that env's
+own directories. On this box base is neither root nor CAP_SETUID, so what is actually tested is
+the refusal: one line on stderr, an `env.privilege` event with `dropping: false` and the reason,
+and an env that boots anyway. That is the deliberate stance — a barebone that refuses to
+supervise an env because it could not drive its uid down is worse than one that says so.
+
+### Detach, and what a replay is allowed to lose
+
+Exit-on-detach existed; what it lacked was the flush. Now the shutdown asks every live worker
+for what it has committed since the last stored pack, stores it, then checkpoints every state
+file before taking anything down — with the pull timer set to ten minutes, the gate proves the
+pack reaches the host only because of the detach. And the next `start` treats the first boot of
+an env like a `reset`: wipe, stage every pack, let the fresh worker fold them in. The gate
+writes an uncommitted file before detaching and asserts it is *gone* afterwards while the
+committed one is back. Replay is restoring the latest snapshot, never re-executing steps.
+
+### Gates
+
+`cargo build --release`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo fmt --check` clean. `TENON_RELEASE_DIR=... cargo test --all-features`: 152 green
+(128 in these crates, from 113 at the end of P3.5a, plus `rs/ui`'s 24), with the adversarial
+suite run on its own as `rs/README.md` prescribes — 20/20 in 185 s, and every other gate binary
+run individually as well (`contract_gate` 7 s, `guardian_gate` 23 s, `manifest_gate` 3.5 s,
+`replay_gate` 13 s). BEAM: `mix compile --warnings-as-errors`, `mix format --check-formatted`,
+`mix credo --strict`, `mix test` (35) and `MIX_ENV=prod mix release --overwrite` all green.
+Loader: the same four, `mix test` 69. `podman ps -a --filter label=tenon.home` empty
+afterwards.
+
+Two of the new gates need no container at all (`sandbox: none` for the contract and manifest
+gates), which is worth keeping in mind for CI: they cost 10 s together and cover the two pieces
+that are pure host bookkeeping.
+
+### Deviations
+
+1. `runtime.register` authenticates with a second per-env token in `run/rt-<env>.token`, not the
+   node token, whose pid binding is what makes `node.register` unforgeable.
+2. Base registers the default runtime on behalf of its own env; the parent of the default
+   runtime is base itself, so a frame from the harness would be base asking itself.
+3. The probe set has a `base` probe the RFC does not name: it is the one call the worker,
+   harness and budget probes share, and it is what keeps a booting env from being reset.
+4. `events.tail{env: "base"}` now reads the barebone's own log — boot, LKG, probe, privilege and
+   sandbox facts belong to no env and were previously only visible on a live `subscribe`.
+5. `tenon rollback` and `tenon status --lkg` are local operations that refuse to touch a running
+   home; the LKG is what a human reads *because* base may not be reachable.
+6. The privilege drop covers an env's host-side processes only; inside a sandbox the uid is the
+   image's, and it is best effort by design.
+7. `install-service` writes and enables but never starts base.
+8. `panic = "abort"` in the release profile: base runs no user code, so a panic there is a bug
+   humans shipped and an abort the supervisor restarts from beats a half-unwound actor.
+
+### Next
+
+P3.6: the krun backend on a Mac and on CI, and the release CI that produces the single `tenon`
+binary with the BEAM payload embedded.
