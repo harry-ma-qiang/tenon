@@ -1728,3 +1728,66 @@ As planned in `p3.refactor.md`, the next evolution focuses on making the TUI and
 5. **Planning Only**: Logged and architected in `p3.refactor.md` (no code written yet).
 
 
+
+## 32. P4.0 result: the plumbing — bus, kv, blob, timer (2026-08-19)
+
+The first slice of RFC P4: one message fabric and one state facade, with SQLite demoted to an
+implementation detail behind them. P4.0 lands the facades and the timer; the legacy record RPCs
+(`events.*`, `episodes.*`, `tool_results.*`, `blobs.*`) stay until P4.1 migrates their producers.
+
+New Rust, LoC: `rs/bus` crate 1067 (envelope 237, filter 129, hub 341, layer 135, ring 206,
+lib 19); base facades 1113 (bus.rs 116, kv.rs 340, blob.rs 60, timer.rs 218, facaderpc.rs 379);
+storage support 210 (kv.rs, envelopes.rs). Integration gate `cli/tests/bus_gate.rs` 460. Every
+file under the 600-line rule.
+
+The pieces:
+- `rs/bus`: the `Envelope` of RFC section 2 verbatim, and the `Hub` — lock-free publish over an
+  `ArcSwap` subscriber snapshot, per-subscriber rings (drop-oldest for non-durable, never-drop for
+  durable), `latest_only` (topic,key) compaction, `coalesce_ms` batching, a single durable writer
+  with a 5 ms group commit, `since_offset` log replay, and a `tracing` layer so `info!(topic=...)`
+  becomes an envelope. The hub is storage-agnostic: durability is the host's `Durable` trait, and
+  env-scoping is a `Filter` the host pins before subscribe. ULID event ids are hand-rolled
+  (monotonic per process), no crate.
+- kv: `get/set{durable?,ttl?}/del/cas/incr/expire/lease/keep_alive/range/watch`, a global monotonic
+  revision, ephemeral keys in memory, durable keys in a new `kv` table, leases swept on a 1 s tick.
+  ControlLease stays a documented `/ctl/<env>` convention — no code.
+- blob: thin `put/get/open/stat` over the existing `blobs` table.
+- timer: `timer.set{after_ms|every_ms}` stored in durable kv under `/timers/`, one wheel that fires
+  it as an envelope and reloads on boot; survives a `kill -9` restart.
+
+Env-scoping (RFC 8d.2): `auth.scope{env, token}` binds a connection to its env via the runtime
+token; every later bus/kv/blob/timer call is pinned there and cross-env requests are refused
+`cross_env_denied`. base/CLI callers are unscoped. Session bridge (temporary): every
+`events.append` also publishes a durable `session/<kind>` envelope, guarded behind one function
+(`facaderpc::bridge_session`) so P4.1 deletes it in one place.
+
+Tests: `rs/bus` 14 unit tests (envelope roundtrip, glob match, ring drop-oldest, latest_only,
+durable persist+offset, since_offset replay, tracing layer). storage: 2 added (envelope batch
+dedup+replay, env-scoped kv with prefix/lease). `bus_gate` 6 integration + 1 ignored bench, all
+green: publish/subscribe with filtering and since_offset replay after a simulated reconnect; a
+durable envelope surviving `kill -9` and replaying from the log on restart; kv get/set/cas/incr/
+lease-expiry/watch; blob put/get/open dedup; an after_ms timer firing and a persisted timer firing
+after a restart; env A denied B's kv and B's topics. Gates: `cargo build --release`, `clippy
+--all-targets --all-features -D warnings`, `fmt --check` all clean; regression suites
+`contract_gate`, `storage_gate`, `boot` green; no leftover `tenon.home` containers (the bus tests
+run `sandbox: none`).
+
+Bench (release, in-process against the hub, section 4 budgets): fan-out throughput 344,352 msg/s
+for 100k envelopes (289 ms), publish→subscriber latency p50 960 ns / p99 1.08 µs. RFC budgets were
+100k msg/s background and p99 < 1 ms — both cleared by a wide margin.
+
+One real bug found and fixed while writing the gate: a facade parameter named `id` collides with
+the wire frame's own correlation `id` — `Client::call` merges params over the frame body, so a
+string timer id overwrote the numeric frame id, `frame::id` returned `None`, and base sent no reply
+(the handler still ran). The timer id now travels as `timer_id`, matching the existing
+`approval_id`/`plugin_id` convention.
+
+Deviations (also in `rs/README.md`): (1) the hub fans out `Arc<Published>` carrying the
+encode-once bytes plus the structured envelope, rather than a bare `Arc<[u8]>`, so server-side
+`coalesce`/`latest_only`/filter can read fields — bytes are still encoded once per publish.
+(2) blob env-scoping is capability-by-hash (a 256-bit sha256 is the read capability) rather than a
+per-env partition; per-env spill files are deferred per RFC section 6. (3) cron is not parsed in
+P4.0 — `after_ms` and `every_ms` only; cron is documented as later. (4) `kv.watch` prefixes are
+segment-aligned globs (`kv/<prefix>**`), which suits the path-like keys (`/timers/`, `/ctl/`).
+(5) The tracing layer is installed process-wide with `try_init`, a no-op if a subscriber already
+exists.
