@@ -46,3 +46,22 @@ pub fn run(mut command: Command, timeout: Duration) -> Result<ExecOutcome> {
         timed_out,
     })
 }
+
+/// SIGTERM, a grace period, then SIGKILL, and always a `wait` — a VMM child is
+/// spawned by base and reaped by base, never left as a zombie for init.
+pub fn terminate(mut child: std::process::Child, grace: Duration) {
+    let pid = child.id() as i32;
+    if pid > 0 {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}

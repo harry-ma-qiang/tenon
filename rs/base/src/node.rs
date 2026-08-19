@@ -17,6 +17,7 @@ pub struct Spec {
     pub target: String,
     pub token: String,
     pub probes: String,
+    pub gateway: String,
 }
 
 pub struct Running {
@@ -39,6 +40,7 @@ pub fn spec(
     env: &str,
     token: String,
     profile: String,
+    gateway: String,
     probes: String,
 ) -> Spec {
     Spec {
@@ -49,6 +51,7 @@ pub fn spec(
         target: config.root_env.clone(),
         token,
         probes,
+        gateway,
     }
 }
 
@@ -94,7 +97,7 @@ pub fn spawn(
         .env("TENON_NODE_TOKEN", &spec.token)
         .env("RELEASE_TMP", home.run());
     if spec.role != GUARDIAN {
-        command.env("TENON_GATEWAY", home.gateway_address(&spec.env));
+        command.env("TENON_GATEWAY", &spec.gateway);
     }
     command
         .stdin(Stdio::null())

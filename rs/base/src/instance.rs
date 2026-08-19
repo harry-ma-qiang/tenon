@@ -52,12 +52,13 @@ impl Base {
             image: std::env::var("TENON_SANDBOX_IMAGE").ok(),
             binary: std::env::current_exe().ok(),
             workspace: self.home.workspace_dir(env),
-            gateway: Some(self.home.gateway_address(env)),
+            gateway: Some(self.gateway_address(env)),
             env_passthrough: sandbox_env_passthrough(),
             policy,
             caps: vec![],
             home_hash: self.home.hash(),
             base_pid: std::process::id() as i32,
+            images: Some(self.home.images_dir()),
         };
         self.sandbox
             .spawn(&spec)
