@@ -2,6 +2,7 @@ pub mod approvals;
 pub mod base;
 pub mod budget;
 pub mod client;
+pub mod cmds;
 pub mod config;
 pub mod envfiber;
 pub mod envrpc;
