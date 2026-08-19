@@ -135,7 +135,7 @@ devices/codecs and registers capabilities in kv; native-audio models connect the
 directly to the provider endpoint while the harness only initiates and logs events. The frame cap
 keeps streams off the bus by construction.
 
-Mobile: the App is just another subscriber — same RPC + SSE (WS bridge ~150 lines later); log = truth
+Mobile: the App is just another subscriber — same RPC + SSE or the P4.4 WS carrier; log = truth
 + `since_offset` replay is the sync protocol (reconnect pulls the delta, nothing durable is lost);
 `latest_only` topics for light state; one env per user/device for tenancy, budgets and approvals; a
 `notify` plugin (APNs/FCM) subscribes to the bus; thin device SDKs (~200 lines Swift/Kotlin) mirror
@@ -149,7 +149,7 @@ sdk/py/ts/rs. All L2 plugins; no architecture change.
 | P4.1 | migration: harness/worker/guardian/UI/CLI onto the facades; delete legacy RPC families; Elixir Logger/telemetry bridge | net LoC reduction in base recorded; all suites green; UI runs on subscribe (no polls) |
 | P4.2 | query hot layer: typed `query.text/scan`, FTS5 over durable topics, composite indexes, retention window config | text < 10 ms and scan < 100 ms at 1M events (bench in tests) |
 | P4.3 | warm segments: compactor to Parquet + Tantivy (vector stub), fan-out merge, version-gated rebuild, `derived/` lifecycle | 10M-event budgets of section 5; rebuild-from-log test |
-| P4.4 | `--https` (rustls + rcgen dev self-signed) + bearer auth on serve, feature-gated | curl over https with the printed fingerprint works; requests without the token are 401; feature off = binary unchanged |
+| P4.4 | `--https` (rustls + rcgen dev self-signed) + bearer auth on serve, feature-gated; WebSocket as the 5th wire carrier (tokio-tungstenite, same feature): `/ws` on serve (RPC + subscribe over WS text frames, binary frames reserved for media chunks) and WS accept on the gateway (`TENON_GATEWAY` gains `ws:`; each connection mounts as a fiber — lets browser extensions such as the vibe-browse Chrome bridge register as plugins without a python side-server) | curl over https works; no token = 401; a WS client subscribes and receives coalesced envelopes; a WS client speaks hello/provide and its svc answers through the kernel; feature off = binary unchanged |
 | P4.5 | docs + REVIEW-P4 (perf tables incl. UI latency), NOTES update | all gates; secret scan; no leftover containers |
 
 LoC estimate: bus 0.8-1k, kv 0.4k, blob facade 0.1k, query hot 0.5k, warm compactor 0.8-1k, minus
