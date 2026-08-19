@@ -19,6 +19,9 @@ tenon-base = { path = "../base" }
 tenon-harness = { path = "../harness" }
 tenon-worker = { path = "../worker" }
 
+[features]
+http = ["tenon-base/http"]
+
 [dev-dependencies]
 base64.workspace = true
 libc.workspace = true

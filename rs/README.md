@@ -557,12 +557,113 @@ the output was tenon-ok
 tenon run: session s41-1 ok, usage {"completion":7,"prompt":11,"total":18}
 ```
 
+## Hard rules v1: approvals, budgets, the kill switch (P3.5)
+
+RFC section 5's three rules, all of them base's and none of them the agent's: a human gate in
+front of host-affecting actions, budgets that stop rather than warn, and a kill switch with
+three carriers. The guardian is told about each of them and owns none of them.
+
+```
+harness --approval.request--> base ---> approvals (barebone state.sqlite)  the queue
+   |  (the call blocks)         |  ---> approvals (state-<env>.sqlite)     that env's history
+   |                            +-----> notify{approval.pending} --> guardian node G
+   |                            +-----> approval.pending event ----> tenon attach / run / UI
+   +<--- {status: approved|denied|expired} <--- tenon approve <id> [--deny]
+```
+
+**The queue.** `approval.request{env, reason, kind}` resolves the env's mode first: `auto`
+approves and `deny` refuses without a human, `ask` writes the pending row and holds the
+caller. The mode comes from the env's overlay (`approval: ask` or `approval: {mode, timeout_s}`)
+and falls back to `approval:` in `config.yml`. The row lands in **both** files: base's own
+`state.sqlite` is the queue `tenon approvals` reads and the id `tenon approve` takes, the env's
+`state-<env>.sqlite` is that env's own history. A verdict moves both and releases every call
+blocked on it; `timeout_s` (60 by default) expires the row instead, and rows left pending by
+an earlier base are swept to `expired` on the next request or list — nothing holds their
+callers any more.
+
+**The gates** are host-affecting actions only, per RFC section 5:
+
+| Gate | When | Knob |
+|---|---|---|
+| `runtime.spawn` | the host already runs `spawn_soft_limit` environments or more | `approval.spawn_soft_limit` (2; `0` disables) |
+| `config.patch{target: "base"}` | always — the barebone's config is L0 | — |
+| `config.patch` of an env overlay | off by default: RFC section 10 makes L3 config agent-owned | `approval.gate_config_patch` (false) |
+| `snap.export` | workspace push-out to a host path | `approval.gate_snap_export` (true) |
+| any tool | the tool's name is in the profile's `gated_tools` | `gated_tools` in the env overlay, seeded from `approval.gated_tools` |
+
+A gated command holds its reply, asks the queue and — when the verdict is `approved` — resumes
+as *the same command with its gate already passed*, so the gate is one `if` at the entry of the
+actor and never a second code path. A refusal is an error the caller reads; for a gated tool it
+is a tool result the model reads, so a denial costs a step, not a turn.
+
+**Budgets.** `budgets: {tokens, usd, wall_s, processes}` per env, `0` meaning off, in
+`config.yml` for the host and in the env's overlay for that env. Tokens come off the session log
+itself: every `assistant/message` carries the usage the llm adapter reported, and base counts it
+on its way into the state file, so the counter cannot disagree with what the model actually
+cost. `usd` is that usage against `usd_per_1k: {input, output}` (or a per-provider table keyed by
+the env's `llm.provider`). `wall_s` is time since that env booted, and `processes` is the
+sandbox's own pid count, asked for on the `budget_tick_ms` timer and only when a limit is set —
+it is a container round trip, not a read. A breach emits `budget.exceeded`, tells G, **halts
+that env's harness** (the turn stops with it) and refuses every later `session.create` and
+`session.prompt` with the reason. `tenon run` prints it and exits non-zero. `tenon reset` clears
+the counters when `budget_reset_on_reset` is on (it is) and the env comes back.
+
+**The kill switch** has the three carriers the RFC names: the file `<home>/run/STOP` (polled,
+appearing and disappearing are the two edges), the frames `kill` and `resume`, and `SIGUSR1`.
+Any of them halts every harness and refuses every prompt with the reason until the file is
+removed or `resume` arrives, at which point the harnesses come back. `status` carries it as
+`"killed": "<reason>" | null`, beside the per-env `"budget"` object.
+
+```yaml
+approval:
+  mode: ask               # ask | auto | deny
+  timeout_s: 60
+  spawn_soft_limit: 2
+  gate_config_patch: false
+  gate_snap_export: true
+  gated_tools: []
+budgets:
+  tokens: 0               # 0 is off, for every one of the four
+  usd: 0.0
+  wall_s: 0
+  processes: 0
+usd_per_1k:
+  input: 0.0
+  output: 0.0
+budget_reset_on_reset: true
+budget_tick_ms: 5000
+```
+
+## The built-in ASCII UI (P3.5)
+
+`rs/ui` is the pure renderer (its own README covers the layout); base is what fills its model
+and carries it. One model builder, `base/src/ui.rs`, reads four frames off the front door —
+`status` for the tree and the budget line, `session.history` for the transcript, `events.tail`
+for the tail, `approval.list` for the queue — and two carriers use it.
+
+**Terminal.** `tenon attach --ui` puts stdin in raw mode with a `termios` guard that restores
+it whatever ends the loop, reads keys on one blocking thread and redraws on three things: an
+event from `subscribe`, a key, and a 400 ms tick that also re-probes the terminal size. Keys are
+`p` (type a line, then `session.prompt` — creating the session on first use), `a` (approve the
+first pending row after `y`/`n`), `r` (rollback: `reset` after `y`), `0`-`9` (fold or unfold that
+transcript item) and `q`. Nothing is buffered on the host: every action is a frame.
+
+**Web.** `tenon serve --http 127.0.0.1:<port>` behind the cargo feature `http` (off by default,
+`cargo build --features http -p tenon-cli`). CGI-like: `GET /?cols=N` renders `html(model, cols)`
+once, `POST /prompt`, `POST /approve/<id>` (`decision=approve|deny`) and `POST /rollback` act and
+answer `303 See Other` back to `/`, so a reload never repeats an action and the server keeps no
+UI state beyond one session id per process. Loopback only — the page is the human gate, not a
+public surface — and it works with JavaScript off.
+
 ## Commands
 
 | Command | What |
 |---|---|
 | `tenon start [--foreground] [--exit-on-detach] [--release-dir DIR] [--home DIR]` | boot G, boot the root env, open the front door. Without `--foreground` it re-execs itself detached (`setsid`), waits for `run/base.ready` and prints the pid |
-| `tenon attach [--env NAME]` | print the status document, then stream the event log until Ctrl-C |
+| `tenon attach [--env NAME] [--ui]` | print the status document, then stream the event log until Ctrl-C. `--ui` renders the built-in ASCII UI instead (raw mode, keys `p a r 0-9 q`) |
+| `tenon approvals [--status STATUS]` | the approval queue, one line per row: `id status env kind reason`. `pending` by default, `all` for the history |
+| `tenon approve <id> [--deny] [--note TEXT]` | answer one pending approval; whatever call is blocked on it resumes or fails with the reason |
+| `tenon serve --http ADDR [--env NAME]` | the same UI as a localhost web page (cargo feature `http`, off by default) |
 | `tenon stop [--all]` | stop every env, then G, then base; `--all` also reaps this home's dead-base sandbox leftovers afterward |
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon status` | one JSON document: base, both nodes, and each node's fiber tree |
@@ -595,7 +696,7 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `runtime.stop{env}` | node, CLI | stop one child environment and its subtree; answers `{stopped: [...]}` |
 | `sandbox.destroy{env}` | CLI | destroy that env's sandbox instance now, without touching the node; the next `reset` (or node restart) creates a fresh one. Also a P3.1 test aid |
 | `plugin{env,op,plugin_id?,spec?}` | harness, CLI | forwarded to that env's node: `list`, `mount` (a `{module}` or `{cmd,args,env}` spec), `unmount`, `restart`. The fiber's id travels as `plugin_id` because `id` is the frame's own correlation id |
-| `session.create{env}` / `session.prompt{env,session_id,text}` / `session.status` / `session.history` / `session.resume` | CLI | forwarded to that env's harness as `svc{name: "loop"}`; how `tenon run` drives the agent |
+| `session.create{env}` / `session.prompt{env,session_id,text}` (both refused while that env is halted or the kill switch is on) / `session.status` / `session.history` / `session.resume` | CLI | forwarded to that env's harness as `svc{name: "loop"}`; how `tenon run` drives the agent |
 | `events.append{env,kind,data}` | harness | one row in `state-<env>.sqlite`'s `events`, fanned out to every subscriber as an `{"t":"event","scope":"env"}` frame. Base is that file's only writer |
 | `events.tail{env,after?,limit?}` | harness, CLI | that env's session log from `after` on |
 | `episodes.append{env,session_id,step,action,verifier_score?,cost,user_event?,state_hash?}` | harness | one `episodes` row; the state hash is computed here from the newest snapshot ref and `user_event` unless one is given |
@@ -606,8 +707,12 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `blobs.get{env,hash,offset?,len?}` | harness, CLI | the blob as base64; with `offset`/`len` it is an incremental window read |
 | `state.retain{env}` | CLI, plugins | run the `retention:` policy against that env's file; answers `{removed, left}` and emits `state.retain` |
 | `config.get{env}` | harness, CLI | the env's harness overlay plus the paths it lives at |
-| `config.patch{env,patch}` | harness, CLI | snapshot `profiles/<env>/harness.yml` into `config-snapshots/<env>/`, merge the patch, ask the node to `reload`; answers `{snapshot, harness, reload}` |
-| `approval.request{env,reason}` | harness, CLI | the P3.5 stub: `{status: "denied", reason: "approvals not enabled"}` unless the env's overlay says `approval: auto` |
+| `config.patch{env,patch,target?}` | harness, CLI | snapshot `profiles/<env>/harness.yml` into `config-snapshots/<env>/`, merge the patch, ask the node to `reload`; answers `{snapshot, harness, reload}`. `target: "base"` patches the barebone's own `config.yml` instead — L0, always gated, and read at the next `start` |
+| `approval.request{env,reason,kind?}` | harness, CLI | ask for a human verdict. `auto`/`deny` answer at once; `ask` writes a pending row, tells G and **holds the answer** until `approval.answer` or the timeout |
+| `approval.list{status?,limit?}` | CLI, plugins | the queue from the barebone's own state file; `status` defaults to every row, `all` is the same, `pending` is what `tenon approvals` asks for |
+| `approval.answer{approval_id,decision,note?}` | CLI, the UI | `approve` or `deny` one pending row. The approval's id travels as `approval_id`: `id` is the frame's own correlation id |
+| `snap.export{env,path}` | CLI, plugins | write that env's newest stored pack to a host path as a self-contained bundle. Workspace push-out, so it is gated |
+| `kill{reason?}` / `resume{reason?}` | CLI, plugins | the kill switch over the socket: halt every harness and refuse every prompt, or let them back |
 | `stop` | CLI | graceful shutdown of everything, base included |
 | `status` | CLI | the snapshot plus one `tree` request per registered node |
 | `subscribe{env}` | CLI | this connection starts receiving `{"t":"event",...}` frames; `env` keeps only that env's events plus the base-wide ones |
@@ -643,19 +748,56 @@ or `null` for the guardian.
 cd ../beam && MIX_ENV=prod mix release        # the integration tests need it
 cd ../plugins/term && cargo build --release   # for the demo-plugin assertion
 cd ../../rs
-cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt --check
-TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test
+cargo build --release && cargo build --release --features http -p tenon-cli
+cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --check
+TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test --all-features
 ```
 
-104 tests in the crates below (`cargo test` prints 128: `rs/ui` brings its own 24, covered by
-its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 2
-(`token`, and `home::hash` — stable per home, distinct across homes), the 20-test
-adversarial suite, `sandbox`'s 2-test conformance suite, the 1-test gateway gate, the
+`--all-features` is what compiles and runs the `http` carrier's own test; without it that one
+test is not built and everything else is identical.
+
+112 tests in the crates below (`cargo test --all-features` prints 136: `rs/ui` brings its own
+24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 5
+(`token`, `home::hash` — stable per home, distinct across homes — the two `ui` model builders
+and the http form decoder), the 20-test adversarial suite, `sandbox`'s 2-test conformance
+suite, the 1-test gateway gate, the
 P3.2 worker suites (`worker/tests/fs_test.rs` 9, `snap_test.rs` 9, `pty_test.rs` 10,
 `cli/tests/worker_wire.rs` 3), the two P3.2 gates (`cli/tests/worker_boot.rs` 1,
 `cli/tests/spawn_gate.rs` 1), the P3.3 suites (`harness/tests/llm_test.rs` 5,
-`loop_test.rs` 11, `cli/tests/harness_gate.rs` 1, `harness_model.rs` 1) and the P3.4 gate
-(`cli/tests/storage_gate.rs` 1).
+`loop_test.rs` 12, `cli/tests/harness_gate.rs` 1, `harness_model.rs` 1), the P3.4 gate
+(`cli/tests/storage_gate.rs` 1) and the three P3.5 gates
+(`cli/tests/approvals_gate.rs` 1, `budget_gate.rs` 2, `ui_gate.rs` 2), which share
+`cli/tests/gate/mod.rs` — one fixture (temp home, `config.yml`, `profiles/root/harness.yml`,
+container reap on `Drop`) instead of three copies of the one `harness_gate.rs` grew.
+
+`cli/tests/approvals_gate.rs` (1, skipped without oci or a release, ~15 s here) is the P3.5
+approvals gate: one boot whose profile lists `bash` under `gated_tools` and whose mode is `ask`
+with an 8 s timeout, then four verdicts on real turns driven by the fake model. A `bash` call
+blocks in the queue while `tenon approvals` lists it; `tenon approve <id> --note` releases it and
+the tool result carries the sandbox's `tenon-ok`; a second call is answered `--deny` and reaches
+the model as a denied tool result with the reason, the turn surviving; a third is answered by
+nobody and expires, the row ending as `expired` and the model reading that; and a `snap.export`
+to a host path — an RPC gate rather than a tool gate — is denied and refuses with
+`snap.export needs a human`, leaving no file. Afterwards the pending queue is empty and
+`approval.pending`, `approval.decided` and `approval.expired` are all in that env's log.
+
+`cli/tests/budget_gate.rs` (2, same skips, ~11 s here) is the hard-stop half. The first drives a
+token budget of 25 against a fake model that reports 18 per turn: the first turn passes and the
+counter reads exactly 18, the second crosses the line, and then `budget.exceeded` names the
+budget and the limit, `status` shows `budget.halted` on the env, the next `tenon run` is refused
+non-zero with `halted ... budget tokens`, and `tenon reset --env root` clears the counter to 0
+and the env answers again. The second is the kill switch: writing `<home>/run/STOP` makes
+`status.killed` non-null within seconds and `tenon run` refuse with `kill switch`; removing the
+file clears it, the harness comes back and a turn runs.
+
+`cli/tests/ui_gate.rs` (2, same skips, ~19 s here) covers both carriers. `attach --ui` runs
+under a real pty (`script -q -c ... /dev/null`), gets one `q` on stdin, exits, and its output
+carries the ANSI clear, the env name, an ASCII border and the input hint. The HTTP test (only
+built with `--features http`) starts `tenon serve --http 127.0.0.1:0`, reads the bound address
+off stdout, and then: `GET /` is 200 with a `<pre>` page naming `root` and the prompt form,
+`POST /prompt` is 303 and a `turn/end` shows up in the log, a pending `approval.request` raised
+on another connection is resolved through `POST /approve/<id>` and the blocked caller sees
+`approved`, and an unknown path is 404.
 
 `storage` (14) is one test per table plus two the phase is about: `retain` over 100 packs
 keeping exactly the newest five, every tenth and one LKG ref (and dropping the 85 others
@@ -997,3 +1139,46 @@ accumulate across CI runs.
 34. **`memory_nodes`, `memory_edges` and `embeddings` have accessors and tests but no
     writer.** They are P5's tables; creating them now is what keeps that plugin a reader of
     an existing file rather than a migration of a live one.
+
+35. **Base owns the approval queue; G is notified, not asked.** RFC section 11 says "G owns the
+    queue and timeouts". G runs in a node with no state file, no socket of its own and a
+    read-only code path, so owning a queue would mean a second writer of the barebone's state
+    file and a second RPC surface. What base does instead: it writes the rows, holds the blocked
+    callers, expires them on a timer, and sends the guardian a one-way `notify{kind, data}` frame
+    for `approval.pending`, `budget.exceeded`, `kill.switch` and `kill.resume`. `Link` answers
+    that frame with `{ok: true}` and passes it on to whoever asked to be told — the only BEAM
+    change this phase (plus its test).
+36. **The approval id travels as `approval_id`.** `id` is the frame's own correlation id on the
+    front door, the same reason `plugin_id` exists; a field literally named `id` overwrites it
+    and the caller waits for a reply that is answered under a different number.
+37. **`config.patch` of an env overlay stays ungated by default.** The RFC gates "base config
+    changes"; RFC section 10's table makes L3 config agent-owned and auto. So `target: "base"`
+    (new, patching `config.yml` itself) is always gated and the env overlay is gated only when
+    `approval.gate_config_patch` is set.
+38. **`snap.export` is the workspace push-out, and it exports the newest pack.** RFC section 8
+    asks for "default clone-in / push-out with human review". Packs are self-contained
+    (deviation 14), so the newest one *is* a bundle a human can `git` against; exporting a range
+    would be a second format nothing reads yet.
+39. **Token usage is read off the session log, not from a new `llm/usage` event.** Every
+    `assistant/message` already carries the step's usage; counting it in `events.append` means
+    the budget cannot disagree with the log and the harness needed no change to be metered.
+40. **A budget breach halts the harness process; it does not unwind the turn.** Base has no way
+    to reach into a running turn, and the harness is restartable by design (its sessions are in
+    the log). So the hard stop is `SIGTERM` to that env's harness, no restart while halted, and
+    every later `session.create`/`session.prompt` refused with the reason. `tenon run` prints
+    the reason and exits non-zero because it watches for `budget.exceeded` and `kill.switch` in
+    the stream it is already reading.
+41. **Budget counters live in memory, not in the state file.** They are per boot: base restart
+    or `tenon reset` (with `budget_reset_on_reset`) clears them. Persisting them would make a
+    crash loop inherit a spend it cannot explain, and the log has the usage rows if a total is
+    ever wanted.
+42. **`tenon serve --http` is hand-rolled on tokio, not axum.** The RFC allows a feature-gated
+    axum; four CGI-like routes, no JSON API, no middleware and no state do not pay for a web
+    framework plus its tower/hyper-server tree in `--all-features` builds. The feature is still
+    off by default, so nothing here is in the default binary.
+43. **The `http` feature lives on `tenon-base` and is re-exported by `tenon-cli`.** `cargo build
+    --release --features http -p tenon-cli` is the build that has the `serve` subcommand; the
+    default binary does not list it at all.
+44. **The pty test drives `script -q`, not a `forkpty` helper.** `attach --ui` needs a real
+    terminal for `TIOCGWINSZ` and raw mode; `script` is in util-linux on every box this runs on
+    and keeps the test free of `unsafe`.

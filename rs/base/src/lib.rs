@@ -1,4 +1,6 @@
+pub mod approvals;
 pub mod base;
+pub mod budget;
 pub mod client;
 pub mod config;
 pub mod envfiber;
@@ -6,6 +8,8 @@ pub mod envrpc;
 pub mod frame;
 pub mod harness;
 pub mod home;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod instance;
 pub mod integrity;
 pub mod lock;
@@ -20,6 +24,8 @@ pub mod snap;
 pub mod spawn;
 pub mod state;
 pub mod token;
+pub mod tui;
+pub mod ui;
 pub mod worker;
 
 use crate::client::Client;
@@ -92,6 +98,12 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
     let (cmds, cmd_rx) = mpsc::unbounded_channel();
     let (exits, exit_rx) = mpsc::unbounded_channel();
     spawn_reap(sandbox.clone(), home.hash(), cmds.clone());
+    budget::watch_stop_file(home.run().join(budget::STOP_FILE), cmds.clone());
+    Signals::kill_switch(cmds.clone())?;
+    budget::ticker(
+        Duration::from_millis(config.budget_tick_ms.max(500)),
+        cmds.clone(),
+    );
     let state = base::Base::new(
         home.clone(),
         config.clone(),
@@ -203,6 +215,51 @@ pub async fn attach(home: Option<PathBuf>, env: Option<String>) -> Result<i32> {
             },
         }
     }
+}
+
+/// `tenon approvals`: the queue as a human reads it, newest last. The same
+/// rows `approval.list` answers with, one line each.
+pub async fn approvals(home: Option<PathBuf>, status: Option<String>) -> Result<i32> {
+    let home = Home::resolve(home)?;
+    let mut client = Client::connect(&home.sock()).await?;
+    let status = status.unwrap_or_else(|| "pending".to_string());
+    let result = client
+        .call("approval.list", json!({ "status": status }))
+        .await?;
+    let rows = result["approvals"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("tenon: no {status} approvals");
+        return Ok(0);
+    }
+    for row in rows {
+        println!(
+            "{} {} {} {} {}",
+            row["id"],
+            row["status"].as_str().unwrap_or("?"),
+            row["env"].as_str().unwrap_or("-"),
+            row["kind"].as_str().unwrap_or("-"),
+            row["reason"].as_str().unwrap_or_default()
+        );
+    }
+    Ok(0)
+}
+
+/// `tenon approve <id>`: the human half of the gate. `--deny` is the other
+/// verdict; both release whatever call is blocked on the row.
+pub async fn approve(
+    home: Option<PathBuf>,
+    id: i64,
+    deny: bool,
+    note: Option<String>,
+) -> Result<i32> {
+    let mut params = json!({
+        "approval_id": id,
+        "decision": match deny { true => "deny", false => "approve" },
+    });
+    if let Some(note) = note {
+        params["note"] = json!(note);
+    }
+    rpc(home, "approval.answer", params).await
 }
 
 pub async fn rpc(home: Option<PathBuf>, method: &str, params: Value) -> Result<i32> {
