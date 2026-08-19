@@ -1748,10 +1748,13 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tar",
+ "tenon-bus",
  "tenon-sandbox",
  "tenon-storage",
  "tenon-ui",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1777,6 +1780,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tenon-base",
+ "tenon-bus",
  "tenon-harness",
  "tenon-sandbox",
  "tenon-test-support",

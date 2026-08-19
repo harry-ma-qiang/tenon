@@ -47,4 +47,16 @@ impl Client {
             }
         }
     }
+
+    /// The next bus envelope frame (`t:"ev"`, RFC section 4), skipping replies
+    /// and legacy `event` frames. What a `bus.subscribe`/`kv.watch` client reads.
+    pub async fn next_ev(&mut self) -> Result<Option<Value>> {
+        loop {
+            match frame::read(&mut self.stream).await? {
+                None => return Ok(None),
+                Some(body) if frame::method(&body) == Some("ev") => return Ok(Some(body)),
+                Some(_other) => continue,
+            }
+        }
+    }
 }

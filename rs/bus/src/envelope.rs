@@ -45,6 +45,7 @@ impl Level {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub topic: String,
+    #[serde(default)]
     pub ts: i64,
     #[serde(default)]
     pub host: String,
@@ -52,6 +53,7 @@ pub struct Envelope {
     pub env: Option<String>,
     #[serde(default)]
     pub src: String,
+    #[serde(default = "default_level")]
     pub level: Level,
     #[serde(default)]
     pub durable: bool,
@@ -63,11 +65,16 @@ pub struct Envelope {
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<i64>,
+    #[serde(default)]
     pub event_id: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
     #[serde(default)]
     pub payload: Value,
+}
+
+fn default_level() -> Level {
+    Level::Info
 }
 
 impl Envelope {

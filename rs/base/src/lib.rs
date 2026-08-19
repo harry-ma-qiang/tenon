@@ -1,8 +1,10 @@
 pub mod approvals;
 pub mod base;
 pub mod bench;
+pub mod blob;
 pub mod bluegreen;
 pub mod budget;
+pub mod bus;
 pub mod candidate;
 pub mod check;
 pub mod client;
@@ -11,6 +13,7 @@ pub mod config;
 pub mod drive;
 pub mod envfiber;
 pub mod envrpc;
+pub mod facaderpc;
 pub mod frame;
 pub mod harness;
 pub mod hash;
@@ -19,6 +22,7 @@ pub mod home;
 pub mod http;
 pub mod instance;
 pub mod integrity;
+pub mod kv;
 pub mod lock;
 pub mod manifest;
 pub mod node;
@@ -36,6 +40,7 @@ pub mod signals;
 pub mod snap;
 pub mod spawn;
 pub mod state;
+pub mod timer;
 pub mod token;
 pub mod tui;
 pub mod ui;
@@ -118,7 +123,8 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         Duration::from_millis(config.budget_tick_ms.max(500)),
         cmds.clone(),
     );
-    let state = base::Base::new(
+    let facades = bus::Facades::build(&home)?;
+    let mut state = base::Base::new(
         home.clone(),
         config.clone(),
         store,
@@ -128,12 +134,14 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         exits,
         cmds.clone(),
     );
+    state.hub = Some(facades.hub.clone());
     tokio::spawn(server::serve(
         listener,
         cmds.clone(),
         server::Opts {
             root_env: config.root_env.clone(),
             timeout: Duration::from_millis(config.request_timeout_ms),
+            facades: Some(facades),
         },
     ));
     let actor = tokio::spawn(state.run(cmd_rx, exit_rx));
