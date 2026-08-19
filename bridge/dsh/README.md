@@ -114,6 +114,42 @@ is gone. `test/dsh_loader_test.exs` (1) drives the loader's DSH collapse against
 live profile: a row added by `Tenon.Loader.reload/1` loads inside the running Node process,
 no restart.
 
+## DSH as a runtime (P3.5)
+
+The bridge mounts DSH *inside* a Tenon environment. The other direction — DSH replacing the
+default runtime of an environment, which RFC section 4 allows for anything that meets the
+runtime contract — needs no bridge change: it needs one frame on base's front door.
+
+```
+tenon start                    base
+  |                              |
+  +-- env root ------------------+  run/rt-root.token   (0600, base writes it)
+        |                           ^
+        +-- dsh (host process) -----+  reads the token, then:
+
+{"t":"runtime.register","id":1,"env":"root","token":"<run/rt-root.token>",
+ "manifest": {"name":"dsh","version":"0.9.1","hash":"sha256:<release>"},
+ "health":   {"kind":"http","target":"http://127.0.0.1:8790/health"},
+ "channels": {"events":"events.append","approvals":"approval.request"}}
+```
+
+Base authenticates the token against the env base generated it for, checks the contract
+(all three objects, every manifest field, `health.kind` of `rpc` or `http`), and then
+**calls the health target itself**: an `http` target is a GET that has to answer 2xx, an
+`rpc` target is a `service.method` pair base sends into that env's node as a `svc` frame.
+Only a runtime that answers is recorded; anything else comes back as an error naming the
+reason and a `runtime.refused` row in that env's log. `tenon status` then shows the
+runtime beside the worker and the harness.
+
+For a DSH runtime the two channels are the frames DSH would use for the session log and
+the human gate — `events.append` and `approval.request` on the same socket. Nothing in
+`src/plugin.ts` is involved: registering is a socket frame, not a plugin.
+
+The stub test for this shape is `rs/cli/tests/contract_gate.rs`, which registers a
+`dsh`-named manifest against an `rpc` target and a `dsh-bridge`-named one against a real
+`http` health endpoint, and asserts the refusals (bad token, missing manifest field,
+unknown health kind, a 503 health endpoint) as well.
+
 ## Deviations
 
 1. **`inject` is not used.** Cordis would reload the plugin when a provider changes, which

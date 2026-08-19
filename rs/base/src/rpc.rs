@@ -90,6 +90,17 @@ pub enum Cmd {
         approved: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    RuntimeRegister {
+        env: String,
+        params: Value,
+        token: String,
+        reply: Option<oneshot::Sender<Result<Value, String>>>,
+    },
+    RuntimeProbed {
+        runtime: Box<crate::runtime::Runtime>,
+        outcome: Result<i64, String>,
+        reply: Option<oneshot::Sender<Result<Value, String>>>,
+    },
     Approval {
         env: String,
         reason: String,
@@ -208,6 +219,7 @@ pub struct NodeView {
     pub children: Vec<String>,
     pub worker: Value,
     pub harness: Value,
+    pub runtime: Option<Value>,
 }
 
 pub struct Snapshot {

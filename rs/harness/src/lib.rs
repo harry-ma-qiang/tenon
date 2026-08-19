@@ -131,6 +131,7 @@ fn router(
 ) -> Router {
     let mut router = Router::default();
     for name in [
+        "ping",
         "session.create",
         "session.prompt",
         "session.status",

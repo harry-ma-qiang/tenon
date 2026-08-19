@@ -193,6 +193,7 @@ impl Base {
                 sandbox: None,
                 exited: None,
                 token: String::new(),
+                runtime_token: String::new(),
                 parent: Some(parent.to_string()),
                 depth,
                 profile,

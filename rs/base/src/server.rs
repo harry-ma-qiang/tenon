@@ -130,6 +130,17 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             })
             .await
         }
+        "runtime.register" => {
+            let params = body.clone();
+            let token = string(body, "token", "");
+            ask(cmds, |reply| Cmd::RuntimeRegister {
+                env,
+                params,
+                token,
+                reply: Some(reply),
+            })
+            .await
+        }
         "approval.request" => {
             let reason = string(body, "reason", "unspecified");
             let kind = string(body, "kind", "agent");
@@ -358,6 +369,7 @@ async fn node_json(node: &NodeView, opts: &Opts) -> Value {
         "children": node.children,
         "worker": node.worker,
         "harness": node.harness,
+        "runtime": node.runtime,
         "budget": node.budget,
         "tree": tree,
     })

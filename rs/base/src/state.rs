@@ -40,6 +40,7 @@ pub struct Node {
     pub sandbox: Option<Arc<dyn Instance>>,
     pub exited: Option<oneshot::Receiver<Option<i32>>>,
     pub token: String,
+    pub runtime_token: String,
     pub parent: Option<String>,
     pub depth: u32,
     pub profile: String,
@@ -79,6 +80,7 @@ impl Base {
             "depth": node.depth,
             "worker": worker_view(&node.worker),
             "harness": crate::harness::view(&node.harness, node.harness_restarts),
+            "runtime": self.runtime_view(env),
             "budget": self.budget_view(env),
             "children": self.children_of(env),
         }))
@@ -123,6 +125,7 @@ impl Base {
                     children: self.children_of(env),
                     worker: worker_view(&node.worker),
                     harness: crate::harness::view(&node.harness, node.harness_restarts),
+                    runtime: self.runtime_view(env),
                 })
                 .collect(),
         }

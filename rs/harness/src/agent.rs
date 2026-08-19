@@ -77,6 +77,7 @@ impl Agent {
             .unwrap_or_default()
             .to_string();
         match method {
+            "ping" => Ok(json!("pong")),
             "session.create" => self.create().await,
             "session.prompt" => {
                 let text = params

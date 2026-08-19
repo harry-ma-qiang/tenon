@@ -109,6 +109,12 @@ impl Home {
         self.run().join("base.ready.tmp")
     }
 
+    /// The env's runtime token, owner-readable only: how a runtime a human
+    /// starts by hand authenticates its `runtime.register`.
+    pub fn runtime_token_file(&self, env: &str) -> PathBuf {
+        self.run().join(format!("rt-{env}.token"))
+    }
+
     pub fn lock_file(&self) -> PathBuf {
         self.run().join("base.lock")
     }

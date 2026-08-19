@@ -33,6 +33,7 @@ pub struct Base {
     pub stopping: bool,
     pub pending: BTreeMap<i64, crate::approvals::Pending>,
     pub killed: Option<String>,
+    pub runtimes: BTreeMap<String, crate::runtime::Runtime>,
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -71,6 +72,7 @@ impl Base {
             stopping: false,
             pending: BTreeMap::new(),
             killed: None,
+            runtimes: BTreeMap::new(),
         }
     }
 
@@ -114,6 +116,7 @@ impl Base {
         self.generation += 1;
         let generation = self.generation;
         let token = crate::token::generate();
+        let runtime_token = crate::token::generate();
         let depth = parent
             .as_ref()
             .and_then(|name| self.nodes.get(name))
@@ -166,6 +169,7 @@ impl Base {
             sandbox,
             exited: running.exited,
             token,
+            runtime_token: runtime_token.clone(),
             parent: previous
                 .as_ref()
                 .and_then(|old| old.parent.clone())
@@ -188,6 +192,8 @@ impl Base {
             budget,
         };
         self.nodes.insert(env.to_string(), node);
+        self.runtimes.remove(env);
+        self.write_runtime_token(env, &runtime_token);
         let _ = self
             .store
             .put_env(env, role, Some(running.pid as i64), "starting");

@@ -19,6 +19,7 @@ pub mod peer;
 pub mod release;
 pub mod rpc;
 pub mod run;
+pub mod runtime;
 pub mod server;
 pub mod signals;
 pub mod snap;
