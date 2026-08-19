@@ -41,9 +41,9 @@ Envelope {
   payload                 JSON; bulk data goes to blob and is referenced by hash
 }
 ```
-Closed fields drive storage/delivery/visibility decisions; tags/topics are open (anyone declares;
-`topic.declare` optional, for discovery/UI columns only; a CI lint lists unregistered topics, never
-fails). Envelope size cap = wire frame cap.
+Closed fields drive storage/delivery/visibility decisions; tags/topics are open (anyone declares).
+`topic.declare` (discovery/UI columns) is deferred until the UI needs it; a CI lint lists topics
+found in code, never fails. Envelope size cap = wire frame cap.
 
 ## 3. The four facades (the only way anything touches state)
 
@@ -89,7 +89,7 @@ query; guardian probes read the bus.
   embeddings belong to P5 memory). Query fans out to relevant segments (time/session
   pruning) in parallel and merges — single-host shard query. Version-gated: wrong version -> drop
   and rebuild.
-- Acceptance at 10M events: text/vector < 50 ms, scan/aggregate < 200 ms, flat month-over-month.
+- Acceptance at 10M events: text < 50 ms, scan/aggregate < 200 ms, flat month-over-month (vector budgets belong to P5).
 - P4 ships hot layer + the segment interfaces; the warm compactor is P4.3 and may land after P5
   starts (Engram consumes the `query` facade, not the engine).
 
@@ -105,7 +105,8 @@ support deferred until a real >1 GB case appears).
 kv carries revision + lease + watch (etcd semantics) so membership/placement/scheduler are later
 plugins: hosts hold TTL leases under `/hosts/`, desired env state under `/envs/<id>/spec` with a
 reconciliation loop (Kubernetes pattern) — the future task manager, orthogonal to the navigator.
-Envelope has `host` + `origin`; `bus.bridge{peer}` reserved (unsupported); ids host-prefixed;
+Envelope `host` is the origin host (loop prevention when bridging); a future bridge is a plain
+plugin built on subscribe+publish, no reserved RPC; ids host-prefixed;
 `runtime.spawn{placement}` placeholder; kv durable layer is written as append-log + snapshot so Raft
 (openraft) can replace it without API change. Federation itself (SWIM/Raft/mTLS/topic bridge) is P6.
 
@@ -191,4 +192,4 @@ parquet in P4.3, feature-gated).
    fallback.
 3. Vector/embedding engine belongs to P5 memory; P4 keeps only the query.vector stub.
 4. UI fully subscription-driven; ControlLease added to kv.
-5. TLS/auth are documented pluggable seams, off by default, outside P4 gates.
+5. TLS/auth/WS moved INTO P4 scope (P4.4), feature-gated, off by default; production SSO stays a documented seam.
