@@ -10,6 +10,32 @@ in. Nothing else in the repo reads them, so editing one by hand is fine.
 | `systemd/tenon.service` | systemd | user unit (`systemctl --user`), never a system unit |
 | `launchd/com.tenon.base.plist` | launchd | LaunchAgent in `~/Library/LaunchAgents` |
 
+## Getting the binary (P3.6)
+
+One file, no runtime dependencies but libc: the BEAM release is embedded in it and unpacked
+into `~/.tenon/erts/<version>-<sha>/` on first start.
+
+```
+# from a release
+curl -fsSLO https://github.com/<owner>/tenon/releases/latest/download/tenon-linux-x86_64
+curl -fsSLO https://github.com/<owner>/tenon/releases/latest/download/tenon-linux-x86_64.sha256
+sha256sum -c tenon-linux-x86_64.sha256
+install -m 0755 tenon-linux-x86_64 ~/bin/tenon
+
+# or from a checkout
+scripts/build-release.sh --verify       # -> dist/tenon-<os>-<arch> and its .sha256
+```
+
+Three artefacts per tag — `tenon-linux-x86_64`, `tenon-linux-aarch64`, `tenon-macos-arm64` —
+each built by `.github/workflows/release.yml` with `scripts/build-release.sh --verify`, so
+every published binary has booted a throwaway home from its own payload before it was
+uploaded. They are **glibc-dynamic** and need the build machine's glibc or newer; `rs/README.md`
+covers that and the static musl alternative.
+
+Put the binary somewhere the service manager can still read after an upgrade — the unit
+records an absolute path, and `install-service` writes the path of the binary that ran it.
+Upgrading in place means replacing that file and restarting the unit.
+
 ## Install
 
 ```

@@ -13,6 +13,9 @@ bridge/dsh/test/deps/
 # Rust (Cargo.lock is committed: every crate here is a binary)
 target/
 
+# Release artefacts: built by scripts/build-release.sh, uploaded by CI
+dist/
+
 # BEAM / Elixir / Erlang
 _build/
 cover/

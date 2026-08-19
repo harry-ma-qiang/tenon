@@ -29,12 +29,40 @@ Design reference: Cordis (MIT), see NOTICE. Decisions, phase plans and status: `
 
 ## Quick start
 
-Toolchain: OTP 27 and Elixir 1.18 (`mise use -g erlang@27 elixir@1.18-otp-27`), plus
-node 22+ with pnpm for the TypeScript parts, a stable rust toolchain for `sdk/rs` and
-`plugins/term`, and python3 for `sdk/py`. Only the first pair is needed for the kernel.
+One file. `tenon` is a single binary with the whole BEAM release — ERTS, kernel, loader,
+guardian and gateway — embedded as a payload and unpacked into `~/.tenon/erts/` the first
+time it runs. Nothing else has to be installed to *use* it: no Erlang, no Elixir, no
+container engine (a sandbox backend is detected, and the barebone boots without one).
 
 ```
-cd cli && mix escript.build          # -> cli/tenon
+curl -fsSLO https://github.com/<owner>/tenon/releases/latest/download/tenon-linux-x86_64
+sha256sum -c tenon-linux-x86_64.sha256 && chmod +x tenon-linux-x86_64 && mv tenon-linux-x86_64 ~/bin/tenon
+
+tenon start                       # base + guardian node G + the root environment
+tenon status                      # what is up, which sandbox backend, which release
+tenon run "summarise this repo"   # one task, streamed out of the session log
+tenon attach --ui                 # the built-in ASCII UI
+tenon stop
+```
+
+Point it at a model first — `~/.tenon/profiles/root/harness.yml` holds the provider, the
+model and the *name* of the environment variable your key lives in; the key never enters
+the sandbox. `rs/README.md` is the reference for the home layout, the roles and the
+sandbox backends, `deploy/README.md` for running it under systemd or launchd.
+
+To build that binary yourself, or to work on Tenon:
+
+```
+scripts/build-release.sh --verify     # -> dist/tenon-<os>-<arch> + .sha256
+```
+
+Toolchain for that, and for everything below: OTP 27 and Elixir 1.18
+(`mise use -g erlang@27 elixir@1.18-otp-27`) plus a stable rust toolchain; node 22+ with
+pnpm for the TypeScript parts and python3 for `sdk/py`. Only the first pair is needed for
+the kernel alone.
+
+```
+cd cli && mix escript.build          # -> cli/tenon, the config-tree CLI below
 ```
 
 Run a python plugin from a config tree. Two files, both relative to `cli/`:
@@ -87,9 +115,13 @@ Every commit, in each project you touched:
 | `loader/`, `cli/` | the same plus `mix credo --strict` |
 | `sdk/test/`, `bridge/dsh/test/` | `mix test` |
 | `beam/` | the loader gates plus `MIX_ENV=prod mix release` |
-| `rs/` | `cargo build --release`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test` |
+| `rs/` | `cargo build --release`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`, `cargo test --all-features` (with `TENON_RELEASE_DIR` set; the adversarial suite on its own) |
 | `sdk/rs/`, `plugins/term/` | `cargo build --release`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` |
 | `sdk/ts/`, `bridge/dsh/` | `pnpm exec tsc --noEmit` |
+
+The same gates run on every push and pull request (`.github/workflows/ci.yml`); a `v*` tag
+builds and publishes the single binary for linux-x86_64, linux-aarch64 and macos-arm64
+(`.github/workflows/release.yml`).
 
 Coding rules for agents and humans: `AGENTS.md`.
 
