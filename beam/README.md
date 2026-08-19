@@ -124,6 +124,16 @@ is a child of the gateway fiber, so unmounting the gateway (or its node dying) d
 them for free, the same cascade that already unwinds any other parent/child mount.
 Mounted only in agent-role nodes — a guardian node has no sandbox to register plugins from.
 
+## Check
+
+`Tenon.Beam.Check` is the kernel contract suite, shipped as a release artifact so an
+installed machine can verify a candidate `tenon.beam` without a development tree.
+`bin/tenon_beam eval 'Tenon.Beam.Check.main()'` with `TENON_CHECK_BEAM` set loads that beam
+into this fresh node, runs every point and prints one JSON report; base drives it as
+`tenon check kernel [--beam PATH]`. The points, the wire plugin (a process of the same VM on
+a loopback socket, so no python is needed) and the `TENON_KERNEL_CONTRACT=1` versioning rule
+are documented in `../kernel/README.md`.
+
 ## Tests
 
 ```
@@ -131,7 +141,7 @@ mix compile --warnings-as-errors && mix format --check-formatted
 mix credo --strict && mix test && MIX_ENV=prod mix release
 ```
 
-35 tests. `test/link_test.exs` (14) covers register, `health`, `tree`, `reload`, the unknown
+38 tests. `test/link_test.exs` (14) covers register, `health`, `tree`, `reload`, the unknown
 method, request correlation in both outcomes, the node-stop on close, and the failed load
 without a socket. `test/guardian_test.exs` (15) covers one test per probe kind — base not answering, an
 unhealthy env, a root fiber that is not active, a worker and a harness that do not answer
@@ -143,7 +153,10 @@ the probe names, recovery clearing the count, and the target name. Both run agai
 `Tenon.Beam.Test.Base`, a fake base on a real unix socket that answers per method (and per
 service name for `svc`, so the worker and harness probes can be failed separately).
 `test/registry_test.exs` (2) covers the
-builtin names and the spec shapes. `test/gateway_test.exs` (4) starts a kernel and a gateway on a temp UDS path and connects
+builtin names and the spec shapes. `test/check_test.exs` (3) runs the contract suite against the compiled kernel (every point
+passes), against a corrupted beam (one `load` failure naming the reason, no point run) and
+against a contract version the suite does not implement (refused by name).
+`test/gateway_test.exs` (4) starts a kernel and a gateway on a temp UDS path and connects
 fake clients directly (no base needed): a `:tenon.svc` call reaches a connected client,
 disconnecting fails that client's fiber and drops its service, a second client gets its own
 fiber, and unmounting the gateway drops an active connection's service.

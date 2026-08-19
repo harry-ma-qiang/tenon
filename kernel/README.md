@@ -387,6 +387,52 @@ listens for and accepts (standing in for a gateway): hook + svc round trip, `unm
 closing the socket and ending the process, `SIGKILL` of the plugin failing the fiber,
 `restart` failing a socket fiber outright, and an oversized reply over the socket.
 
+## The contract and `tenon check kernel` (P3.7)
+
+The kernel is the one L1 artifact of RFC section 10: an agent may replace `tenon.erl` in its
+own environment, but only if the replacement still keeps this file's promises. What
+"promises" means is a suite, not a prose list, and the suite has to run **on the machine
+that installs the kernel**, where there is no development tree, no `mix` and no test files.
+
+So the contract suite ships inside the beam release as ordinary code
+(`../beam/lib/tenon/beam/check.ex` and `check/`), and base runs it:
+
+```
+tenon check kernel                      # the tenon.beam the release ships
+tenon check kernel --beam /tmp/new.beam # a candidate an agent built
+```
+
+Base runs `bin/tenon_beam eval 'Tenon.Beam.Check.main()'` in a fresh node with
+`TENON_CHECK_BEAM` naming the candidate. The suite purges `tenon`, loads that file with
+`code:load_binary/3` (a release runs in embedded mode, so a candidate beam is on no code
+path and cannot be loaded any other way), runs every point against it and prints one JSON
+document; the exit status is 0 only if every point passed.
+
+| Point | What it asserts |
+|---|---|
+| `exports` | the module exports every function of the API table above, at every arity |
+| `mount_unmount` | a plugin loads on `mount`, shows in `tree`, and `unmount` runs its disposers and ends the fiber |
+| `disposers` | disposers run in reverse registration order |
+| `kill_sweep` | `exit(Fiber, kill)` leaves no fiber, service or hook row behind |
+| `inject` | a dependent waits for its provider, loads when it appears, unloads when it goes |
+| `hooks` | `emit` order and isolation, `prepend`, the `call` waterfall rewriting and short-circuiting, `bail` |
+| `provide_svc` | module impl and `fun/2` impl through `svc`, `get` on an absent name, duplicate `provide` raises |
+| `socket_fiber` | wire v1.2: `hello`, `load`, `provide`, a `svc` round trip, a `call`-mode hook answered with `next`, and `unmount` closing the socket |
+| `frame_cap` | an oversized reply and an oversized outgoing frame both answer `{error, frame_too_large}` and leave the fiber usable |
+| `hot_swap` | loading the module again under a live kernel keeps every fiber active and every service and hook row intact |
+
+The wire points need no python and no script file: the plugin half is a process of the same
+VM speaking frames over a loopback socket, which is what makes the suite runnable anywhere
+the release runs.
+
+**Versioning.** The suite declares `TENON_KERNEL_CONTRACT=1` and base asks for exactly that
+version; a suite that does not implement the requested version refuses instead of pretending.
+The version is the *contract*, not the kernel: bug fixes, performance work and new optional
+functions keep contract 1, while changing a frame, an existing function's meaning or a
+lifecycle rule is contract 2 and needs a human to ship both halves (RFC section 10: "changing
+the contract needs a human"). `tenon.erl`'s own version is whatever the release says; the
+contract is what an upgrade is judged against.
+
 ## Deviations from NOTES section 9
 
 1. **External unload terminates the plugin process.** Section 9.4 only describes this for

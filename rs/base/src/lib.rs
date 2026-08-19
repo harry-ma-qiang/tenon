@@ -1,6 +1,7 @@
 pub mod approvals;
 pub mod base;
 pub mod budget;
+pub mod check;
 pub mod client;
 pub mod cmds;
 pub mod config;
