@@ -1663,3 +1663,55 @@ adversarial suite run in parallel inside `cargo test -p tenon-cli --tests` (CI's
 adversarial` filters test *names*, and no adversarial test is named "adversarial", so it runs
 there too) fails its teardown assertion in about one run in three (2 of 6 runs here). It was reproduced on the
 unmodified tree during this pass, before any test file was touched.
+
+## 30. P3 final QA (2026-08-19)
+
+Independent QA pass over P3.0-3.8, commit `b57af93`, clean tree. Full write-up:
+`REVIEW-P3.md`. Summary:
+
+Gates: kernel 66, loader 69, cli 7, beam 38, sdk/test 16 tests, all 0 failures, credo strict
+clean, format clean; `rs/` 173 tests 0 failures (`cargo build --release --all-features`,
+`clippy -D warnings`, `fmt --check`, `machete` all clean, zero unused deps). Two intermittent
+findings, both load-induced and characterized: a `beam` `LinkTest` teardown race (not
+reproduced on rerun) and a `bridge/dsh/test` HMR-watcher race (~50% reproducible, plausible
+root cause identified — a DSH-side timing issue, not a Tenon regression). The Rust
+adversarial suite's previously-documented flaky teardown (§29) did not trigger in either full
+run of this pass.
+
+Coverage: `loader` 92.25%, `beam` 76.3-76.5% (below its own 90% Mix gate, pre-existing debt),
+`kernel` 78.15% (full-suite number is an artifact — the adversarial suite's own
+`:code.purge`/`:code.load_file` discards `cover`'s instrumentation). `rs/` workspace 77.92%
+line / 74.83% region / 72.26% function under `cargo llvm-cov`, confirmed to include the
+container-booting integration suites, not just unit tests. Least-covered: `harness/bus.rs`
+0%, `harness/manage.rs` 2.70%, `worker/service.rs` 4.60% — the agent-facing management-tools
+and raw-bus paths are the least test-verified part of the harness.
+
+`cargo machete`: zero unused deps. `mix xref`: one 2-file cycle in `loader` (not fixed, just
+reported).
+
+End-to-end, real model (`deepseek-v4-flash`): the full CLI surface (`start/status/run/reset/
+attach --ui/stop`), a guard plugin mounted via profile denying `rm -rf`, the approvals flow
+(`gated_tools`, `tenon approve`), and the HTTP carrier (`GET /`, `POST /prompt`, `/approve/
+<id>`, `/rollback`) all PASS. The shipping single-file binary (`scripts/build-release.sh`,
+no release dir, payload-only) boots and runs a real turn. The DSH web smoke
+(`playground/smoke/smoke.mjs`) against the live demo: 4/4 PASS, untouched throughout.
+
+Two real findings, not fixed, documented in `REVIEW-P3.md`: the demo guard plugin is a plain
+substring filter on `"rm -rf"`, trivially bypassed by rephrasing (`rm -r`) — correctly scoped
+as a hook-point demo per the RFC's "no deny lists inside the VM" stance, but worth flagging
+loudly since it is not a security control; and `scripts/build-release.sh` silently clobbers
+the `--all-features` dev binary at `rs/target/release/tenon` (same output path, different
+feature sets).
+
+Performance, Tenon-native vs DSH, same box/model, apples-to-oranges stated plainly (DSH's
+Node UI process vs Tenon's oci container boot): cold start 1300-1571ms (Tenon; DSH not
+re-measured to avoid disturbing the live demo); idle RSS ~309MB (Tenon) vs ~298MB (DSH);
+local no-model tool round trip 133.7-141.1ms (Tenon; no comparable DSH HTTP endpoint exists);
+e2e "pong" 704-1078ms (Tenon) vs 1028-1533ms (DSH); e2e one bash tool call 2011-2134ms
+(Tenon) vs 2545-3050ms (DSH) — Tenon faster on both real-model comparisons on this box.
+
+krun remains the one gate not exercised anywhere in this pass: no `/dev/kvm` on this box: compiled, unit
+tested, conformance suite skips itself with a reason string. Needs a KVM/HVF host or CI.
+
+A live Tenon instance was left running for direct inspection: `TENON_HOME=~/.tenon-demo`,
+HTTP UI at `http://127.0.0.1:38080/`, distinct from the user's own DSH demo on `:3080`.
