@@ -131,7 +131,7 @@ mix compile --warnings-as-errors && mix format --check-formatted
 mix credo --strict && mix test && MIX_ENV=prod mix release
 ```
 
-32 tests. `test/link_test.exs` (9) covers register, `health`, `tree`, `reload`, the unknown
+35 tests. `test/link_test.exs` (14) covers register, `health`, `tree`, `reload`, the unknown
 method, request correlation in both outcomes, the node-stop on close, and the failed load
 without a socket. `test/guardian_test.exs` (15) covers one test per probe kind — base not answering, an
 unhealthy env, a root fiber that is not active, a worker and a harness that do not answer
@@ -142,7 +142,8 @@ approved sibling passes — plus the quiet path, the reset after N failing passe
 the probe names, recovery clearing the count, and the target name. Both run against
 `Tenon.Beam.Test.Base`, a fake base on a real unix socket that answers per method (and per
 service name for `svc`, so the worker and harness probes can be failed separately).
-`test/gateway_test.exs` (4) starts a kernel and a gateway on a temp UDS path and connects
+`test/registry_test.exs` (2) covers the
+builtin names and the spec shapes. `test/gateway_test.exs` (4) starts a kernel and a gateway on a temp UDS path and connects
 fake clients directly (no base needed): a `:tenon.svc` call reaches a connected client,
 disconnecting fails that client's fiber and drops its service, a second client gets its own
 fiber, and unmounting the gateway drops an active connection's service.
