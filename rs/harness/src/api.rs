@@ -1,4 +1,4 @@
-use crate::bus::{BoxFut, EpisodeRow, Event, Log, ToolRow};
+use crate::bus::{BoxFut, EpisodeRow, Event, Gate, Log, ToolRow};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -90,6 +90,45 @@ impl Api {
             object.insert("env".to_string(), json!(self.env));
         }
         self.lane(lane, method, params).await
+    }
+}
+
+/// The gated-tool half of the front door: one `approval.request` per call,
+/// which base holds until a human answers `tenon approve` or the row expires.
+pub struct ApiGate {
+    api: std::sync::Arc<Api>,
+}
+
+impl ApiGate {
+    pub fn new(api: std::sync::Arc<Api>) -> Self {
+        Self { api }
+    }
+}
+
+impl Gate for ApiGate {
+    fn check<'a>(&'a self, name: &str, args: &Value) -> BoxFut<'a, Result<(), String>> {
+        let reason = format!("tool {name} {args}");
+        let name = name.to_string();
+        Box::pin(async move {
+            let answer = self
+                .api
+                .env_call(
+                    "approval.request",
+                    json!({"reason": reason, "kind": "tool"}),
+                )
+                .await?;
+            let status = answer
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("denied");
+            match status {
+                "approved" => Ok(()),
+                other => Err(format!(
+                    "tool {name} needs a human and the approval is {other}: {}",
+                    answer.get("reason").and_then(Value::as_str).unwrap_or("")
+                )),
+            }
+        })
     }
 }
 

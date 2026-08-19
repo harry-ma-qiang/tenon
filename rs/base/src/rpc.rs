@@ -85,13 +85,50 @@ pub enum Cmd {
     },
     ConfigPatch {
         env: String,
+        target: String,
         patch: Value,
+        approved: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     Approval {
         env: String,
         reason: String,
+        kind: String,
         reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ApprovalList {
+        status: Option<String>,
+        limit: i64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ApprovalAnswer {
+        id: i64,
+        decision: String,
+        note: Option<String>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ApprovalExpire {
+        id: i64,
+    },
+    /// The prompt gate: a halted env and a killed base refuse with a reason
+    /// instead of queueing a turn nobody will run.
+    Guard {
+        env: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    Halt {
+        env: String,
+        reason: String,
+    },
+    Kill {
+        on: bool,
+        reason: String,
+        reply: Option<oneshot::Sender<Result<Value, String>>>,
+    },
+    BudgetTick,
+    Processes {
+        env: String,
+        count: i64,
     },
     WorkerReady {
         env: String,
@@ -106,6 +143,12 @@ pub enum Cmd {
         env: String,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    SnapExport {
+        env: String,
+        path: String,
+        approved: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     SnapPacked {
         env: String,
         step: i64,
@@ -116,6 +159,7 @@ pub enum Cmd {
         peer: u64,
         parent: Option<String>,
         overrides: Value,
+        approved: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     RuntimeStop {
@@ -152,6 +196,7 @@ pub enum Cmd {
 
 pub struct NodeView {
     pub env: String,
+    pub budget: Value,
     pub role: String,
     pub pid: Option<i32>,
     pub registered: bool,
@@ -166,6 +211,7 @@ pub struct NodeView {
 }
 
 pub struct Snapshot {
+    pub killed: Option<String>,
     pub home: PathBuf,
     pub release: PathBuf,
     pub pid: u32,

@@ -96,7 +96,9 @@ create table if not exists approvals (
   id integer primary key autoincrement,
   env text not null,
   reason text not null,
+  kind text not null default '',
   status text not null,
+  note text,
   created_at integer not null,
   decided_at integer
 );
@@ -140,11 +142,14 @@ pub fn version(conn: &Connection) -> Result<i64> {
 
 /// Columns added to a table that already existed: `create table if not exists`
 /// never adds one, and a duplicate-column error means the migration already
-/// ran. Both arrived with P3.2, before this file had versions at all.
+/// ran. The `envs` pair arrived with P3.2, before this file had versions at
+/// all; the `approvals` pair with P3.5, over files whose step 2 already ran.
 fn columns(conn: &Connection) {
     for statement in [
         "alter table envs add column parent text",
         "alter table envs add column depth integer not null default 0",
+        "alter table approvals add column kind text not null default ''",
+        "alter table approvals add column note text",
     ] {
         let _ = conn.execute(statement, []);
     }

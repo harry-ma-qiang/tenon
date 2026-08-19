@@ -96,6 +96,20 @@ defmodule Tenon.Beam.LinkTest do
     assert_receive {:base, %{"t" => "rep", "id" => 12, "error" => _reason}}, 2_000
   end
 
+  test "answers a notify and passes it on", %{base: base} do
+    assert_receive {:base, %{"t" => "node.register"}}, 2_000
+
+    Base.push(base, %{
+      "t" => "notify",
+      "id" => 13,
+      "kind" => "approval.pending",
+      "data" => %{"id" => 7}
+    })
+
+    assert_receive {:base, %{"t" => "rep", "id" => 13, "result" => %{"ok" => true}}}, 2_000
+    assert_receive {:tenon_notify, "approval.pending", %{"id" => 7}}, 2_000
+  end
+
   test "refuses an unknown method", %{base: base} do
     assert_receive {:base, %{"t" => "node.register"}}, 2_000
     Base.push(base, %{"t" => "nope", "id" => 10})

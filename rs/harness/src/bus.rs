@@ -20,6 +20,13 @@ pub trait Bus: Send + Sync + 'static {
     }
 }
 
+/// The human gate in front of a tool the profile lists under `gated_tools`.
+/// `Ok(())` runs the call, an error is the reason the model reads as the tool
+/// result. `ApiGate` asks base's approval queue; tests use a double.
+pub trait Gate: Send + Sync + 'static {
+    fn check<'a>(&'a self, name: &str, args: &Value) -> BoxFut<'a, Result<(), String>>;
+}
+
 /// One row of the session log. `id` is the rowid in the env's state file, so
 /// it doubles as the replay offset.
 #[derive(Debug, Clone)]

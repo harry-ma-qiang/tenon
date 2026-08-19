@@ -142,10 +142,10 @@ pub fn probe(
 
 impl Base {
     pub fn harness_boot(&mut self, env: &str) {
-        if env == GUARDIAN {
+        if env == GUARDIAN || self.halted(env) {
             return;
         }
-        let config = match self.home.harness_config(env) {
+        let config = match self.harness_settings(env) {
             Ok(config) => config,
             Err(error) => {
                 self.emit(
@@ -184,6 +184,21 @@ impl Base {
         }
     }
 
+    /// The env's overlay as the harness receives it, with base's own
+    /// `gated_tools` seeded in when the profile names none of its own: the
+    /// list is a host rule, not an agent preference.
+    pub fn harness_settings(&self, env: &str) -> anyhow::Result<Value> {
+        let mut config = self.home.harness_config(env)?;
+        let gated = &self.config.approval.gated_tools;
+        if gated.is_empty() || config.get("gated_tools").is_some() {
+            return Ok(config);
+        }
+        if let Some(object) = config.as_object_mut() {
+            object.insert("gated_tools".to_string(), json!(gated));
+        }
+        Ok(config)
+    }
+
     pub fn harness_ready(&mut self, env: &str, pid: Option<i32>, error: Option<String>) {
         let Some(node) = self.nodes.get_mut(env) else {
             return;
@@ -219,7 +234,7 @@ impl Base {
             Some(env),
             json!({"code": code, "restarts": restarts}),
         );
-        if restarts <= self.config.max_restarts {
+        if restarts <= self.config.max_restarts && !self.halted(env) {
             self.harness_boot(env);
         }
     }

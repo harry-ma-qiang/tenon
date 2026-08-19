@@ -31,6 +31,10 @@ pub struct Settings {
     pub approval: String,
     #[serde(default = "tool_timeout_ms")]
     pub tool_timeout_ms: u64,
+    /// Tools whose every call needs a human. Base's own config seeds this
+    /// list into the overlay it hands the harness.
+    #[serde(default)]
+    pub gated_tools: Vec<String>,
 }
 
 fn provider() -> String {
@@ -95,6 +99,7 @@ impl Default for Settings {
             max_steps: max_steps(),
             approval: approval(),
             tool_timeout_ms: tool_timeout_ms(),
+            gated_tools: Vec::new(),
         }
     }
 }
