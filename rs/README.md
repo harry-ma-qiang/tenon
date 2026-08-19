@@ -593,8 +593,8 @@ callers any more.
 
 A gate resolves through **base's** `approval.mode`, never the env's overlay: an env may loosen
 its own `approval.request` (the agent asking on its own behalf) but a child's patch layer must
-not be a way past a host gate. A gated command holds its reply, asks the queue and — when the verdict is `approved` — resumes
-as *the same command with its gate already passed*, so the gate is one `if` at the entry of the
+not be a way past a host gate. A gated command holds its reply, asks the queue and — when the verdict
+is `approved` — resumes as *the same command with its gate already passed*, so the gate is one `if` at the entry of the
 actor and never a second code path. A refusal is an error the caller reads; for a gated tool it
 is a tool result the model reads, so a denial costs a step, not a turn.
 
