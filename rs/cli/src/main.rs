@@ -72,7 +72,17 @@ enum Command {
         env: Option<String>,
     },
     /// One JSON document with every node, its environment and its fiber tree
-    Status,
+    Status {
+        /// Print what the last LKG promotion pinned, and verify it, instead
+        #[arg(long)]
+        lkg: bool,
+    },
+    /// Restore the last known good config, profiles and state copy
+    Rollback {
+        /// Restore even though the LKG manifest does not match what is on disk
+        #[arg(long)]
+        force: bool,
+    },
     /// Sandbox backend maintenance for humans
     Sandbox {
         #[command(subcommand)]
@@ -195,7 +205,11 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             let params = env.map(|env| json!({ "env": env })).unwrap_or(json!({}));
             tenon_base::rpc(home, "reset", params).await
         }
-        Command::Status => tenon_base::rpc(home, "status", json!({})).await,
+        Command::Status { lkg } => match lkg {
+            true => tenon_base::lkg_status(home),
+            false => tenon_base::rpc(home, "status", json!({})).await,
+        },
+        Command::Rollback { force } => tenon_base::rollback(home, force).await,
         Command::Run { task, env, timeout } => {
             tenon_base::run::task(home, env, task, std::time::Duration::from_secs(timeout)).await
         }
