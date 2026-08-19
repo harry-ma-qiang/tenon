@@ -1,6 +1,6 @@
 # RFC P4 — Plumbing: bus, kv, blob, query (v1)
 
-Author: Fable. 2026-08-19. Status: draft for review. P3 is the foundation and walls; P4 is the
+Author: Fable. 2026-08-19. Status: v1.1 (AGY review folded). P3 is the foundation and walls; P4 is the
 plumbing and wiring: one message fabric and one state facade that every component uses, with SQLite
 demoted to an implementation detail behind them. Engram (memory) and the navigator are P5+ consumers
 of these pipes, not part of them.
@@ -51,6 +51,7 @@ fails). Envelope size cap = wire frame cap.
 |---|---|---|
 | bus | `publish(env)`, `subscribe{filter{topics glob, levels, env, session, tags}, since_offset?, coalesce_ms?, latest_only?}` | Hub in base + `events` table for durable topics |
 | kv | `get/set{durable?}/del/cas/incr/expire/lease/keep_alive/range(prefix)/watch(prefix, since_rev)`; global monotonic `revision` | memory map + SQLite for durable keys; watch events ride the bus |
+| kv: ControlLease | `/ctl/<env>` lease: the holder may send input, other attached terminals render read-only, idle 30 s auto-release, explicit takeover allowed | first consumer of lease; multi-terminal co-display |
 | blob | `put(bytes|path) -> sha256`, `get`, `open(offset,len)`, `stat` | BLOB rows in state files; >threshold spills to per-env files later (deferred) |
 | query | `text{q, filter, topk}`, `scan{filter, aggregate}`, `vector{emb, topk}` (stub), typed JSON — no SQL | hot: SQLite indexes + FTS5; warm: derived segments (P4.3) |
 
@@ -65,7 +66,9 @@ query; guardian probes read the bus.
   (drop-oldest for non-durable, never-drop via log replay for durable); topic index in `ArcSwap`
   prefix tree; subscribe/unsubscribe take a mutex (cold path).
 - Durable topics: single writer task batches into the state file; publish returns after the batch
-  fsync tick (group commit, <=5 ms).
+  fsync tick (group commit, 5 ms default; decided). Non-durable envelopes (token chunks, audio,
+  telemetry, thinking fragments) NEVER touch disk or the writer task: lock-free memory fan-out only,
+  target < 0.1 ms.
 - `latest_only` (topic+key compaction) for status/metrics topics; `coalesce_ms` batches frames per
   subscriber (UI uses 16 ms).
 - Rust components integrate via a `tracing` Layer (import = instant messaging ability: `info!`,
@@ -79,9 +82,11 @@ query; guardian probes read the bus.
 - Hot (truth): state files keep only the recent window fully indexed (config, default 14 days):
   composite indexes on (topic, ts), (session, seq); FTS5 over text payload fields of durable topics.
 - Warm (derived, disposable, rebuildable from the log — DSH pattern generalized): a background
-  compactor rolls aged events into immutable segments: Parquet (columnar, per env+month) for
-  scan/aggregate via embedded DuckDB or a Polars scan; Tantivy segments for BM25 text; usearch/HNSW
-  segments for vectors (when embeddings exist). Query fans out to relevant segments (time/session
+  compactor rolls aged events into immutable segments: Parquet (columnar, per env+month) scanned by
+  minimal pure-Rust `parquet`/`arrow-rs` (feature-gated; DuckDB rejected — C++, 30-50 MB; Polars
+  rejected as similarly heavy). Hard gate: release binary stays < 80 MB, else fall back to SQLite
+  partition tables as segments. Tantivy segments for BM25 text; vector search is a stub (engine and
+  embeddings belong to P5 memory). Query fans out to relevant segments (time/session
   pruning) in parallel and merges — single-host shard query. Version-gated: wrong version -> drop
   and rebuild.
 - Acceptance at 10M events: text/vector < 50 ms, scan/aggregate < 200 ms, flat month-over-month.
@@ -111,8 +116,12 @@ Envelope has `host` + `origin`; `bus.bridge{peer}` reserved (unsupported); ids h
   after migration (target: net negative LoC in base).
 - harness/worker/guardian: emit through the tracing Layer / Link telemetry instead of bespoke event
   appends; `worker/step`, `budget.*`, `guardian.*`, `upgrade.phase` become plain topics.
-- UI (rs/ui carriers): subscribe with coalesce + latest_only instead of polling status; status RPC
-  remains for CLI one-shots.
+- UI (rs/ui carriers): 100% subscription-driven (decided) with coalesce + latest_only; the status
+  RPC remains only for `tenon status` one-shots. Multi-terminal attach uses ControlLease.
+- serve --http optional hardening seams (not critical, feature-gated, off by default): TLS via
+  rustls + rcgen self-signed for dev (`--https --cert --key`); auth layer 1 = bearer token
+  (`TENON_AUTH_TOKEN`, ~20 lines); production guidance = reverse proxy (Caddy/Tailscale) or JWT
+  header pass-through. Documented seams only; not in the P4 gates.
 - kernel, loader, sandbox, sdk wire: unchanged. Kernel stays frozen.
 
 ## 9. Plan
@@ -130,9 +139,11 @@ LoC estimate: bus 0.8-1k, kv 0.4k, blob facade 0.1k, query hot 0.5k, warm compac
 `rs/bus` new; kv/blob/query live in base + storage (no new processes, no new deps beyond tantivy/
 parquet in P4.3, feature-gated).
 
-## 10. Open questions
+## 10. Decisions (AGY review, 2026-08-19)
 
-1. Durable publish group-commit tick (5 ms default) vs per-event fsync knob.
-2. Warm engine: embedded DuckDB vs pure-Rust (polars/arrow) for scan — decide in P4.3 by binary size.
-3. Embedding provider interface placement (query facade vs memory service) — leaning memory (P5).
-4. Does the ASCII UI switch fully to subscribe in P4.1 or keep the status RPC hybrid.
+1. Group commit 5 ms default; durable:false never persists (zero-fsync memory path).
+2. No DuckDB, no Polars; pure-Rust parquet/arrow minimal, binary < 80 MB hard gate, SQLite-partition
+   fallback.
+3. Vector/embedding engine belongs to P5 memory; P4 keeps only the query.vector stub.
+4. UI fully subscription-driven; ControlLease added to kv.
+5. TLS/auth are documented pluggable seams, off by default, outside P4 gates.
