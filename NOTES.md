@@ -1404,3 +1404,134 @@ libkrun not found (tried libkrun.so.1, libkrun.so): libkrun.so: dlopen failed` a
 P3.7: the change protocol and blue/green kernels, `tenon check kernel`, the worker as a
 replaceable plugin, the benchmark gate — and the two small debts this phase named, `envfiber`
 over tcp and the musl shape as a second release matrix entry.
+
+## 28. P3.7 result: the change protocol, and a kernel that can be replaced under load (2026-08-19)
+
+The phase where an agent may change the thing it runs on. Four tiers, one protocol, and a
+judge that is neither the agent nor a human opinion: a contract suite, a conformance call and
+a benchmark set.
+
+### Lines
+
+Rust: +~1.4k (`base/upgrade.rs` 300, `drive.rs` 275, `candidate.rs` 440, `bluegreen.rs` 300,
+`bench.rs` 185, `check.rs` 185, `storage/upgrades.rs` 178, plus the config, node, worker and
+CLI wiring), tests +1 gate +2 storage. Elixir: +~330 (`beam/lib/tenon/beam/check.ex` and
+`check/`, the `plugin{op: "owner"}` handler), tests +3.
+
+### The contract suite had to become an artifact
+
+`tenon check kernel` is the L1 gate of RFC section 10, and the interesting constraint is
+*where it runs*: on a machine that downloaded one binary, there is no `mix`, no test file and
+no checkout. The plan said "package the ExUnit contract tests"; a `mix release` ships neither
+`ex_unit` nor `test/`, so packaging them would have meant adding both to every node in order
+to check a kernel once. The curated subset is ordinary code in the release instead
+(`Tenon.Beam.Check`, ten named contract points), run by `bin/tenon_beam eval` in a fresh node
+with `TENON_CHECK_BEAM` naming the candidate, and `mix test` runs the same suite once so it
+cannot rot.
+
+Two details paid for themselves immediately. The candidate is loaded with
+`code:load_binary/3` — a release runs in embedded mode, so a beam that is on no code path
+cannot be loaded any other way, and a corrupted file comes back as `{:error, :badfile}` with
+the path in the message. And the wire points (socket fiber, frame cap, hot swap) use a process
+of the same VM speaking frames over a loopback socket rather than a python plugin, so the
+suite needs nothing installed and no writable directory. Ten points, 0.3 s.
+
+`TENON_KERNEL_CONTRACT=1` is the version, and it is the *contract*, not the kernel: a suite
+asked for a version it does not implement refuses instead of pretending. Changing a frame or a
+lifecycle rule is contract 2 and needs a human to ship both halves, which is exactly what the
+RFC's "changing the contract needs a human" means operationally.
+
+### "Beside the old one" is a fight with the kernel unless the canary renames itself
+
+The protocol wants a canary mounted beside what it replaces. The kernel raises
+`{service_exists, Name}` on a duplicate `provide` — that is the single authority working
+correctly — so "beside" cannot mean "under the same name". Base hands the canary
+`TENON_CANARY_SERVICE=<service>-canary` (and `TENON_WORKER_SERVICE` for a worker) and the
+conformance calls that name; a candidate that ignores the variable fails its canary phase with
+the kernel's own error, which is the right verdict rather than a special case.
+
+The mirror problem is *which fiber to unmount at promotion*. A plugin that registered through
+the gateway is a socket fiber whose id is the gateway's connection number, not anything the
+proposer chose. `plugin{op: "owner", name}` — one `ets:lookup` in the services table plus a
+tree walk — is the smallest thing that makes a promotion able to name its predecessor.
+
+### The benchmark baseline is measured, not remembered
+
+RFC section 10 says promotion needs the candidate to beat "LKG's recorded numbers". Recording
+them at LKG promotion would compare against a different machine, a different model and a
+different day. The baseline is measured in the *snapshot* phase instead, seconds before the
+canary exists, and stored as the `lkg = 1` row of `benchmarks`; the candidate pass runs in
+`verify` with the canary live. The two passes then differ only in the artifact under test.
+
+Two rules keep it honest rather than merely strict. Rows carry a `label` (`fake` or `real`)
+and only compare within one label, because a fake model's numbers are not a measurement of the
+same thing. And a task set nothing can pass blocks nothing: the gate is "not worse than LKG",
+so a baseline of 0.0 does not freeze the environment — a set that does not discriminate is a
+configuration problem.
+
+The gate does work: the test's sabotage canary passes its own selfcheck and then
+short-circuits every `llm/request`; conformance is happy, and the benchmark refuses it by
+name. That is the shape of failure this phase exists for — an artifact that is healthy and
+worse.
+
+### Blue/green: the second socket lives in the same directory
+
+The kernel's promote path replaces a process, not a fiber. What made it cheap is the P3.1
+decision to bind-mount the gateway *directory* into the sandbox rather than the socket file: a
+second node can listen on `run/gw-<env>/gateway-green.sock`, and the worker inside the guest
+reaches it with no new mount and no container restart. So the switch is: stage a copy of the
+release with the candidate beam in it, start A' with the same profile, wait for
+`node.register` plus a healthy tree, hand A' the env's name, sandbox, state file and budget,
+then drain A — and it is A's socket closing that ends the old worker and the old harness,
+exactly the way every node already notices base dying.
+
+The one subtlety worth writing down: A' is spawned under the staging name `<env>~green` (so
+`node.register` and `status` both work while it is a candidate) but reports its *exit* under
+the env's real name, and the generation check decides what that exit means. A candidate that
+dies is ignored and the driver reports the timeout; the same process, once it is the env's
+node, is supervised and restarted normally. One field (`Spec.exit_env`) instead of a second
+supervision path.
+
+A bad beam never gets that far: it fails `tenon check kernel` in the canary phase and A is
+untouched. A beam that passes the suite and then fails to register leaves A running too, and
+the proposal ends `rolled_back` with the reason.
+
+### The worker was already replaceable; this made it provable
+
+`tenon worker` gained one line — the service name comes from `TENON_WORKER_SERVICE` when a
+config does not name it — and with that the built-in worker became the LKG fallback rather
+than the only implementation. A candidate is launched inside the sandbox as `worker-canary`,
+runs the conformance (bash echo, fs write/view round trip, snap commit) beside the working
+built-in one, and only then takes the name. The promoted spec is a file under `profiles/`, so
+it survives a node restart and a base restart and `tenon rollback` puts the old one back.
+
+The bug that phase found in itself: `nohup VAR=value cmd` is not a command, and the promoted
+spec's environment was being handed to `nohup` instead of to the shell. It passed the
+promotion (which uses the canary's own launch path) and only broke on the *next* worker
+boot — which is to say, after the blue/green switch, which is where the gate caught it.
+
+### Gates
+
+`cargo build --release`, `--features http -p tenon-cli`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo fmt --check` clean. Every test binary green:
+`upgrade_gate` 24 s, the sixteen other cli gates individually, the adversarial suite on its
+own (20/20, 186 s — it fails its 15 s teardown assertion under a parallel whole-suite run, as
+`rs/README.md` already documents). beam: 38 tests, `mix credo --strict` and
+`mix format --check-formatted` clean, `MIX_ENV=prod mix release` rebuilt. kernel: 66 tests,
+seeds default and 1. `podman ps -a --filter label=tenon.home` empty afterwards.
+
+### Deviations
+
+1. The contract suite is pure Elixir in the release, not ExUnit files.
+2. A canary provides `<service>-canary`, by a documented environment-variable convention.
+3. `selfcheck` takes no arguments; declaring one makes it required.
+4. The benchmark baseline is measured per proposal, not carried from an LKG promotion.
+5. `upgrade.propose` answers with an id and never blocks; an `ask` tier parks the row.
+6. Blue/green needs a unix gateway and refuses on a `tcp:` one (krun) with that reason.
+7. The kernel tier stages a whole `cp -a` copy of the release per proposal.
+
+### Next
+
+P3.8: the zero-behaviour-change simplify pass, and the debts still open — `envfiber` over tcp
+(which is also what blue/green under krun needs), the musl shape as a release matrix entry,
+and a benchmark task set that is a real gate rather than a smoke test.
