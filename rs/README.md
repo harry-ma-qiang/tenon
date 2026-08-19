@@ -53,6 +53,50 @@ TENON_RELEASE_TAR=/tmp/tenon_beam.tar.gz TENON_RELEASE_VERSION=0.1.0 cargo build
 ./target/release/tenon start        # extracts to ~/.tenon/erts/<version>-<sha>/ on first run
 ```
 
+**`scripts/build-release.sh`** does all of that in one line and is what CI runs (P3.6):
+`MIX_ENV=prod mix release`, tar, `TENON_RELEASE_TAR=... cargo build --release`, then
+`dist/tenon-<os>-<arch>` plus a `.sha256` beside it. `--verify` adds the check that matters
+— start the produced binary in a throwaway `TENON_HOME` with **no** `--release-dir` and no
+`TENON_RELEASE_DIR`, so the embedded payload is the only way it can find a release at all,
+wait for that env's harness to report `ready`, then `stop`. With `TENON_VERIFY_BASE_URL`
+pointing at an OpenAI-compatible endpoint it writes a matching `profiles/root/harness.yml`
+and runs one `tenon run` turn through it as well.
+
+```
+scripts/build-release.sh --verify
+dist/tenon-linux-aarch64      dist/tenon-linux-aarch64.sha256
+```
+
+Measured here: 77 MB binary, ~50 s from a warm cargo cache, and the verification boots the
+guardian, the root env, an oci sandbox, the worker and the harness in ~35 s before the fake
+model answers. The binary is not bit-reproducible across runs — the payload tarball carries
+mtimes — so the `.sha256` identifies one build, not the source it came from.
+
+**glibc, and the musl build.** `dist/tenon-<os>-<arch>` is dynamically linked against the
+glibc of the machine that built it and runs on that version or newer (the release job builds
+on `ubuntu-latest`; this box builds against 2.39). Two consequences: an older distribution
+needs its own build, and any guest root the binary is copied into — the oci backend's
+bind mount, the krun backend's `/usr/local/bin/tenon` — must carry a matching libc, which is
+why the default oci image is Debian-based and `alpine` is not usable.
+
+The static musl build **works** and takes about 2.5 minutes here, which is worth writing
+down because the earlier assumption was that it would not:
+
+```
+rustup target add aarch64-unknown-linux-musl
+cd rs && CC_aarch64_unknown_linux_musl=musl-gcc cargo build --release --target aarch64-unknown-linux-musl
+file target/aarch64-unknown-linux-musl/release/tenon   # ELF 64-bit ... statically linked
+```
+
+`rusqlite` is `bundled`, `reqwest` is on rustls with no OpenSSL, and `git2`/`libgit2-sys`
+compile against the musl C toolchain that `musl-tools` + `musl-dev` provide. It is still
+**not** what `build-release.sh` ships, for one exact reason: a fully static binary has no
+dynamic loader, so `dlopen("libkrun.so.1")` can never succeed in it and the krun backend is
+permanently unavailable there. glibc-dynamic is the shipping shape for that reason; the musl
+build is the one to reach for when the target is an alpine guest or an old distribution and
+no microVM. Making both shapes a release matrix entry, and checking the musl binary through
+the full suite (only `--version` and `--help` have been run against it here), is P3.7.
+
 The extracted directory is keyed by version plus the first 6 bytes of the payload's sha256,
 so a rebuilt payload lands beside the old one instead of overwriting a release a node may be
 running from. An existing directory with a `bin/tenon_beam` is reused, so extraction happens
@@ -1560,3 +1604,6 @@ accumulate across CI runs.
     tcp gateway it has nothing to connect to. Spawning children is an oci/landlock
     capability in P3.6; teaching `envfiber` the tcp carrier is a small change and belongs
     with the P3.7 worker/plugin work, next to the rest of the transport cleanup.
+55. **The shipped binary is glibc-dynamic, not musl-static.** The musl build compiles and
+    links here; what it cannot do is `dlopen` libkrun, because a fully static binary has no
+    dynamic loader. See "Build" for both commands and the tradeoff.
