@@ -1,7 +1,9 @@
 pub mod approvals;
 pub mod blobs;
+pub mod envelopes;
 pub mod episodes;
 pub mod events;
+pub mod kv;
 pub mod memory;
 pub mod packs;
 pub mod retain;
@@ -10,8 +12,10 @@ pub mod upgrades;
 
 pub use approvals::Approval;
 pub use blobs::{sha256, Blob};
+pub use envelopes::EnvelopeRow;
 pub use episodes::Episode;
 pub use events::{Event, ToolResult};
+pub use kv::KvRow;
 pub use memory::{Embedding, MemoryEdge, MemoryNode};
 pub use packs::{EnvRow, PackRow, SnapshotRow};
 pub use retain::{Retained, Retention};
