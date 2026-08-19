@@ -1,6 +1,6 @@
 # RFC P4 — Plumbing: bus, kv, blob, query (v1)
 
-Author: Fable. 2026-08-19. Status: v1.1 (AGY review folded). P3 is the foundation and walls; P4 is the
+Author: Fable. 2026-08-19. Status: v1.8 (security-consistency review folded). P3 is the foundation and walls; P4 is the
 plumbing and wiring: one message fabric and one state facade that every component uses, with SQLite
 demoted to an implementation detail behind them. Engram (memory) and the navigator are P5+ consumers
 of these pipes, not part of them.
@@ -168,15 +168,44 @@ query engine for app schemas; the query facade serves the platform's own log/mem
 is ever needed: an additive `db.open(name)` facade (per-env libSQL file + quota + snapshot-backed
 backups) — not built now.
 
+## 8d. Security consistency with P3 (one boundary, one auth, minimal code)
+
+P4 adds many listeners; every one reuses P3's existing boundary instead of inventing its own. This is
+both the security rule and the LoC rule.
+
+1. One authorizer, not per-feature. A single `authorize(carrier, req, env) -> ok|reject` is the only
+   gate for all carriers: base UDS (peer creds / node+runtime token, as P3), gateway (fd/ws
+   connection -> env), and every serve route (HTTP/WS/SSE/ingress/webhook/MCP). Bearer token check
+   lives in exactly one place; adding a route never adds an auth path. Non-local carriers (anything
+   on serve) require the token unless the app is explicitly `public`.
+2. Env-scoped read/write. `bus.subscribe`, `kv.range/watch`, `blob.get`, `query` are capabilities
+   bounded to the caller's env: a plugin sees only its own env's topics/keys/blobs plus what its
+   parent explicitly shares; only base/barebone reads across envs. This extends P3's "children cannot
+   touch parents" from RPC to the facades — the single most important P4 invariant.
+3. Outbound stays inside the boundary. trigger `http_post`, inbound `POST /hook`, and MCP client
+   calls obey budgets, the hop counter (loop/amplification guard), and can be listed in
+   `gated_tools`; a child env's trigger cannot target the parent's control socket. Egress network
+   policy remains undefined and backend-owned (unchanged from P3).
+4. Barebone unchanged. serve, ingress, triggers, MCP, timer are all runtime (L2) plugins outside the
+   sandbox boundary but never inside the barebone; base still runs no user code; keys stay on the
+   host; secrets never enter envelopes (mask|block). The kernel stays frozen.
+5. Supply chain / push posture (the "blocked by security" case). Pushing `.github/workflows/*`
+   needs the `workflow` OAuth scope; we push over SSH and keep CI minimal and least-privileged
+   (read-only checks, no deploy secrets in CI). pre-commit/pre-push secret scan and human-only push
+   from P3 are unchanged and cover every P4 commit.
+
+Net effect: P4's new surface is large but its security code is small — one authorizer, one env-scope
+check, one hop/budget guard, reused everywhere.
+
 ## 9. Plan
 
 | Step | Deliverable | Gate |
 |---|---|---|
-| P4.0 | `rs/bus` (envelope, Hub, tracing Layer, `t:"ev"` frames), kv facade (memory + durable + lease/watch/revision), blob facade over existing blobs, RPCs `bus.publish/subscribe`, `kv.*`, `blob.*`; timer service (`timer.set{topic, cron|after, payload}` -> envelope on schedule, one timer wheel in the Hub) | budgets in section 4 measured by a bench test; durable replay after kill -9; a cron timer fires on schedule and survives base restart (kv-stored); existing suites green |
+| P4.0 | `rs/bus` (envelope, Hub, tracing Layer, `t:"ev"` frames) with env-scoped subscribe/kv/blob (section 8d.2), kv facade (memory + durable + lease/watch/revision), blob facade over existing blobs, RPCs `bus.publish/subscribe`, `kv.*`, `blob.*`; timer service (`timer.set{topic, cron|after, payload}` -> envelope on schedule, one timer wheel in the Hub) | budgets in section 4 measured by a bench test; durable replay after kill -9; a cron timer fires on schedule and survives base restart (kv-stored); existing suites green |
 | P4.1 | migration: harness/worker/guardian/UI/CLI onto the facades; delete legacy RPC families; Elixir Logger/telemetry bridge | net LoC reduction in base recorded; all suites green; UI runs on subscribe (no polls) |
 | P4.2 | query hot layer: typed `query.text/scan`, FTS5 over durable topics, composite indexes, retention window config | text < 10 ms and scan < 100 ms at 1M events (bench in tests) |
 | P4.3 | warm segments: compactor to Parquet + Tantivy (vector stub), fan-out merge, version-gated rebuild, `derived/` lifecycle | 10M-event budgets of section 5; rebuild-from-log test |
-| P4.4 | `--https` (rustls + rcgen dev self-signed) + bearer auth on serve, feature-gated; secrets facade (`secret.get(name)`: values live only in base config/env refs, per-env grants; per-secret leak policy `mask` (default) or `block` — the Hub scans payloads for known secret values before fan-out and persistence: `mask` replaces the value with `***<name>***` (vibe-term's PTY-mask idea applied at the envelope layer), `block` refuses the publish with an error and logs a `violation` event; the worker applies the same scrub to tool output tails before they enter payloads); WebSocket as the 5th wire carrier (tokio-tungstenite, same feature): `/ws` on serve (RPC + subscribe over WS text frames, binary frames reserved for media chunks) and WS accept on the gateway (`TENON_GATEWAY` gains `ws:`; each connection mounts as a fiber — lets browser extensions such as the vibe-browse Chrome bridge register as plugins without a python side-server) | curl over https works; no token = 401; a WS client subscribes and receives coalesced envelopes; a WS client speaks hello/provide and its svc answers through the kernel; feature off = binary unchanged |
+| P4.4 | one `authorize()` for all carriers (section 8d); `--https` (rustls + rcgen dev self-signed) + bearer auth on serve, feature-gated; secrets facade (`secret.get(name)`: values live only in base config/env refs, per-env grants; per-secret leak policy `mask` (default) or `block` — the Hub scans payloads for known secret values before fan-out and persistence: `mask` replaces the value with `***<name>***` (vibe-term's PTY-mask idea applied at the envelope layer), `block` refuses the publish with an error and logs a `violation` event; the worker applies the same scrub to tool output tails before they enter payloads); WebSocket as the 5th wire carrier (tokio-tungstenite, same feature): `/ws` on serve (RPC + subscribe over WS text frames, binary frames reserved for media chunks) and WS accept on the gateway (`TENON_GATEWAY` gains `ws:`; each connection mounts as a fiber — lets browser extensions such as the vibe-browse Chrome bridge register as plugins without a python side-server) | curl over https works; no token = 401; a WS client subscribes and receives coalesced envelopes; a WS client speaks hello/provide and its svc answers through the kernel; feature off = binary unchanged |
 | P4.5 | ingress (section 8c): `ingress.register/list`, kv lease routes, `/app/<name>/*` proxy incl. WS pass-through, quotas | an app started inside the sandbox registers and is reachable through https with the token; killing the app expires the route; a second env cannot claim the same name |
 | P4.6 | `tenon backup <dir>` / `tenon restore <dir>`: consistent copy of all state files (SQLite backup API) + config + LKG manifest; refuses restore over a running base | backup taken under load restores to a working home; state file checksums match |
 | P4.7 | triggers: `trigger.set{filter, action, ttl?}` plugin (kv-stored; actions publish / http_post with retry+budget / prompt{env}; hop counter in the envelope prevents loops; sensitive actions gateable) + inbound webhook route `POST /hook/<topic>` on serve (token -> publish); MCP bridge plugin, both directions: client (spawn/connect an MCP server, `tools/list` registered into the tools bus under single authority, `tools/call` forwarded; guard/budget/approval hooks apply to bridged tools) and server (expose worker + management tools over MCP stdio and streamable HTTP on serve, token-authenticated, gated tools go through approvals) | an external MCP server's tool is callable by the model through our loop and is denied by a guard hook; Claude Code connects to Tenon-as-MCP-server and runs bash in the sandbox |
