@@ -69,9 +69,14 @@ defmodule Tenon.Beam.Test.Base do
   end
 
   defp accept(listen, server) do
-    {:ok, socket} = :gen_tcp.accept(listen, 5_000)
-    :ok = :gen_tcp.controlling_process(socket, server)
-    send(server, {:accepted, socket})
+    case :gen_tcp.accept(listen, 5_000) do
+      {:ok, socket} ->
+        :ok = :gen_tcp.controlling_process(socket, server)
+        send(server, {:accepted, socket})
+
+      {:error, _reason} ->
+        :ok
+    end
   end
 
   defp reply(%{"t" => method, "id" => id} = frame, state) do
