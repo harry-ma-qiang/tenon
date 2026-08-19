@@ -1037,3 +1037,105 @@ user demo was left untouched.
 P3.5: the built-in ASCII UI (`rs/ui`, `attach --ui`, `serve --http`), hard rules, budgets,
 the kill switch and the approval queue that finally owns the `approvals` table this phase
 started writing.
+
+## 25. P3.5a result: approvals, budgets, the kill switch, and the UI wired to both carriers (2026-08-19)
+
+The barebone got its hard rules and its face. Base owns an approval queue that blocks the
+caller until a human answers; budgets are counted off the session log and stop the env rather
+than warn; the kill switch has three carriers; and `rs/ui`, standalone since the last phase, is
+now driven by `tenon attach --ui` in a real terminal and by `tenon serve --http` behind a cargo
+feature.
+
+### Lines
+
+Rust: +~1.5k over P3.4 (base `approvals.rs` 320, `budget.rs` 330, `ui.rs` 290, `tui.rs` 250,
+`http.rs` 220 behind the feature, plus config/server/rpc wiring), harness +80 (the `Gate` seam
+and `ApiGate`), storage +20 (`kind`, `note`). BEAM: +10 (`Link` answers `notify`). Tests: +3
+integration files (approvals, budgets/kill switch, the two UI carriers) and one loop unit test.
+
+### The queue lives in base, and G is told
+
+RFC section 11 says G owns the queue. G is a node with a read-only code path, no state file and
+no socket of its own; giving it the queue would mean a second writer of the barebone's state
+file and a second RPC surface to secure, for a table base already writes. So base owns the rows,
+holds the blocked callers in memory, expires them on a timer, and sends the guardian a one-way
+`notify{kind, data}` frame — the only BEAM change this phase. The observable contract the RFC
+asked for holds: a pending request is a row, `tenon approvals` lists it, `tenon approve <id>`
+answers it, timeouts expire it, and G learns about it without polling.
+
+Two files per row on purpose: the barebone's `state.sqlite` is the queue (its rowid is the id a
+human types), `state-<env>.sqlite` is that env's own history, so a reset that drops an env's file
+never loses the queue and a queue read never has to open every env's file.
+
+### A gate is one `if` at the entry, not a second code path
+
+Every gated action — `runtime.spawn` past the soft limit, `config.patch{target: "base"}`,
+`snap.export`, any tool in `gated_tools` — does the same thing: hold the reply, ask the queue,
+and on `approved` **re-send the same command with `approved: true`**. The actor never awaits a
+human (that would wedge every other command behind it); the waiting happens in a task that owns
+the caller's reply channel. A refusal is an error string for an RPC and a tool result for a tool,
+so a denied tool costs the model a step and the turn survives — the same shape P3.3's guard
+plugin established.
+
+### The budget counter cannot disagree with the log
+
+Usage was already in the log: every `assistant/message` carries the step's `{prompt, completion,
+total}`. Counting it inside `events.append` — base is that file's only writer — means no new
+event kind, no harness change, and no way for the counter to drift from what the model actually
+cost. usd is that usage against `usd_per_1k`; wall time is since the env booted; the process
+count is the only one that costs a container round trip, so it is asked for on a timer and only
+when a limit is set.
+
+The hard stop is a `SIGTERM` to the env's harness plus a refusal on every later
+`session.create`/`session.prompt`. Base cannot unwind a turn from outside, and it does not need
+to: the harness is restartable by design and its sessions are in the log. `tenon run` reports the
+reason because it already reads the event stream — two more kinds to match, `budget.exceeded`
+and `kill.switch`.
+
+### The defect the tests found: `id` is not yours
+
+`tenon approve 2` hung forever while the approval was answered correctly. `Client::call` builds
+`{"t": method, "id": <correlation>}` and then merges the caller's params over it, so a param
+literally named `id` **overwrites the correlation id**: base answered under id 2, the CLI waited
+for id 1. The codebase already had the scar (`plugin_id`), and now the approval id travels as
+`approval_id` too. Worth a lint one day: on this front door, `id` belongs to the frame.
+
+### Gates
+
+`cargo build --release`, `cargo build --release --features http -p tenon-cli`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check` clean.
+`TENON_RELEASE_DIR=... cargo test --all-features`: 137 green, 0 failed — 113 in these crates
+(from 104 at the end of P3.4) plus `rs/ui`'s own 24. New: the three P3.5 gates
+(`approvals_gate.rs` 1, `budget_gate.rs` 2, `ui_gate.rs` 2, sharing one fixture in
+`cli/tests/gate/mod.rs`), one more `loop_test` (a gated tool refused with the gate's reason,
+against a `Gate` double) and three base unit tests (both UI model builders, the http form
+decoder). `spawn_gate.rs` needed one config line — the P3.2 tree gate is about the env limits,
+not the human gate, so it sets `spawn_soft_limit: 0` — which is the phase's one behaviour
+change to an older suite. The whole run is ~5 minutes here, adversarial being 180 s of it; the
+one flake seen (`attach::two_attaches_one_disconnect` under four container-heavy binaries in
+parallel) passed on its own and in the second full run.
+BEAM: `mix compile --warnings-as-errors`, `mix format --check-formatted`, `mix credo --strict`,
+`mix test` (25) and `MIX_ENV=prod mix release` all green.
+
+### Deviations
+
+1. Base owns the queue, G is notified (`notify` frame, answered `{ok: true}`).
+2. The approval id is `approval_id` on the wire; `id` is the frame's.
+2b. A gate resolves through base's `approval.mode`, never the env overlay's, so a child's patch
+    layer cannot be a way past a host gate; the overlay still decides the agent's own
+    `approval.request`.
+3. `config.patch` of an env overlay stays ungated by default (L3 is agent-owned in RFC section
+   10); `target: "base"` is new and always gated.
+4. `snap.export` exports the newest pack, which is self-contained already.
+5. Token usage is read off `assistant/message`, not a new `llm/usage` event.
+6. A breach halts the harness process; it does not unwind the running turn.
+7. Budget counters are per boot, in memory; `reset` clears them.
+8. `tenon serve --http` is hand-rolled on tokio, not axum: four CGI-like routes do not pay for a
+   web framework in every `--all-features` build. The feature is off by default either way.
+9. The pty test drives `script -q` rather than a `forkpty` helper, so no `unsafe` in tests.
+
+### Next
+
+P3.5b: the runtime contract and `runtime.register`, the guardian's probe set beyond health, OS
+supervision (systemd --user / launchd), state copies at LKG promotion, manifests, per-env
+privilege drop and exit-on-detach replay. Then P3.6, krun and the release CI.

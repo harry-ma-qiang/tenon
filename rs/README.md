@@ -591,7 +591,9 @@ callers any more.
 | `snap.export` | workspace push-out to a host path | `approval.gate_snap_export` (true) |
 | any tool | the tool's name is in the profile's `gated_tools` | `gated_tools` in the env overlay, seeded from `approval.gated_tools` |
 
-A gated command holds its reply, asks the queue and — when the verdict is `approved` — resumes
+A gate resolves through **base's** `approval.mode`, never the env's overlay: an env may loosen
+its own `approval.request` (the agent asking on its own behalf) but a child's patch layer must
+not be a way past a host gate. A gated command holds its reply, asks the queue and — when the verdict is `approved` — resumes
 as *the same command with its gate already passed*, so the gate is one `if` at the entry of the
 actor and never a second code path. A refusal is an error the caller reads; for a gated tool it
 is a tool result the model reads, so a denial costs a step, not a turn.
@@ -756,7 +758,7 @@ TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test --all-featu
 `--all-features` is what compiles and runs the `http` carrier's own test; without it that one
 test is not built and everything else is identical.
 
-112 tests in the crates below (`cargo test --all-features` prints 136: `rs/ui` brings its own
+113 tests in the crates below (`cargo test --all-features` prints 137: `rs/ui` brings its own
 24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 5
 (`token`, `home::hash` — stable per home, distinct across homes — the two `ui` model builders
 and the http form decoder), the 20-test adversarial suite, `sandbox`'s 2-test conformance

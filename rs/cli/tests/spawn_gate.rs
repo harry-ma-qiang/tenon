@@ -6,7 +6,10 @@ use tenon_base::client::Client;
 
 const BIN: &str = env!("CARGO_BIN_EXE_tenon");
 const NAME: &str = "spawn-gate";
-const CONFIG: &str = "sandbox: oci\nenvs:\n  max_total: 3\n  max_depth: 1\n  ram_mb: 384\n";
+/// The limits under test are the environment tree's, not the human gate's, so
+/// `spawn_soft_limit: 0` turns the P3.5 approval gate off for this home.
+const CONFIG: &str = "sandbox: oci\nenvs:\n  max_total: 3\n  max_depth: 1\n  ram_mb: 384\n\
+                      approval:\n  spawn_soft_limit: 0\n";
 
 fn release() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TENON_RELEASE_DIR") {

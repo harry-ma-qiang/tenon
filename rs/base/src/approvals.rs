@@ -25,8 +25,20 @@ pub struct Pending {
 }
 
 impl Base {
+    /// The mode a **gate** resolves through: base's config and nothing else.
+    /// An env may loosen its own `approval.request` (that is the agent asking
+    /// for itself) but never the host's gate on a host-affecting action —
+    /// otherwise a child's overlay patch would be a way past the gate.
+    pub fn gate_mode(&self) -> (String, u64) {
+        (
+            self.config.approval.mode.clone(),
+            self.config.approval.timeout_s,
+        )
+    }
+
     /// `ask` from the env's overlay or base's config, with `auto` and `deny`
-    /// as the two answers that need no human.
+    /// as the two answers that need no human. This is the agent's own
+    /// `approval.request`, not a gate.
     pub fn approval_mode(&self, env: &str) -> (String, u64) {
         let config = &self.config.approval;
         let overlay = self.home.harness_config(env).unwrap_or_else(|_| json!({}));
@@ -55,7 +67,28 @@ impl Base {
         kind: &str,
         reply: oneshot::Sender<Answer>,
     ) {
-        let (mode, timeout_s) = self.approval_mode(env);
+        self.decide(env, reason, kind, self.approval_mode(env), reply)
+    }
+
+    /// A gate asks with base's mode; everything else about the row is the same.
+    pub fn gate_request(
+        &mut self,
+        env: &str,
+        reason: &str,
+        kind: &str,
+        reply: oneshot::Sender<Answer>,
+    ) {
+        self.decide(env, reason, kind, self.gate_mode(), reply)
+    }
+
+    fn decide(
+        &mut self,
+        env: &str,
+        reason: &str,
+        kind: &str,
+        (mode, timeout_s): (String, u64),
+        reply: oneshot::Sender<Answer>,
+    ) {
         self.sweep_approvals();
         match mode.as_str() {
             AUTO => {
@@ -255,7 +288,7 @@ impl Base {
         resume: impl FnOnce(oneshot::Sender<Answer>) -> Cmd + Send + 'static,
     ) {
         let (tx, rx) = oneshot::channel();
-        self.approval_request(env, reason, kind, tx);
+        self.gate_request(env, reason, kind, tx);
         let cmds = self.cmds.clone();
         let kind = kind.to_string();
         tokio::spawn(async move {
