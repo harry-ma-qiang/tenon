@@ -51,6 +51,17 @@ impl Base {
             | Cmd::ConfigGet { .. }
             | Cmd::ConfigPatch { .. }
             | Cmd::Approval { .. } => self.on_env_cmd(cmd),
+            Cmd::RuntimeRegister {
+                env,
+                params,
+                token,
+                reply,
+            } => self.runtime_register(&env, &params, &token, reply),
+            Cmd::RuntimeProbed {
+                runtime,
+                outcome,
+                reply,
+            } => self.runtime_probed(*runtime, outcome, reply),
             Cmd::ApprovalList {
                 status,
                 limit,

@@ -45,6 +45,7 @@ pub fn spawn(
     home: &Home,
     env: &str,
     config: &Value,
+    runtime_token: &str,
     generation: u64,
     exits: mpsc::UnboundedSender<Cmd>,
 ) -> Result<Running> {
@@ -65,7 +66,8 @@ pub fn spawn(
         .env("TENON_HOME", &home.root)
         .env("TENON_BASE_SOCK", home.sock())
         .env("TENON_GATEWAY", home.gateway_address(env))
-        .env("TENON_HARNESS_CONFIG", config.to_string());
+        .env("TENON_HARNESS_CONFIG", config.to_string())
+        .env("TENON_RUNTIME_TOKEN", runtime_token);
     if let Some(name) = config
         .get("llm")
         .and_then(|llm| llm.get("api_key_env"))
@@ -165,7 +167,15 @@ impl Base {
         }
         node.harness = State::Booting;
         let peer = node.peer.clone();
-        let running = match spawn(&self.home, env, &config, generation, self.cmds.clone()) {
+        let runtime_token = node.runtime_token.clone();
+        let running = match spawn(
+            &self.home,
+            env,
+            &config,
+            &runtime_token,
+            generation,
+            self.cmds.clone(),
+        ) {
             Ok(running) => running,
             Err(error) => {
                 self.harness_ready(env, None, Some(error.to_string()));
@@ -211,6 +221,7 @@ impl Base {
             None => {
                 node.harness = State::Ready(pid);
                 self.emit("harness.ready", Some(env), json!({"pid": pid}));
+                self.register_default_runtime(env);
             }
         }
     }

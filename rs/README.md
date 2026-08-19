@@ -71,6 +71,7 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `profiles/guardian/` | an empty entry list; G mounts only barebone plugins |
 | `erts/<version>-<sha>/` | the extracted BEAM release, read-only to base and to the nodes |
 | `run/base.sock` | the front door |
+| `run/rt-<env>.token` | that env's runtime token (mode 0600): what a runtime the human starts by hand presents to `runtime.register` |
 | `run/base.lock` | an exclusive `flock`, held for the life of the base process; guards against a second `start` |
 | `run/base.ready` | holds the base pid while it is up; how `tenon start` waits. Written atomically (temp file + rename) |
 | `run/{base,guardian,root}.log` | stdout and stderr of base and of each node |
@@ -636,6 +637,47 @@ budget_reset_on_reset: true
 budget_tick_ms: 5000
 ```
 
+## The runtime contract (P3.5)
+
+RFC section 2's last row, as an RPC. A runtime is one environment's world — node A, its
+harness, its worker — and anything may replace it as long as base can supervise it. The
+contract is what "supervisable" means, and `runtime.register` is where it is checked.
+
+```
+runtime  --runtime.register{env, token, manifest, health, channels}-->  base
+                                                                          |
+                                     token == run/rt-<env>.token ---------+
+                                     contract: manifest{name,version,hash},
+                                               health{kind: rpc|http, target},
+                                               channels{events, approvals}
+                                                                          |
+              <-- probe: svc <service>.<method> | GET <url> ---------------+
+                                                                          |
+   {manifest, health, channels, probe_ms}  <-- recorded, `runtime.register` event
+   error naming the reason                 <-- refused, `runtime.refused` event
+```
+
+- **Authentication is a per-env token**, generated with the env exactly like the node
+  token, handed to that env's harness in `TENON_RUNTIME_TOKEN` and written to
+  `run/rt-<env>.token` with mode 0600. A runtime a human starts by hand (DSH through the
+  bridge — `bridge/dsh/README.md` has the frame) reads that file; the file permissions are
+  the same protection `run/base.sock` has. A wrong token is `unauthorized` and nothing else
+  is looked at.
+- **The contract is checked before anything is probed**: all three objects must be there,
+  every manifest field must be a non-empty string, `health.kind` must be `rpc` or `http`,
+  and an `rpc` target must be a `service.method` pair. Each failure names the field.
+- **Base probes the target the runtime declared**, rather than trusting the registration:
+  an `rpc` target goes into that env's node as an ordinary `svc` frame, an `http` target is
+  a plain GET that has to answer 2xx (hand-rolled, no client stack — the same stance as
+  `serve --http`). The round trip time is kept as `probe_ms`.
+- **Base registers the default runtime on behalf of its own env**, once that env's harness
+  answers: manifest `tenon-default` at the binary's own version, hashed with sha256 over
+  the running executable, health `rpc loop.ping`, channels `events.append` and
+  `approval.request`. So `tenon status` shows a `runtime` object for every env from the
+  first boot on, and a replacement is visible as a different manifest in the same field.
+- **One row per env.** Registering again replaces it; starting or resetting an env drops
+  it and the token with it. A refusal never disturbs the runtime already recorded.
+
 ## The built-in ASCII UI (P3.5)
 
 `rs/ui` is the pure renderer (its own README covers the layout); base is what fills its model
@@ -710,6 +752,7 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `state.retain{env}` | CLI, plugins | run the `retention:` policy against that env's file; answers `{removed, left}` and emits `state.retain` |
 | `config.get{env}` | harness, CLI | the env's harness overlay plus the paths it lives at |
 | `config.patch{env,patch,target?}` | harness, CLI | snapshot `profiles/<env>/harness.yml` into `config-snapshots/<env>/`, merge the patch, ask the node to `reload`; answers `{snapshot, harness, reload}`. `target: "base"` patches the barebone's own `config.yml` instead — L0, always gated, and read at the next `start` |
+| `runtime.register{env,token,manifest,health,channels}` | node, runtime, CLI | the runtime contract: authenticate with `run/rt-<env>.token`, check the manifest/health/channels shape, probe the declared health target, then record it. Answers the recorded document or an error naming the reason |
 | `approval.request{env,reason,kind?}` | harness, CLI | ask for a human verdict. `auto`/`deny` answer at once; `ask` writes a pending row, tells G and **holds the answer** until `approval.answer` or the timeout |
 | `approval.list{status?,limit?}` | CLI, plugins | the queue from the barebone's own state file; `status` defaults to every row, `all` is the same, `pending` is what `tenon approvals` asks for |
 | `approval.answer{approval_id,decision,note?}` | CLI, the UI | `approve` or `deny` one pending row. The approval's id travels as `approval_id`: `id` is the frame's own correlation id |
@@ -1192,3 +1235,17 @@ accumulate across CI runs.
 44. **The pty test drives `script -q`, not a `forkpty` helper.** `attach --ui` needs a real
     terminal for `TIOCGWINSZ` and raw mode; `script` is in util-linux on every box this runs on
     and keeps the test free of `unsafe`.
+
+45. **`runtime.register` authenticates with a second, per-env token, not the node token.**
+    The node token is bound to an exact OS pid base spawned, which is what makes
+    `node.register` unforgeable; a runtime base did not spawn has no such pid, so reusing
+    that token would mean weakening the node check. Base generates a separate
+    `runtime_token` per env instead, hands it to that env's harness in the environment and
+    writes it to `run/rt-<env>.token` with mode 0600 for a runtime a human starts by hand.
+    It is exactly as protected as `run/base.sock`, and it dies with the env.
+46. **The default runtime is registered by base, not by the harness.** RFC section 2 has
+    the runtime register with its parent; for the default runtime the parent is base and
+    the runtime is base's own harness/worker/node A triple, so a registration frame from
+    the harness would be base asking itself. Base registers it once the harness answers,
+    with `loop.ping` as the health target — the same call the guardian's harness probe
+    makes, so the contract's health claim and the guardian's probe cannot drift apart.
