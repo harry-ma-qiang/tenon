@@ -1111,9 +1111,16 @@ for id 1. The codebase already had the scar (`plugin_id`), and now the approval 
 against a `Gate` double) and three base unit tests (both UI model builders, the http form
 decoder). `spawn_gate.rs` needed one config line — the P3.2 tree gate is about the env limits,
 not the human gate, so it sets `spawn_soft_limit: 0` — which is the phase's one behaviour
-change to an older suite. The whole run is ~5 minutes here, adversarial being 180 s of it; the
-one flake seen (`attach::two_attaches_one_disconnect` under four container-heavy binaries in
-parallel) passed on its own and in the second full run.
+change to an older suite. The whole run is ~7 minutes here, adversarial being 195 s of it.
+
+One honest caveat: with three more container-heavy binaries, a single `cargo test` run puts up
+to six sandboxes through start and teardown at once on this four-core box, and the adversarial
+suite's 15 s teardown assertions (`exit-on-detach` waits for base and its container to be gone)
+flake on that load — once on `two_attaches_one_disconnect`, once on
+`attach_with_exit_on_detach`, different runs, both green (20/20) whenever adversarial runs on
+its own. Not logic: nothing in this phase touches the detach path, and the timing sensitivity
+is the one P3.1 already documented when `sandbox: auto` put a real container on the boot path.
+`rs/README.md` now says to run that suite separately.
 BEAM: `mix compile --warnings-as-errors`, `mix format --check-formatted`, `mix credo --strict`,
 `mix test` (25) and `MIX_ENV=prod mix release` all green.
 

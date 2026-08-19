@@ -758,6 +758,14 @@ TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam cargo test --all-featu
 `--all-features` is what compiles and runs the `http` carrier's own test; without it that one
 test is not built and everything else is identical.
 
+**Run `--test adversarial` on its own.** The three P3.5 gates are three more container-heavy
+binaries, and `cargo test` runs test binaries in parallel: on this four-core box a whole-suite
+run has up to six sandboxes starting and being torn down at once, and the adversarial suite's
+15 s teardown assertions (`exit-on-detach` waits for base, its env's container included, to be
+gone) start failing on load rather than on logic — seen twice in whole-suite runs here, green
+every time the suite runs alone (`cargo test -p tenon-cli --test adversarial`, 195 s). The
+numbers below are from the whole suite plus that separate adversarial run.
+
 113 tests in the crates below (`cargo test --all-features` prints 137: `rs/ui` brings its own
 24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 5
 (`token`, `home::hash` — stable per home, distinct across homes — the two `ui` model builders
