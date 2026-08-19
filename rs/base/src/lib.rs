@@ -16,6 +16,7 @@ pub mod integrity;
 pub mod lock;
 pub mod node;
 pub mod peer;
+pub mod probes;
 pub mod release;
 pub mod rpc;
 pub mod run;

@@ -28,8 +28,14 @@ defmodule Tenon.Beam.Link.Server do
   def stop(pid), do: GenServer.stop(pid, :normal)
 
   @spec service(pid(), atom(), [term()]) :: term()
-  def service(pid, :request, [method, params]),
-    do: GenServer.call(pid, {:request, method, params}, @call_timeout + 1_000)
+  def service(pid, :request, [method, params]), do: service(pid, :request, [method, params, nil])
+
+  def service(pid, :request, [method, params, timeout]) do
+    limit = if is_integer(timeout) and timeout > 0, do: timeout, else: @call_timeout
+    GenServer.call(pid, {:request, method, params, limit}, limit + 1_000)
+  catch
+    :exit, reason -> {:error, reason}
+  end
 
   def service(_pid, method, _args), do: {:error, {:unknown_method, method}}
 
@@ -64,7 +70,7 @@ defmodule Tenon.Beam.Link.Server do
     {:reply, :ok, state}
   end
 
-  def handle_call({:request, method, params}, from, state) do
+  def handle_call({:request, method, params, timeout}, from, state) do
     id = state.next
 
     frame =
@@ -73,7 +79,7 @@ defmodule Tenon.Beam.Link.Server do
       |> Map.merge(%{"t" => method, "id" => id})
 
     send_frame(state, frame)
-    timer = Process.send_after(self(), {:expire, id}, @call_timeout)
+    timer = Process.send_after(self(), {:expire, id}, timeout)
     {:noreply, %{state | next: id + 1, pending: Map.put(state.pending, id, {from, timer})}}
   end
 

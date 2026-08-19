@@ -87,13 +87,18 @@ defmodule Tenon.Beam.Boot do
     config = %{
       target: System.get_env("TENON_GUARDIAN_TARGET", "root"),
       interval: number("TENON_GUARDIAN_INTERVAL_MS", 2_000),
-      failures: number("TENON_GUARDIAN_FAILURES", 6)
+      failures: number("TENON_GUARDIAN_FAILURES", 6),
+      probe_timeout: number("TENON_GUARDIAN_PROBE_TIMEOUT_MS", 5_000),
+      probes: paths(System.get_env("TENON_GUARDIAN_PROBES"))
     }
 
     Logger.info("tenon guardian: watching #{config.target} from #{env}")
     {:ok, fiber} = :tenon.mount(ctx, %{module: Guardian, id: "guardian", config: config})
     fiber
   end
+
+  defp paths(nil), do: []
+  defp paths(value), do: String.split(value, ":", trim: true)
 
   defp number(name, default) do
     case Integer.parse(System.get_env(name, "")) do

@@ -25,6 +25,7 @@ defmodule Tenon.Beam.Link do
     end
   end
 
-  @spec request(pid(), String.t(), map()) :: {:ok, term()} | {:error, term()}
-  def request(pid, method, params), do: Server.service(pid, :request, [method, params])
+  @spec request(pid(), String.t(), map(), timeout()) :: {:ok, term()} | {:error, term()}
+  def request(pid, method, params, timeout \\ nil),
+    do: Server.service(pid, :request, [method, params, timeout])
 end

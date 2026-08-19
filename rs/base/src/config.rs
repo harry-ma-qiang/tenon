@@ -8,6 +8,24 @@ pub struct Guardian {
     pub interval_ms: u64,
     #[serde(default = "failures")]
     pub failures: u32,
+    #[serde(default = "probe_timeout_ms")]
+    pub probe_timeout_ms: u64,
+}
+
+/// Extra probe plugins, signed by being in base's own config: the file lives
+/// in `<home>/probes/` and the sha256 here is what base checks it against
+/// before the guardian is allowed to run it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Probes {
+    #[serde(default)]
+    pub extra: Vec<ProbeEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProbeEntry {
+    pub file: String,
+    #[serde(default)]
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,6 +122,8 @@ pub struct Config {
     pub sandbox: String,
     #[serde(default)]
     pub guardian: Guardian,
+    #[serde(default)]
+    pub probes: Probes,
     #[serde(default)]
     pub worker: Worker,
     #[serde(default)]
@@ -214,11 +234,16 @@ fn failures() -> u32 {
     6
 }
 
+fn probe_timeout_ms() -> u64 {
+    5_000
+}
+
 impl Default for Guardian {
     fn default() -> Self {
         Self {
             interval_ms: interval_ms(),
             failures: failures(),
+            probe_timeout_ms: probe_timeout_ms(),
         }
     }
 }
@@ -277,6 +302,7 @@ impl Default for Config {
             max_restarts: max_restarts(),
             sandbox: sandbox(),
             guardian: Guardian::default(),
+            probes: Probes::default(),
             worker: Worker::default(),
             envs: Envs::default(),
             retention: Retention::default(),

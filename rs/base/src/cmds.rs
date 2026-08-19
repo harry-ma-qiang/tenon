@@ -26,7 +26,10 @@ impl Base {
                 let peer = self.nodes.get(&env).and_then(|node| node.peer.clone());
                 let _ = reply.send(peer);
             }
-            Cmd::Reset { env, reply } => {
+            Cmd::Reset { env, probes, reply } => {
+                if !probes.is_empty() {
+                    self.emit_env(&env, "guardian.reset", json!({"probes": probes}));
+                }
                 let outcome = self.reset(&env).await;
                 let _ = reply.send(outcome);
             }
