@@ -853,6 +853,27 @@ resolvable by name; the **LKG manifest** is what makes a rollback verifiable.
   list, needs no running base, and exits non-zero when the verification fails — which
   makes it usable as a check in a script.
 
+## `tenon check kernel` (P3.7)
+
+The kernel is L1 in RFC section 10: agents may replace `tenon.erl` in their own environment,
+and the gate in front of that is a contract suite the *release* carries, not the development
+tree. `../kernel/README.md` documents the ten contract points and the
+`TENON_KERNEL_CONTRACT=1` versioning rule; what base does is resolve the release exactly the
+way `start` does and run it:
+
+```
+tenon check kernel                                   # the release's own tenon.beam
+tenon check kernel --beam /tmp/candidate/tenon.beam  # what an agent built
+```
+
+`base/src/check.rs` spawns `bin/tenon_beam eval 'Tenon.Beam.Check.main()'` with
+`TENON_CHECK_BEAM` and `TENON_KERNEL_CONTRACT` set, reads the last JSON line off its stdout
+(anything the VM logged around it is noise) and reports `{ok, contract, beam, passed,
+points}`. A failure names every point that failed and why — that string is what the change
+protocol below hands back to the agent that proposed the beam. The same function is what the
+kernel tier of `upgrade.propose` calls, so a human running the command by hand and an agent
+proposing an upgrade are judged by the same suite.
+
 ## Guardian probes (P3.5)
 
 RFC section 5.2's watch, as a fixed set of probes in the guardian node plus the extra ones
@@ -975,6 +996,7 @@ public surface — and it works with JavaScript off.
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon install-service --user [--print]` | write the OS service unit for this binary and home, and enable it where there is a user service manager; `--print` prints it instead. Never starts base |
 | `tenon status [--lkg]` | one JSON document: base, both nodes, and each node's fiber tree. `--lkg` prints what the last promotion pinned and verifies it instead, without needing a running base, and exits non-zero when a hash moved |
+| `tenon check kernel [--beam PATH] [--release-dir DIR]` | run the kernel contract suite that ships inside the beam release against a `tenon.beam` — the one the release ships, or a candidate. Prints the JSON report and exits non-zero when a point failed. Needs no running base |
 | `tenon rollback [--force]` | restore the LKG config, profiles and state copy. Verifies every pinned hash first and refuses with what differs; `--force` overrides. Refuses while base is running |
 | `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
 | `tenon run "task" [--env NAME] [--timeout SECONDS]` | one task for that env's agent: create a session, prompt it, stream the answer, exit 0 if the turn ended ok |

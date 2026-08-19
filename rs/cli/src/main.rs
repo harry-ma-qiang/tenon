@@ -92,6 +92,11 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Run a contract suite against an artifact before it is trusted
+    Check {
+        #[command(subcommand)]
+        command: CheckCommand,
+    },
     /// Sandbox backend maintenance for humans
     Sandbox {
         #[command(subcommand)]
@@ -122,6 +127,18 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckCommand {
+    /// Run the kernel contract suite shipped in the beam release against a
+    /// `tenon.beam`; without --beam it checks the one the release ships
+    Kernel {
+        #[arg(long, value_name = "PATH")]
+        beam: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        release_dir: Option<PathBuf>,
     },
 }
 
@@ -246,6 +263,15 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             false => tenon_base::rpc(home, "status", json!({})).await,
         },
         Command::Rollback { force } => tenon_base::rollback(home, force).await,
+        Command::Check {
+            command: CheckCommand::Kernel { beam, release_dir },
+        } => tenon_base::check::command(
+            home,
+            beam,
+            release_dir,
+            payload::PAYLOAD,
+            payload::VERSION,
+        ),
         Command::InstallService { user, print } => match user || print {
             true => tenon_base::service::install(home, print),
             false => {
