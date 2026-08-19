@@ -3,7 +3,6 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-pub type Fut<T> = BoxFut<'static, T>;
 pub type Answer = Result<Value, String>;
 
 /// The kernel bus as the harness needs it: call a service, run a waterfall,

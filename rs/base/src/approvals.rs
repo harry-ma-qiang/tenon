@@ -7,7 +7,6 @@ use tokio::sync::oneshot;
 
 type Answer = Result<Value, String>;
 
-pub const ASK: &str = "ask";
 pub const AUTO: &str = "auto";
 pub const DENY: &str = "deny";
 

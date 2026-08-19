@@ -1,7 +1,6 @@
 use crate::base::Base;
 use crate::config::ProbeEntry;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// What base hands the guardian node as `TENON_GUARDIAN_PROBES`, and what it
@@ -26,9 +25,7 @@ impl Approved {
 }
 
 fn hash(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    let sum = Sha256::digest(&bytes);
-    Some(sum.iter().map(|byte| format!("{byte:02x}")).collect())
+    Some(crate::hash::sha256(std::fs::read(path).ok()?))
 }
 
 fn executable(path: &Path) -> bool {

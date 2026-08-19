@@ -84,10 +84,6 @@ impl Client {
         &self.config.model
     }
 
-    pub fn has_key(&self) -> bool {
-        self.key.is_some() || self.config.base_url.starts_with("http://")
-    }
-
     pub fn describe(&self) -> Value {
         json!({
             "provider": self.config.provider,

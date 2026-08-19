@@ -1,3 +1,4 @@
+use crate::hash::hex;
 use crate::home::Home;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -5,13 +6,6 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub const FILE: &str = "manifest.json";
-
-fn hex(sum: impl AsRef<[u8]>) -> String {
-    sum.as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
 
 pub fn file_hash(path: &Path) -> Option<String> {
     std::fs::read(path)
