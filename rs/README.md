@@ -1607,3 +1607,8 @@ accumulate across CI runs.
 55. **The shipped binary is glibc-dynamic, not musl-static.** The musl build compiles and
     links here; what it cannot do is `dlopen` libkrun, because a fully static binary has no
     dynamic loader. See "Build" for both commands and the tradeoff.
+56. **CI cannot be run here.** `.github/workflows/ci.yml` and `release.yml` are checked for
+    YAML validity and are built out of commands this box does run by hand; GitHub Actions
+    itself has never executed them. The krun conformance job is written to report the reason
+    and pass on a runner without a hypervisor or without libkrun, which is what a stock
+    `ubuntu-latest` is — libkrun is not in the Ubuntu archive.

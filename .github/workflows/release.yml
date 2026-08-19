@@ -1,0 +1,106 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  OTP: "27"
+  ELIXIR: "1.18"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - name: macos-arm64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-beam publishes builds for the Linux runners; on macOS Homebrew is
+      # the reliable path and gives the same OTP 27 / Elixir 1.18 pair.
+      - uses: erlef/setup-beam@v1
+        if: runner.os == 'Linux'
+        with:
+          otp-version: ${{ env.OTP }}
+          elixir-version: ${{ env.ELIXIR }}
+      - name: otp and elixir
+        if: runner.os == 'macOS'
+        run: |
+          brew install erlang@27 elixir
+          echo "$(brew --prefix erlang@27)/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rs
+
+      - name: build the single file
+        run: scripts/build-release.sh --verify
+
+      - name: name the artifact
+        id: artifact
+        shell: bash
+        run: |
+          file="$(ls dist/tenon-* | grep -v '\.sha256$' | head -1)"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "base=$(basename "$file")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.base }}
+          path: |
+            dist/tenon-*
+          if-no-files-found: error
+
+      - name: attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --generate-notes
+          gh release upload "$tag" dist/tenon-* --clobber
+
+  krun:
+    name: krun conformance
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rs
+      # Both halves have to be there: a hypervisor and a libkrun to drive it.
+      # libkrun is not in the Ubuntu archive, so on a stock runner this job
+      # reports the reason and stops; the same script passes on a host that has
+      # it (a Mac, or a runner image with libkrun installed).
+      - name: hypervisor and libkrun
+        id: check
+        run: |
+          ok=1
+          [ -e /dev/kvm ] || { echo "no /dev/kvm on this runner"; ok=0; }
+          sudo apt-get update
+          sudo apt-get install -y libkrun-dev || { echo "libkrun not installable from the archive"; ok=0; }
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+      - name: smoke
+        if: steps.check.outputs.ok == '1'
+        run: scripts/krun-smoke.sh
+      - name: skipped
+        if: steps.check.outputs.ok != '1'
+        run: |
+          echo "krun conformance skipped: this runner has no hypervisor, no libkrun, or neither"

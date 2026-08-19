@@ -1,0 +1,165 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTP: "27"
+  ELIXIR: "1.18"
+
+jobs:
+  beam:
+    name: beam gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP }}
+          elixir-version: ${{ env.ELIXIR }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            kernel/_build
+            loader/_build
+            loader/deps
+            cli/_build
+            cli/deps
+            beam/_build
+            beam/deps
+          key: beam-${{ runner.os }}-${{ env.OTP }}-${{ env.ELIXIR }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: beam-${{ runner.os }}-${{ env.OTP }}-${{ env.ELIXIR }}-
+      - name: kernel
+        working-directory: kernel
+        run: |
+          mix compile
+          mix format --check-formatted
+          mix test
+      - name: loader
+        working-directory: loader
+        run: |
+          mix deps.get
+          mix compile --warnings-as-errors
+          mix format --check-formatted
+          mix credo --strict
+          mix test
+      - name: cli
+        working-directory: cli
+        run: |
+          mix deps.get
+          mix compile --warnings-as-errors
+          mix format --check-formatted
+          mix credo --strict
+          mix escript.build
+          mix test
+      - name: beam
+        working-directory: beam
+        run: |
+          mix deps.get
+          mix compile --warnings-as-errors
+          mix format --check-formatted
+          mix test
+          MIX_ENV=prod mix release --overwrite
+
+  rust:
+    name: rust build and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP }}
+          elixir-version: ${{ env.ELIXIR }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rs
+      - name: build the release the tests boot nodes from
+        working-directory: beam
+        run: |
+          mix deps.get
+          MIX_ENV=prod mix release --overwrite
+      - name: build
+        working-directory: rs
+        run: cargo build --release
+      - name: clippy
+        working-directory: rs
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: fmt
+        working-directory: rs
+        run: cargo fmt --check
+      # Everything that needs no sandbox engine. The container-heavy gates are
+      # the `integration` job below, which is the one that has podman.
+      - name: unit tests
+        working-directory: rs
+        run: cargo test --all-features --lib
+      - name: sandbox conformance
+        working-directory: rs
+        run: cargo test --all-features -p tenon-sandbox -- --nocapture
+
+  integration:
+    name: integration gates (podman)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP }}
+          elixir-version: ${{ env.ELIXIR }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rs
+      - name: podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+          podman version
+      - name: build the beam release
+        working-directory: beam
+        run: |
+          mix deps.get
+          MIX_ENV=prod mix release --overwrite
+      - name: pull the sandbox image once
+        run: podman pull docker.io/library/python:3.12-slim
+      # The adversarial suite kills base processes and races container
+      # teardown; rs/README.md prescribes running it on its own.
+      - name: gates
+        working-directory: rs
+        run: cargo test --all-features --workspace --exclude tenon-cli
+      - name: cli gates
+        working-directory: rs
+        run: cargo test --all-features -p tenon-cli --tests -- --skip adversarial
+      - name: adversarial suite
+        working-directory: rs
+        run: cargo test --all-features -p tenon-cli --test adversarial -- --test-threads 1
+      - name: no container left behind
+        if: always()
+        run: |
+          left="$(podman ps -a --filter label=tenon.home --format '{{.ID}}')"
+          [ -z "$left" ] || { echo "leaked containers: $left"; podman rm -f $left; exit 1; }
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: scan the pushed range
+        run: |
+          from="${{ github.event.pull_request.base.sha || github.event.before }}"
+          to="${{ github.event.pull_request.head.sha || github.sha }}"
+          if [ -z "$from" ] || [ "$from" = "0000000000000000000000000000000000000000" ]; then
+            from="$(git rev-list --max-parents=0 "$to" | tail -1)"
+          fi
+          echo "scanning $from..$to"
+          scripts/scan-secrets.sh range "$from" "$to"
