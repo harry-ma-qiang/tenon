@@ -50,19 +50,12 @@ async fn connection(stream: UnixStream, id: u64, cmds: Cmds, opts: Opts) {
         tokio::spawn(async move {
             let outcome = dispatch(&body, &peer, &cmds, &opts).await;
             if let Some(id) = frame::id(&body) {
-                peer.send(reply(id, outcome));
+                peer.send(frame::rep_id(id, outcome));
             }
         });
     }
     peer.fail_all("disconnected");
     let _ = cmds.send(Cmd::Gone { peer: id });
-}
-
-fn reply(id: u64, outcome: Answer) -> Value {
-    match outcome {
-        Ok(result) => json!({"t": "rep", "id": id, "result": result}),
-        Err(error) => json!({"t": "rep", "id": id, "error": error}),
-    }
 }
 
 async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer {

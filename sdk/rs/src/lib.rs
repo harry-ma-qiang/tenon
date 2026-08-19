@@ -422,7 +422,7 @@ impl Plugin {
         let config = self.config.clone();
         match self.load_handler.clone() {
             Some(body) => self.guard(req, body, vec![config]),
-            None => self.send(&json!({"t": "rep", "req": req, "result": "ok"})),
+            None => self.send(&rep(req, json!("ok"))),
         }
     }
 
@@ -483,7 +483,7 @@ impl Plugin {
                 return self.fail(req, &error.to_string());
             }
         };
-        match self.send(&json!({"t": "rep", "req": req, "result": result})) {
+        match self.send(&rep(req, result)) {
             Err(Error::FrameTooLarge { size, cap }) => {
                 self.log(format!("tenon: reply of {size} bytes over cap {cap}"));
                 self.fail(req, "frame_too_large")
@@ -496,11 +496,8 @@ impl Plugin {
         if req.is_none() {
             return Ok(());
         }
-        let frame = json!({"t": "rep", "req": req, "error": reason});
-        match self.send(&frame) {
-            Err(Error::FrameTooLarge { .. }) => {
-                self.send(&json!({"t": "rep", "req": req, "error": "frame_too_large"}))
-            }
+        match self.send(&rep_err(req, reason)) {
+            Err(Error::FrameTooLarge { .. }) => self.send(&rep_err(req, "frame_too_large")),
             other => other,
         }
     }
@@ -581,6 +578,14 @@ impl Next<'_> {
     pub fn config(&self) -> &Value {
         &self.plugin.config
     }
+}
+
+fn rep(req: Option<u64>, result: Value) -> Value {
+    json!({"t": "rep", "req": req, "result": result})
+}
+
+fn rep_err(req: Option<u64>, error: &str) -> Value {
+    json!({"t": "rep", "req": req, "error": error})
 }
 
 fn args_of(frame: &Value) -> Vec<Value> {

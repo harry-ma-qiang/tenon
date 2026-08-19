@@ -69,23 +69,15 @@ async fn serve(
         };
         match frame::method(&request) {
             Some("load") => {
-                let req = request.get("req").cloned().unwrap_or(Value::Null);
-                write(
-                    &mut stream,
-                    &json!({"t": "rep", "req": req, "result": "ok"}),
-                )
-                .await?;
+                let req = crate::params::value(&request, "req");
+                write(&mut stream, &frame::rep_req(req, Ok(json!("ok")))).await?;
                 write(&mut stream, &json!({"t": "provide", "name": service})).await?;
             }
             Some("svc") => {
                 let req = crate::params::value(&request, "req");
                 let method = crate::params::text(&request, "method");
                 let answer = call(&env, &method, &cmds).await;
-                let frame = match answer {
-                    Ok(result) => json!({"t": "rep", "req": req, "result": result}),
-                    Err(error) => json!({"t": "rep", "req": req, "error": error}),
-                };
-                write(&mut stream, &frame).await?;
+                write(&mut stream, &frame::rep_req(req, answer)).await?;
             }
             Some("unload") => return Ok(()),
             _ => {}
