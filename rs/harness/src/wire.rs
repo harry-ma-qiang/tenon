@@ -5,7 +5,7 @@ use std::os::fd::FromRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tenon_base::frame;
+use tenon_base::{frame, params};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
@@ -194,7 +194,7 @@ where
                 for name in router.names() {
                     wire.send(json!({"t": "provide", "name": name}));
                 }
-                wire.send(json!({"t": "rep", "req": body.get("req"), "result": "ok"}));
+                wire.send(frame::rep_req(params::value(&body, "req"), Ok(json!("ok"))));
                 if let Some(ready) = ready.take() {
                     ready(wire.clone(), config);
                 }
@@ -208,35 +208,18 @@ where
 }
 
 fn dispatch(wire: &Arc<Wire>, router: &Arc<Router>, body: Value) {
-    let req = body.get("req").cloned().unwrap_or(Value::Null);
-    let name = body
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let method = body
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let args = body
-        .get("args")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let req = params::value(&body, "req");
+    let name = params::text(&body, "name");
+    let method = params::text(&body, "method");
+    let args = params::array(&body, "args");
     let Some(handler) = router.lookup(&name, &method) else {
-        wire.send(
-            json!({"t": "rep", "req": req, "error": format!("unknown method {name}.{method}")}),
-        );
+        let reason = format!("unknown method {name}.{method}");
+        wire.send(frame::rep_req(req, Err(reason)));
         return;
     };
     let wire = wire.clone();
     tokio::spawn(async move {
-        let frame = match handler(args).await {
-            Ok(result) => json!({"t": "rep", "req": req, "result": result}),
-            Err(error) => json!({"t": "rep", "req": req, "error": error}),
-        };
-        wire.send(frame);
+        wire.send(frame::rep_req(req, handler(args).await));
     });
 }
 
