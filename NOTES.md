@@ -1715,3 +1715,16 @@ tested, conformance suite skips itself with a reason string. Needs a KVM/HVF hos
 
 A live Tenon instance was left running for direct inspection: `TENON_HOME=~/.tenon-demo`,
 HTTP UI at `http://127.0.0.1:38080/`, distinct from the user's own DSH demo on `:3080`.
+
+## 31. Next Horizon: Real-time UI Redesign, Always-On Daemon & Telemetry Broadcast (2026-08-19)
+
+### Direction & Directives
+
+As planned in `p3.refactor.md`, the next evolution focuses on making the TUI and Web UI more real-time, more compatible, cooler, more professional, and deeply 简约 (minimalist & sleek):
+1. **Always-On Daemon (`vibe-term` Model)**: Single standardized daemon setup (`~/.tenon/run/base.sock`). `Ctrl-C` / window close only *detaches* the UI client without interrupting running microVMs, compiling builds, or LLM turns. Explicit `tenon stop` stops the server. macOS `launchd` / Linux `systemd --user` units prevent OS sleep termination.
+2. **Synchronized Broadcast & Cooperative Control Lock**: Multi-terminal fan-out broadcast (all TUI and Web screens show identical live tokens and logs). Lightweight `ControlLease` prevents multi-user prompt conflicts with graceful auto-release and takeover.
+3. **Low-Latency Live Telemetry**: Zero-copy in-memory ring buffer (`TelemetryRing`) broadcasting live CPU/RAM, token/sec velocity, wire latency, and BEAM fibers at 20Hz (50ms).
+4. **Distributed Swarm Ready & Tight Code Budget**: Frame format ready for remote node clustering; entire infrastructure delivered within **≤ 2,000 LoC** of pure Rust.
+5. **Planning Only**: Logged and architected in `p3.refactor.md` (no code written yet).
+
+
