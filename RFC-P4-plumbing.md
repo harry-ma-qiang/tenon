@@ -141,6 +141,32 @@ Mobile: the App is just another subscriber — same RPC + SSE or the P4.4 WS car
 `notify` plugin (APNs/FCM) subscribes to the bus; thin device SDKs (~200 lines Swift/Kotlin) mirror
 sdk/py/ts/rs. All L2 plugins; no architecture change.
 
+## 8c. App platform: ingress, and the data-layering rule
+
+Evaluation (2026-08-19): with P4 the facades cover ~70% of a BaaS (state=kv, files=blob,
+realtime=bus with offset resync, search=query, server logic=long-lived python/node inside the VM,
+audit/undo=log+snapshots, tenancy/quotas=env tree+budgets, TLS/auth/WS=P4.4). Two gaps closed here:
+
+Ingress (route + port mapping, ~150 lines inside the http feature):
+- Registration: an app inside the sandbox calls gateway svc `ingress.register{name, port, public?}`;
+  the worker/base validates (name unique per host, env owns it, count/quota from config,
+  non-public apps inherit the bearer token) and writes `/ingress/<name> -> {env, addr}` into kv
+  (lease-backed: app dies -> route expires). `ingress.list` and CLI `tenon ingress` read kv.
+- Routing: `serve` proxies `/app/<name>/*` -> the sandbox address (oci: mapped port on 127.0.0.1;
+  krun: TSI-mapped port; landlock: localhost port), strips the prefix, adds `X-Tenon-App`,
+  `X-Tenon-Env`; WS upgrade passes through (same carrier); public apps skip the token, everything
+  else requires it. No subdomains, no per-app TLS, no load balancing — one host, one proxy route.
+- Safety: routes only into that env's own sandbox; body size and connection caps from config;
+  `ingress.register` can be listed in `gated_tools` to require human approval.
+
+Data layering rule (the SQL answer): one app, one file — an app's relational data lives in ITS OWN
+sqlite file inside its workspace (python/node have sqlite natively; git-snap snapshots it, giving
+DB time-travel for free). The platform never offers a shared SQL server; cross-app/shared state goes
+through kv/bus/blob only (permissioned, audited, evented). kv/bus are coordination primitives, not a
+query engine for app schemas; the query facade serves the platform's own log/memory. If a managed DB
+is ever needed: an additive `db.open(name)` facade (per-env libSQL file + quota + snapshot-backed
+backups) — not built now.
+
 ## 9. Plan
 
 | Step | Deliverable | Gate |
@@ -150,7 +176,8 @@ sdk/py/ts/rs. All L2 plugins; no architecture change.
 | P4.2 | query hot layer: typed `query.text/scan`, FTS5 over durable topics, composite indexes, retention window config | text < 10 ms and scan < 100 ms at 1M events (bench in tests) |
 | P4.3 | warm segments: compactor to Parquet + Tantivy (vector stub), fan-out merge, version-gated rebuild, `derived/` lifecycle | 10M-event budgets of section 5; rebuild-from-log test |
 | P4.4 | `--https` (rustls + rcgen dev self-signed) + bearer auth on serve, feature-gated; WebSocket as the 5th wire carrier (tokio-tungstenite, same feature): `/ws` on serve (RPC + subscribe over WS text frames, binary frames reserved for media chunks) and WS accept on the gateway (`TENON_GATEWAY` gains `ws:`; each connection mounts as a fiber — lets browser extensions such as the vibe-browse Chrome bridge register as plugins without a python side-server) | curl over https works; no token = 401; a WS client subscribes and receives coalesced envelopes; a WS client speaks hello/provide and its svc answers through the kernel; feature off = binary unchanged |
-| P4.5 | docs + REVIEW-P4 (perf tables incl. UI latency), NOTES update | all gates; secret scan; no leftover containers |
+| P4.5 | ingress (section 8c): `ingress.register/list`, kv lease routes, `/app/<name>/*` proxy incl. WS pass-through, quotas | an app started inside the sandbox registers and is reachable through https with the token; killing the app expires the route; a second env cannot claim the same name |
+| P4.6 | docs + REVIEW-P4 (perf tables incl. UI latency), NOTES update | all gates; secret scan; no leftover containers |
 
 LoC estimate: bus 0.8-1k, kv 0.4k, blob facade 0.1k, query hot 0.5k, warm compactor 0.8-1k, minus
 ~0.5-0.8k deleted legacy RPC/plumbing = net ~+2k Rust for the whole of P4, tests separate. Crates:
