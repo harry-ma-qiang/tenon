@@ -13,8 +13,10 @@ a fiber dies, cleanly or violently, nothing it registered survives it.
 
 Design reference: Cordis (MIT), see NOTICE. Decisions, phase plans and status: `NOTES.md`.
 
-Status: P3.0-3.8 landed and independently QA'd (2026-08-19) - gates, e2e (real model,
-CLI + HTTP), and a Tenon-native vs DSH performance comparison. See `REVIEW-P3.md`.
+Status: P3 complete (P3.0-3.8), independently QA'd 2026-08-19: all gates green (kernel 66,
+loader 69, beam 38, sdk 16, Rust 173 tests), end-to-end verified with a real model over both CLI and
+HTTP, secret scan clean, plus a Tenon-native vs DSH performance comparison (faster on both measured
+model tasks). Evidence and how-to-review: `REVIEW-P3.md`. Next: P4 plumbing (`RFC-P4-plumbing.md`).
 
 ## Layout
 
