@@ -177,7 +177,7 @@ implementation detail.
 - User's project files: default clone-in / push-out with human review; opt-in virtio-fs mount of a
   host directory when convenience beats isolation.
 
-## 9. Storage and control plane
+## 9. Storage and control plane (superseded by RFC-P4-plumbing.md sections 2-6; kept for history)
 
 - Host files: `config`, `state.sqlite` (barebone) and `state-<env>.sqlite` per env; optional
   `workspace-<env>.img`. Every state file has one writer (its env's harness, or base for the barebone
