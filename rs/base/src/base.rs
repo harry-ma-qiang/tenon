@@ -279,7 +279,14 @@ impl Base {
             self.promoted = true;
             let _ = self.store.checkpoint();
             match self.home.promote_lkg() {
-                Ok(()) => self.emit("lkg.promote", None, json!({"ok": true})),
+                Ok(()) => {
+                    let manifest = crate::manifest::write(&self.home, &self.release.clone());
+                    let data = match manifest {
+                        Ok(manifest) => json!({"ok": true, "manifest": manifest}),
+                        Err(error) => json!({"ok": true, "manifest_error": error.to_string()}),
+                    };
+                    self.emit("lkg.promote", None, data);
+                }
                 Err(error) => self.emit("lkg.promote", None, json!({"error": error.to_string()})),
             }
             self.emit("base.ready", None, json!({"nodes": self.nodes.len()}));

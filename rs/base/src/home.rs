@@ -59,6 +59,12 @@ impl Home {
     /// Where an extra guardian probe must live to be loadable at all; base
     /// checks each one against the sha256 in its own config before the
     /// guardian node is told about it.
+    /// Installed plugin versions, `<name>@<version>/manifest.json` each: the
+    /// loader's manifest registry source and what the LKG manifest pins.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.root.join("plugins")
+    }
+
     pub fn probes_dir(&self) -> PathBuf {
         self.root.join("probes")
     }
@@ -153,6 +159,7 @@ impl Home {
             self.run(),
             self.lkg(),
             self.probes_dir(),
+            self.plugins_dir(),
         ] {
             std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
@@ -430,7 +437,7 @@ fn copy_file(from: &Path, into: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_tree(from: &Path, into: &Path) -> Result<()> {
+pub fn copy_tree(from: &Path, into: &Path) -> Result<()> {
     if !from.is_dir() {
         bail!("{} is not a directory", from.display());
     }

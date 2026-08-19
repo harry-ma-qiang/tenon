@@ -68,6 +68,7 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `state.sqlite` | the host state file, one writer: base |
 | `profiles/root/tenon.yml` | the default profile: one demo external plugin |
 | `profiles/root/registry.yml` | the `name => spec` rows the loader resolves against |
+| `plugins/<name>@<version>/manifest.json` | installed plugin versions: the loader's manifest registry source, pinned by the LKG manifest |
 | `probes/` | extra guardian probe executables; only the ones `probes.extra` lists with a matching sha256 are ever run |
 | `profiles/guardian/` | an empty entry list; G mounts only barebone plugins |
 | `erts/<version>-<sha>/` | the extracted BEAM release, read-only to base and to the nodes |
@@ -83,7 +84,7 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `run/harness-<env>.log` | stdout and stderr of that env's harness process |
 | `envs/<env>/workspace/` | that env's sandbox workspace, bind-mounted at `/workspace` (oci) or granted read-write at the same path (landlock). `.tenon-snap/` (the snapshot GIT_DIR), `.tenon-out/` (handles and spill files) and `.tenon-restore/` (packs staged for a restore) live inside it |
 | `profiles/<child>/overlay.patch.yml` | a spawned child env's own patch layer; its `TENON_PROFILE` is the parent's layers plus this file |
-| `lkg/` | `config.yml`, `profiles/`, `state.sqlite` copied at every successful boot |
+| `lkg/` | `config.yml`, `profiles/`, `state.sqlite` copied at every successful boot, plus `manifest.json`: the hashes `tenon rollback` verifies |
 
 ## Double start, boot signals, state integrity, node auth
 
@@ -641,6 +642,40 @@ budget_reset_on_reset: true
 budget_tick_ms: 5000
 ```
 
+## Manifests, the LKG manifest and `tenon rollback` (P3.5)
+
+Two manifests, one shape. A **plugin manifest** is what makes a version installable and
+resolvable by name; the **LKG manifest** is what makes a rollback verifiable.
+
+```
+<home>/plugins/<name>@<version>/manifest.json      installed plugin versions
+   {name, version, hash, cmd, args, protocol}      loader resolves profile names against these
+
+<home>/lkg/manifest.json                           written at every LKG promotion
+   {config_hash, profile_hash, release_version,
+    plugins: [{name, version, hash}], state_copy: {path, sha256, bytes}}
+```
+
+- **The loader reads the plugin manifests** (`loader/README.md`, `Tenon.Loader.Manifest`):
+  every node's profile gets `manifests: ["<home>/plugins"]`, so a profile row may name
+  `echo` (whatever version is installed) or `echo@1.0.0` (pinned), and an explicit
+  `registry.yml` row still wins over a manifest of the same name.
+- **The LKG manifest is written by base at every promotion**, over the copies it has just
+  taken: `config_hash` is the sha256 of `lkg/config.yml`, `profile_hash` one sha256 over
+  the whole of `lkg/profiles/` (paths included, so a renamed profile moves it),
+  `release_version` is the binary's version and the release directory it started nodes
+  from, `plugins` is what was installed at that moment, and `state_copy` names and hashes
+  the state file that was copied. It rides along in the `lkg.promote` event.
+- **`tenon rollback [--force]` verifies before it restores.** Every hash is recomputed:
+  the three LKG copies must still hash to what was pinned (a corrupt LKG must not be
+  restored over a live home), and every pinned plugin must still be installed with the
+  same hash. Any drift prints one line per difference — `what`, `pinned`, `found` — and
+  refuses; `--force` restores anyway. It also refuses while base is up, because restoring
+  `state.sqlite` under its only writer would corrupt exactly what is being rescued.
+- **`tenon status --lkg`** prints the manifest plus `verified` and the same difference
+  list, needs no running base, and exits non-zero when the verification fails — which
+  makes it usable as a check in a script.
+
 ## Guardian probes (P3.5)
 
 RFC section 5.2's watch, as a fixed set of probes in the guardian node plus the extra ones
@@ -761,7 +796,8 @@ public surface — and it works with JavaScript off.
 | `tenon serve --http ADDR [--env NAME]` | the same UI as a localhost web page (cargo feature `http`, off by default) |
 | `tenon stop [--all]` | stop every env, then G, then base; `--all` also reaps this home's dead-base sandbox leftovers afterward |
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
-| `tenon status` | one JSON document: base, both nodes, and each node's fiber tree |
+| `tenon status [--lkg]` | one JSON document: base, both nodes, and each node's fiber tree. `--lkg` prints what the last promotion pinned and verifies it instead, without needing a running base, and exits non-zero when a hash moved |
+| `tenon rollback [--force]` | restore the LKG config, profiles and state copy. Verifies every pinned hash first and refuses with what differs; `--force` overrides. Refuses while base is running |
 | `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
 | `tenon run "task" [--env NAME] [--timeout SECONDS]` | one task for that env's agent: create a session, prompt it, stream the answer, exit 0 if the turn ended ok |
 | `tenon harness [--env NAME]` | the agent process of one env. Base starts one per env; run by hand only against a live gateway |
@@ -1300,3 +1336,15 @@ accumulate across CI runs.
     the harness would be base asking itself. Base registers it once the harness answers,
     with `loop.ping` as the health target — the same call the guardian's harness probe
     makes, so the contract's health claim and the guardian's probe cannot drift apart.
+47. **`tenon rollback` is a local, base-must-be-down operation.** It restores
+    `state.sqlite`, and that file has exactly one writer; copying over it while base holds
+    it open would corrupt the thing being rescued. So `rollback` talks to no socket at
+    all, refuses while `run/base.ready` exists, and names the pid that has to go first.
+    `status --lkg` is local for the same reason: the LKG is what a human reads *because*
+    base may not be reachable.
+48. **The LKG manifest verifies the LKG copies and the installed plugins, not the
+    workspace.** `config_hash`, `profile_hash` and `state_copy.sha256` are recomputed over
+    `lkg/` (has the pinned copy itself been touched or truncated), and every pinned plugin
+    must still be installed with the same hash (has an agent replaced a plugin version
+    under a name the pinned profile resolves). Packs are the workspace history and are
+    restored by `reset`, not by `rollback`.

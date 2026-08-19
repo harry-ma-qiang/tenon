@@ -2,13 +2,15 @@ defmodule Tenon.Loader do
   @moduledoc """
   In-VM Tenon plugin that composes a Cordis/DSH config tree and mounts it.
 
-  Config: `%{layers: [layer], registry: %{name => spec}, collapse: [{prefix, fun}], dsh: map()}`.
+  Config: `%{layers: [layer], registry: %{name => spec}, manifests: [dir],
+  collapse: [{prefix, fun}], dsh: map()}`.
   See `README.md` for the row, patch and `!!js` semantics.
   """
 
   require Logger
 
   alias Tenon.Loader.Config
+  alias Tenon.Loader.Manifest
   alias Tenon.Loader.Server
   alias Tenon.Loader.Tree
 
@@ -29,10 +31,20 @@ defmodule Tenon.Loader do
 
     built =
       rows
-      |> Tree.build(config)
+      |> Tree.build(Map.put(config, :registry, registry(config)))
       |> Map.put(:warnings, warnings)
 
     Tree.sync(ctx, state, built)
+  end
+
+  # Manifests are re-read on every compose, so installing a plugin version and
+  # calling `reload/1` is enough to make its name resolvable; an explicit
+  # `registry` row always wins over one a manifest supplies.
+  defp registry(config) do
+    config
+    |> Map.get(:manifests)
+    |> Manifest.load()
+    |> Map.merge(Map.get(config, :registry, %{}))
   end
 
   @spec reload(pid()) :: :ok

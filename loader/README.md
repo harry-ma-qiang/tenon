@@ -33,6 +33,7 @@ ctx = :tenon.root(kernel)
 | `layers` | ordered list of config layers. A path ending in `.patch.yml` / `.patch.yaml` is a **patch list**, any other path is an **entry list**. `{:patch, path_or_rows}` and `{:entries, path_or_rows}` state the kind explicitly and accept already-parsed rows |
 | `registry` | `name => spec`. `%{module: M}` mounts an in-VM plugin, `%{cmd: c, args: a, env: e}` mounts an external one. A name that is in no layer of the registry **fails loud** |
 | `collapse` | `[{prefix, fun}]`. Every row whose `name` starts with `prefix` leaves the tree; the harvested rows are handed to `fun` as ONE list and the returned spec is mounted as a single external fiber. First matching target wins |
+| `manifests` | directories of installed plugin versions, `<dir>/<name>@<version>/manifest.json`. Read on every compose and merged **under** `registry`, so an explicit registry row of the same name wins. See [Manifests](#manifests) |
 | `dsh` | the built-in collapse target `Tenon.Loader.Dsh`. It is tried **before** every `collapse` prefix. See [DSH collapse](#dsh-collapse) |
 
 Every layer is turned into patch rows and applied over an **empty root** in order, exactly
@@ -74,6 +75,29 @@ DSH include produces, and are never evaluated on the BEAM.
 
 "Fails loud" means: the row is logged as an error, is not mounted, and appears in `dump/1`
 with `kind: :error` and its reason. The rest of the tree still mounts.
+
+## Manifests
+
+`Tenon.Loader.Manifest` is a registry source that reads a directory instead of a map:
+
+```
+<dir>/<name>@<version>/manifest.json
+  {"name": "echo", "version": "1.0.0", "hash": "sha256:...",
+   "cmd": "./bin/echo", "args": [], "protocol": "wire/1"}
+```
+
+Each manifest becomes **two** registry rows, `name` and `name@version`, so a profile row
+either follows whatever version is installed or pins one. A relative `cmd` is resolved
+against the plugin's own directory. `name`, `version` and `cmd` are required and
+`protocol` must be one this loader speaks (`wire`, `wire/1`, `wire/1.2`); anything else is
+logged as an error and the row is simply not in the registry, which then fails the profile
+row that names it the same way an unknown name does. `hash` is carried for the host's
+change protocol (`rs/README.md`, the LKG manifest) and is not checked here.
+
+`Manifest.load/1` is the registry map, `Manifest.list/1` the manifests themselves for a
+caller that wants versions and hashes. Both take a directory or a list of them, and a
+directory that does not exist is an empty map rather than an error, so `manifests:` can be
+set unconditionally. Base sets it to `<home>/plugins` for every node.
 
 ## DSH collapse
 
@@ -185,7 +209,11 @@ mix compile --warnings-as-errors && mix format --check-formatted
 mix credo --strict && mix test        # seeds 1..3 verified
 ```
 
-64 tests. `test/config_test.exs` ports the `applyEntryPatches` and YAML dialect cases,
+69 tests. `test/manifest_test.exs` covers the manifest registry: two plugins read by name
+and by `name@version`, a relative `cmd` resolved against the plugin directory, an
+incomplete manifest and an unknown protocol both refused loudly, a profile row of each
+kind mounting a real wire plugin through the manifest, and an explicit registry row
+winning over a manifest. `test/config_test.exs` ports the `applyEntryPatches` and YAML dialect cases,
 `test/tree_test.exs` covers spec resolution, disabled inheritance, the `!!js` policy and
 collapse harvesting, and `test/loader_test.exs` runs the real kernel: mount, group cascade,
 reload diff, a bridge fiber speaking the wire (`test/fixtures/wire_plugin.py`), and a

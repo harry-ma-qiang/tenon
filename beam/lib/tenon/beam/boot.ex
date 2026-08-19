@@ -67,7 +67,15 @@ defmodule Tenon.Beam.Boot do
         Map.merge(acc, Registry.load(Path.join(Path.dirname(path), "registry.yml")))
       end)
 
-    %{layers: layers, registry: registry}
+    %{layers: layers, registry: registry, manifests: [plugins()]}
+  end
+
+  # `<home>/plugins/<name>@<version>/manifest.json`: the loader reads them on
+  # every compose, so an installed plugin version is resolvable by name after a
+  # `reload`, and base pins the same directory in the LKG manifest.
+  defp plugins do
+    home = System.get_env("TENON_HOME", Path.join(System.user_home!(), ".tenon"))
+    Path.join(home, "plugins")
   end
 
   defp layers(nil), do: []

@@ -14,6 +14,7 @@ pub mod http;
 pub mod instance;
 pub mod integrity;
 pub mod lock;
+pub mod manifest;
 pub mod node;
 pub mod peer;
 pub mod probes;
@@ -263,6 +264,36 @@ pub async fn approve(
         params["note"] = json!(note);
     }
     rpc(home, "approval.answer", params).await
+}
+
+/// `tenon rollback`: the LKG manifest is verified before anything is put
+/// back, and a mismatch names what differs instead of restoring over it.
+pub async fn rollback(home: Option<PathBuf>, force: bool) -> Result<i32> {
+    let home = Home::resolve(home)?;
+    let result = manifest::rollback(&home, force)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(0)
+}
+
+/// `tenon status --lkg`: what the last promotion pinned and whether the
+/// copies on disk still hash to it. Needs no running base.
+pub fn lkg_status(home: Option<PathBuf>) -> Result<i32> {
+    let home = Home::resolve(home)?;
+    let manifest = manifest::read(&home)?;
+    let differs = manifest::verify(&home, &manifest);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "lkg": home.lkg(),
+            "manifest": manifest,
+            "verified": differs.is_empty(),
+            "differs": differs,
+        }))?
+    );
+    Ok(match differs.is_empty() {
+        true => 0,
+        false => 1,
+    })
 }
 
 pub async fn rpc(home: Option<PathBuf>, method: &str, params: Value) -> Result<i32> {
