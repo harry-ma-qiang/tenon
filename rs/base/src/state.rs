@@ -53,6 +53,7 @@ pub struct Node {
     pub fiber: Option<envfiber::Handle>,
     pub ticker: Option<Ticker>,
     pub restore: Vec<(i64, String)>,
+    pub budget: crate::budget::Budget,
 }
 
 pub fn worker_view(state: &WorkerState) -> Value {
@@ -78,6 +79,7 @@ impl Base {
             "depth": node.depth,
             "worker": worker_view(&node.worker),
             "harness": crate::harness::view(&node.harness, node.harness_restarts),
+            "budget": self.budget_view(env),
             "children": self.children_of(env),
         }))
     }
@@ -92,6 +94,7 @@ impl Base {
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            killed: self.killed.clone(),
             home: self.home.root.clone(),
             release: self.release.clone(),
             pid: std::process::id(),
@@ -102,6 +105,7 @@ impl Base {
                 .iter()
                 .map(|(env, node)| NodeView {
                     env: env.clone(),
+                    budget: self.budget_view(env),
                     role: node.role.clone(),
                     pid: node.pid,
                     registered: node.registered,

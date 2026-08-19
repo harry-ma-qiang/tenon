@@ -31,6 +31,8 @@ pub struct Base {
     pub generation: u64,
     pub promoted: bool,
     pub stopping: bool,
+    pub pending: BTreeMap<i64, crate::approvals::Pending>,
+    pub killed: Option<String>,
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -67,6 +69,8 @@ impl Base {
             generation: 0,
             promoted: false,
             stopping: false,
+            pending: BTreeMap::new(),
+            killed: None,
         }
     }
 
@@ -140,11 +144,49 @@ impl Base {
             | Cmd::ConfigGet { .. }
             | Cmd::ConfigPatch { .. }
             | Cmd::Approval { .. } => self.on_env_cmd(cmd),
+            Cmd::ApprovalList {
+                status,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(self.approval_list(status.as_deref(), limit));
+            }
+            Cmd::ApprovalAnswer {
+                id,
+                decision,
+                note,
+                reply,
+            } => {
+                let _ = reply.send(self.approval_answer(id, &decision, note.as_deref()));
+            }
+            Cmd::ApprovalExpire { id } => self.approval_expire(id),
+            Cmd::Guard { env, reply } => {
+                let _ = reply.send(self.allow_prompt(&env));
+            }
+            Cmd::Halt { env, reason } => {
+                let grace = Duration::from_millis(self.config.stop_grace_ms);
+                self.harness_halt(&env, grace).await;
+                self.emit_env(&env, "env.halt", json!({"reason": reason}));
+            }
+            Cmd::Kill { on, reason, reply } => {
+                let outcome = self.kill_switch(on, reason).await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
+            }
+            Cmd::BudgetTick => self.tick_budgets(),
+            Cmd::Processes { env, count } => self.processes(&env, count),
             Cmd::WorkerReady { env, pid, error } => self.worker_ready(&env, pid, error),
             Cmd::SnapPull { env, reply } => self.snap_pull(&env, reply),
             Cmd::SnapList { env, reply } => {
                 let _ = reply.send(self.snap_list(&env));
             }
+            Cmd::SnapExport {
+                env,
+                path,
+                approved,
+                reply,
+            } => self.on_snap_export(env, path, approved, reply),
             Cmd::SnapPacked {
                 env,
                 step,
@@ -155,11 +197,9 @@ impl Base {
                 peer,
                 parent,
                 overrides,
+                approved,
                 reply,
-            } => {
-                let outcome = self.spawn_child(peer, parent, &overrides);
-                let _ = reply.send(outcome);
-            }
+            } => self.on_spawn(peer, parent, overrides, approved, reply),
             Cmd::RuntimeStop { env, reply } => {
                 let outcome = self.runtime_stop(&env).await;
                 let _ = reply.send(outcome);
@@ -236,6 +276,13 @@ impl Base {
         .map_err(|error| error.to_string())?;
         let mut previous = self.nodes.remove(env);
         let restarts = previous.as_ref().map(|node| node.restarts).unwrap_or(0);
+        let mut budget = previous
+            .as_ref()
+            .map(|node| node.budget.clone())
+            .unwrap_or_default();
+        if budget.started == 0 {
+            budget.started = tenon_storage::now();
+        }
         let sandbox = self.enter_sandbox(role, env, previous.as_ref(), ram_mb)?;
         let store = match previous.as_mut().and_then(|old| old.store.take()) {
             Some(store) => Some(store),
@@ -271,6 +318,7 @@ impl Base {
                 .as_ref()
                 .map(|old| old.restore.clone())
                 .unwrap_or_default(),
+            budget,
         };
         self.nodes.insert(env.to_string(), node);
         let _ = self
@@ -441,9 +489,19 @@ impl Base {
         let restored = self.home.restore_env(env).unwrap_or(false);
         let parent = self.nodes.get(env).and_then(|node| node.parent.clone());
         self.start(&role, env, parent)?;
+        let clear = self.config.budget_reset_on_reset;
         if let Some(node) = self.nodes.get_mut(env) {
             node.restarts = 0;
             node.restore = staged.clone();
+            if clear {
+                node.budget = crate::budget::Budget {
+                    started: tenon_storage::now(),
+                    ..Default::default()
+                };
+            }
+        }
+        if clear {
+            self.emit_env(env, "budget.reset", json!({"ok": true}));
         }
         let fresh = self.nodes.get(env).and_then(|node| node.pid);
         Ok(json!({
