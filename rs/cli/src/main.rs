@@ -32,6 +32,33 @@ enum Command {
     Attach {
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
+        /// Render the built-in ASCII UI instead of streaming raw events
+        #[arg(long)]
+        ui: bool,
+    },
+    /// List the approval queue
+    Approvals {
+        /// pending (default), approved, denied, expired or all
+        #[arg(long, default_value = "pending", value_name = "STATUS")]
+        status: String,
+    },
+    /// Answer one pending approval
+    Approve {
+        id: i64,
+        /// Refuse instead of approving
+        #[arg(long)]
+        deny: bool,
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// Serve the built-in ASCII UI as a localhost web page
+    #[cfg(feature = "http")]
+    Serve {
+        /// The address to bind, loopback only
+        #[arg(long = "http", default_value = "127.0.0.1:8791", value_name = "ADDR")]
+        http: String,
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
     },
     /// Stop every environment, then the guardian, then the base
     Stop {
@@ -149,7 +176,14 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             })
             .await
         }
-        Command::Attach { env } => tenon_base::attach(home, env).await,
+        Command::Attach { env, ui } => match ui {
+            true => tenon_base::tui::attach(home, env).await,
+            false => tenon_base::attach(home, env).await,
+        },
+        Command::Approvals { status } => tenon_base::approvals(home, Some(status)).await,
+        Command::Approve { id, deny, note } => tenon_base::approve(home, id, deny, note).await,
+        #[cfg(feature = "http")]
+        Command::Serve { http, env } => tenon_base::http::serve(home, env, http).await,
         Command::Stop { all } => {
             let code = tenon_base::rpc(home.clone(), "stop", json!({})).await?;
             if all {

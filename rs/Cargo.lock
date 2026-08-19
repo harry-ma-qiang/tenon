@@ -1707,6 +1707,7 @@ dependencies = [
  "tar",
  "tenon-sandbox",
  "tenon-storage",
+ "tenon-ui",
  "tokio",
 ]
 

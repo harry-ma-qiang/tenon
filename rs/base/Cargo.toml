@@ -20,3 +20,7 @@ tar.workspace = true
 tokio.workspace = true
 tenon-sandbox = { path = "../sandbox" }
 tenon-storage = { path = "../storage" }
+tenon-ui = { path = "../ui" }
+
+[features]
+http = []

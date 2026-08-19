@@ -54,13 +54,33 @@ lines)` followed by the tool text when it is. Long lines are wrapped at the box'
   `Prompt`/`Approve`/`Rollback`/`Quit`, digits `0`-`9` to `Fold(n)`, everything else to `Other`.
   No raw-mode terminal handling here — the CLI attach loop owns that.
 
-## Wiring later (P3.5 base/CLI work, out of scope for this crate)
+## Wiring (P3.5, in `base`)
 
-`tenon attach --ui` will poll `status` + `events.tail` through the existing UDS client, build a
-`UiModel` from the JSON, call `Frame::draw`, and feed raw stdin bytes through `keys::parse`.
-`tenon serve --http` will do the same per request and call `html`. Both carriers are read-mostly
-except for the `p`/`a`/`r` actions, which map to `session.prompt`, `approval.request` (answer),
-and `reset`/rollback RPCs already on the wire.
+Both carriers are wired now; this crate still knows nothing about sockets or sqlite.
+
+- **The model builder is `base/src/ui.rs`.** `Ui::model(client)` reads four frames off base's
+  front door and turns them into a `UiModel`: `status` becomes `envs` (nested by `parent`) and
+  the `StatusLine` (base pid, attached count, and a budgets line that the kill switch replaces
+  with `KILL SWITCH: <reason>` when it is on), `session.history` becomes the `transcript`
+  (`user/message`, `assistant/message`, `tool/result`, newest 200), `events.tail` becomes
+  `events` (one line per row, data summarised to 200 characters) and `approval.list` becomes
+  `approvals`. Its two unit tests cover both shapes.
+- **`tenon attach --ui` is `base/src/tui.rs`.** A `termios` guard (`libc::tcgetattr`/`tcsetattr`,
+  `ICANON|ECHO|ISIG` off) enters raw mode and restores the terminal on every exit path, one
+  blocking thread turns stdin into a channel of bytes, and the loop redraws on an event from
+  `subscribe`, on a key, or on a 400 ms tick that also re-reads `Frame::size()`. `keys::parse`
+  drives it: `p` collects a line into the input hint and sends `session.prompt` (creating the
+  session on first use), `a` takes the first pending approval and asks `y`/`n` before
+  `approval.answer`, `r` asks `y` before `reset`, digits toggle `model.expanded`, `q` returns.
+- **`tenon serve --http ADDR` is `base/src/http.rs`**, behind the cargo feature `http` (off by
+  default). One render per request: `GET /?cols=N` answers `html(model, cols)`, `POST /prompt`,
+  `POST /approve/<id>` and `POST /rollback` act and answer `303 See Other` back to `/`. Loopback
+  addresses only, no JavaScript needed, no framework — four routes on tokio.
+
+`cli/tests/ui_gate.rs` covers both: `attach --ui` under a real pty (`script -q`) renders a frame
+carrying the tree, the borders and the input hint and quits on `q`; the HTTP carrier answers 200
+with a `<pre>` page, drives a fake-model turn through `POST /prompt` and resolves a pending
+approval through `POST /approve/<id>`.
 
 ## Tests
 
