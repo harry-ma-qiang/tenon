@@ -14,6 +14,7 @@ struct World {
     log: Arc<MemLog>,
     bus: Arc<FakeBus>,
     prompt: Arc<Prompt>,
+    tools: Arc<Tools>,
 }
 
 fn world(base_url: &str) -> World {
@@ -29,7 +30,7 @@ fn world(base_url: &str) -> World {
         bus.clone() as Arc<dyn Bus>,
         log.clone() as Arc<dyn Log>,
         support::llm(base_url),
-        tools,
+        tools.clone(),
         prompt.clone(),
         4,
     ));
@@ -38,6 +39,28 @@ fn world(base_url: &str) -> World {
         log,
         bus,
         prompt,
+        tools,
+    }
+}
+
+/// The human gate, as the loop sees it: one verdict, recorded.
+struct DoubleGate {
+    verdict: Result<(), String>,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl tenon_harness::bus::Gate for DoubleGate {
+    fn check<'a>(
+        &'a self,
+        name: &str,
+        args: &Value,
+    ) -> tenon_harness::bus::BoxFut<'a, Result<(), String>> {
+        self.asked
+            .lock()
+            .expect("gate lock")
+            .push(format!("{name} {args}"));
+        let verdict = self.verdict.clone();
+        Box::pin(async move { verdict })
     }
 }
 
@@ -168,6 +191,42 @@ async fn a_pre_execute_hook_denies_the_call_with_its_own_reason() {
     let result = world.log.of("tool/result").pop().unwrap();
     assert_eq!(result["denied"], json!(true));
     assert_eq!(result["text"], json!("blocked by tenon guard"));
+}
+
+/// A tool the profile lists under `gated_tools` never reaches its target
+/// until the gate answers; a refusal is a tool result the model reads.
+#[tokio::test]
+async fn a_gated_tool_is_refused_with_the_gate_s_reason() {
+    let server = fake::spawn(vec![
+        Say::Tool("bash".to_string(), json!({"cmd": "echo hi"})),
+        Say::Text("it needed a human".to_string()),
+    ])
+    .await
+    .unwrap();
+    let world = world(&server.base_url);
+    let gate = Arc::new(DoubleGate {
+        verdict: Err("tool bash needs a human and the approval is expired".to_string()),
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    world.tools.set_gate(gate.clone(), &["bash".to_string()]);
+    let id = session(&world).await;
+    world
+        .agent
+        .call(
+            "session.prompt",
+            &[json!({"session_id": id, "text": "run echo"})],
+        )
+        .await
+        .unwrap();
+    support::settle("turn/end", || !world.log.of("turn/end").is_empty()).await;
+    assert_eq!(world.bus.seen("worker", "bash"), 0);
+    let result = world.log.of("tool/result").pop().unwrap();
+    assert_eq!(result["denied"], json!(true));
+    assert!(result["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("needs a human"));
+    assert_eq!(gate.asked.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

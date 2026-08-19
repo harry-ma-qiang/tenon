@@ -120,11 +120,64 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         "config.get" => ask(cmds, |reply| Cmd::ConfigGet { env, reply }).await,
         "config.patch" => {
             let patch = body.get("patch").cloned().unwrap_or_else(|| json!({}));
-            ask(cmds, |reply| Cmd::ConfigPatch { env, patch, reply }).await
+            let target = string(body, "target", "env");
+            ask(cmds, |reply| Cmd::ConfigPatch {
+                env,
+                target,
+                patch,
+                approved: false,
+                reply,
+            })
+            .await
         }
         "approval.request" => {
             let reason = string(body, "reason", "unspecified");
-            ask(cmds, |reply| Cmd::Approval { env, reason, reply }).await
+            let kind = string(body, "kind", "agent");
+            ask(cmds, |reply| Cmd::Approval {
+                env,
+                reason,
+                kind,
+                reply,
+            })
+            .await
+        }
+        "approval.list" => {
+            let status = body
+                .get("status")
+                .and_then(Value::as_str)
+                .filter(|status| *status != "all")
+                .map(str::to_string);
+            let limit = body.get("limit").and_then(Value::as_i64).unwrap_or(200);
+            ask(cmds, |reply| Cmd::ApprovalList {
+                status,
+                limit,
+                reply,
+            })
+            .await
+        }
+        "approval.answer" => {
+            // `id` is the frame's own correlation id on every hop, so the
+            // approval's id travels as `approval_id`, the way `plugin_id` does.
+            let id = body.get("approval_id").and_then(Value::as_i64).unwrap_or(0);
+            let decision = string(body, "decision", "approve");
+            let note = body.get("note").and_then(Value::as_str).map(str::to_string);
+            ask(cmds, |reply| Cmd::ApprovalAnswer {
+                id,
+                decision,
+                note,
+                reply,
+            })
+            .await
+        }
+        "kill" | "resume" => {
+            let on = method == "kill";
+            let reason = string(body, "reason", "requested over the front door");
+            ask(cmds, |reply| Cmd::Kill {
+                on,
+                reason,
+                reply: Some(reply),
+            })
+            .await
         }
         "reset" => ask(cmds, |reply| Cmd::Reset { env, reply }).await,
         "runtime.spawn" => {
@@ -138,12 +191,23 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
                 peer: id,
                 parent,
                 overrides,
+                approved: false,
                 reply,
             })
             .await
         }
         "runtime.stop" => ask(cmds, |reply| Cmd::RuntimeStop { env, reply }).await,
         "snap.list" => ask(cmds, |reply| Cmd::SnapList { env, reply }).await,
+        "snap.export" => {
+            let path = string(body, "path", "");
+            ask(cmds, |reply| Cmd::SnapExport {
+                env,
+                path,
+                approved: false,
+                reply,
+            })
+            .await
+        }
         "snap.pull" => {
             ask(cmds, |reply| Cmd::SnapPull {
                 env,
@@ -192,6 +256,10 @@ async fn plugin(body: &Value, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {
 /// The CLI drives the env's harness through base: one `svc` frame to that
 /// env's node, addressed to the harness's `loop` service.
 async fn session(method: &str, body: &Value, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {
+    if matches!(method, "session.prompt" | "session.create") {
+        let env = env.to_string();
+        ask(cmds, |reply| Cmd::Guard { env, reply }).await?;
+    }
     let node = peer_of(env, cmds).await?;
     let mut args = body.clone();
     if let Some(object) = args.as_object_mut() {
@@ -262,6 +330,7 @@ async fn status(cmds: &Cmds, opts: &Opts) -> Answer {
     Ok(json!({
         "home": snapshot.home,
         "release": snapshot.release,
+        "killed": snapshot.killed,
         "pid": snapshot.pid,
         "exit_on_detach": snapshot.exit_on_detach,
         "attached": snapshot.attached,
@@ -289,6 +358,7 @@ async fn node_json(node: &NodeView, opts: &Opts) -> Value {
         "children": node.children,
         "worker": node.worker,
         "harness": node.harness,
+        "budget": node.budget,
         "tree": tree,
     })
 }

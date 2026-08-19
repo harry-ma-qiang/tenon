@@ -108,6 +108,18 @@ defmodule Tenon.Beam.Link.Server do
     state
   end
 
+  # Base's one-way word to the guardian: an approval is waiting, a budget is
+  # gone, the kill switch moved. The queue and the counters live in base; the
+  # node only logs and passes the message on to whoever asked to be told.
+  defp incoming(%{"t" => "notify", "id" => id} = frame, state) do
+    kind = Map.get(frame, "kind", "notify")
+    data = Map.get(frame, "data", %{})
+    Logger.info("tenon link: #{kind} #{inspect(data)}")
+    if is_pid(state.notify), do: send(state.notify, {:tenon_notify, kind, data})
+    send_frame(state, %{"t" => "rep", "id" => id, "result" => %{"ok" => true}})
+    state
+  end
+
   defp incoming(%{"t" => "svc", "id" => id} = frame, state) do
     # Off the server process: a service call may be a whole model turn or a
     # minute of `bash`, and a health probe must not queue behind it.

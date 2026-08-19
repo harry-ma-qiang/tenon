@@ -1,11 +1,57 @@
 use crate::base::Base;
 use crate::envfiber;
 use crate::node::GUARDIAN;
+use crate::rpc::Cmd;
 use crate::state::{Node, WorkerState};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 impl Base {
+    /// The soft limit of RFC section 5: below it a runtime spawns itself,
+    /// above it the host asks a human first. The reply is held until the
+    /// verdict and the spawn resumes as the same command, already approved.
+    pub fn on_spawn(
+        &mut self,
+        peer: u64,
+        parent: Option<String>,
+        overrides: Value,
+        approved: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    ) {
+        let total = self
+            .nodes
+            .values()
+            .filter(|node| node.role != GUARDIAN)
+            .count();
+        let soft = self.config.approval.spawn_soft_limit;
+        if approved || soft == 0 || total < soft {
+            let outcome = self.spawn_child(peer, parent, &overrides);
+            let _ = reply.send(outcome);
+            return;
+        }
+        let env = parent
+            .clone()
+            .or_else(|| self.env_of_peer(peer))
+            .unwrap_or_else(|| self.config.root_env.clone());
+        let reason = format!(
+            "runtime.spawn from {env}: {total} environments is past the soft limit of {soft}"
+        );
+        self.gate(
+            &env.clone(),
+            "runtime.spawn",
+            &reason,
+            reply,
+            move |reply| Cmd::Spawn {
+                peer,
+                parent,
+                overrides,
+                approved: true,
+                reply,
+            },
+        );
+    }
+
     /// The barebone is the only thing that creates a runtime. An env asks its
     /// parent (through `Link`), the request lands here, and base builds the
     /// child on the host: its own sandbox instance, node, state file and
@@ -160,6 +206,7 @@ impl Base {
                 fiber: None,
                 ticker: None,
                 restore: Vec::new(),
+                budget: crate::budget::Budget::default(),
             },
         );
     }

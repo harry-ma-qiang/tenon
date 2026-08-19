@@ -216,10 +216,10 @@ fn memory_nodes_edges_and_embeddings_round_trip() {
 fn approvals_move_from_pending_to_a_verdict() {
     let (_dir, store) = store();
     let pending = store
-        .put_approval("root", "touch the host", approvals::PENDING)
+        .put_approval("root", "touch the host", "tool", approvals::PENDING)
         .unwrap();
     let denied = store
-        .put_approval("root", "rm -rf /", approvals::DENIED)
+        .put_approval("root", "rm -rf /", "tool", approvals::DENIED)
         .unwrap();
     assert_eq!(
         store.approval(pending).unwrap().unwrap().status,
@@ -241,14 +241,18 @@ fn approvals_move_from_pending_to_a_verdict() {
         store.approvals(Some(approvals::PENDING), 10).unwrap().len(),
         1
     );
-    assert!(store.decide_approval(pending, approvals::APPROVED).unwrap());
-    assert!(!store.decide_approval(pending, approvals::DENIED).unwrap());
+    assert!(store
+        .decide_approval(pending, approvals::APPROVED, Some("ok"))
+        .unwrap());
+    assert!(!store
+        .decide_approval(pending, approvals::DENIED, None)
+        .unwrap());
     assert_eq!(
         store.approval(pending).unwrap().unwrap().status,
         approvals::APPROVED
     );
     let stale = store
-        .put_approval("root", "waited too long", approvals::PENDING)
+        .put_approval("root", "waited too long", "tool", approvals::PENDING)
         .unwrap();
     assert_eq!(store.expire_approvals(0).unwrap(), 1);
     assert_eq!(
@@ -256,6 +260,9 @@ fn approvals_move_from_pending_to_a_verdict() {
         approvals::EXPIRED
     );
     assert_eq!(store.approvals(None, 10).unwrap().len(), 3);
+    let decided = store.approval(pending).unwrap().unwrap();
+    assert_eq!(decided.note.as_deref(), Some("ok"));
+    assert_eq!(decided.kind, "tool");
 }
 
 #[test]

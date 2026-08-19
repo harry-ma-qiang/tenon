@@ -7,8 +7,6 @@ use std::time::Duration;
 use tenon_storage::{Retention, Store};
 use tokio::sync::oneshot;
 
-pub const APPROVAL_OFF: &str = "approvals not enabled";
-
 /// The tail an `episodes.tail`/`tool_results.tail` without an `n` answers with,
 /// and the ceiling any of them is clamped to.
 const TAIL: i64 = 200;
@@ -31,6 +29,7 @@ impl Base {
         let event = store
             .append(kind, Some(env), data)
             .map_err(|error| error.to_string())?;
+        let (kind, data) = (kind.to_string(), data.clone());
         let frame = json!({
             "t": "event",
             "id": event.id,
@@ -45,7 +44,26 @@ impl Base {
                 peer.send(frame.clone());
             }
         }
-        Ok(json!({"id": event.id, "at": event.at}))
+        let answer = json!({"id": event.id, "at": event.at});
+        self.account(env, &kind, &data);
+        Ok(answer)
+    }
+
+    /// An env-scoped fact belongs in that env's own log, which is what
+    /// `events.tail{env}`, `tenon run` and the UI's event tail read. Before
+    /// the env has a state file it falls back to the barebone's log.
+    pub fn emit_env(&mut self, env: &str, kind: &str, data: Value) {
+        let has_store = self
+            .nodes
+            .get(env)
+            .map(|node| node.store.is_some())
+            .unwrap_or(false);
+        match has_store {
+            true => {
+                let _ = self.events_append(env, kind, &data);
+            }
+            false => self.emit(kind, Some(env), data),
+        }
     }
 
     pub fn events_tail(&self, env: &str, after: i64, limit: i64) -> Answer {
@@ -89,9 +107,38 @@ impl Base {
     /// L3 change protocol: snapshot the overlay, merge the patch, ask the
     /// env's node to reload its profile. The running harness keeps the
     /// settings it started with; the next one reads the new file.
-    pub fn config_patch(&mut self, env: &str, patch: &Value, reply: oneshot::Sender<Answer>) {
+    /// `target: "base"` patches the barebone's own `config.yml` instead, which
+    /// is L0 and always behind a human gate.
+    pub fn config_patch(
+        &mut self,
+        env: &str,
+        target: &str,
+        patch: &Value,
+        approved: bool,
+        reply: oneshot::Sender<Answer>,
+    ) {
         if !patch.is_object() {
             let _ = reply.send(Err("config.patch needs a patch object".to_string()));
+            return;
+        }
+        let base_config = target == "base";
+        if !approved && (base_config || self.config.approval.gate_config_patch) {
+            let reason = format!("config.patch of the {target} config from {env}: {patch}");
+            let (env, target, patch) = (env.to_string(), target.to_string(), patch.clone());
+            let name = env.clone();
+            self.gate(&name, "config.patch", &reason, reply, move |reply| {
+                Cmd::ConfigPatch {
+                    env,
+                    target,
+                    patch,
+                    approved: true,
+                    reply,
+                }
+            });
+            return;
+        }
+        if base_config {
+            let _ = reply.send(self.patch_base_config(patch));
             return;
         }
         let outcome = self.home.patch_harness(env, patch);
@@ -128,45 +175,32 @@ impl Base {
         });
     }
 
-    /// P3.5 owns the queue; until then this is the honest stub: `auto` in the
-    /// env's overlay approves everything, anything else denies with a reason
-    /// the model can read and work around.
-    pub fn approval_request(&mut self, env: &str, reason: &str) -> Answer {
-        let mode = self
-            .home
-            .harness_config(env)
-            .ok()
-            .and_then(|config| {
-                config
-                    .get("approval")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "deny".to_string());
-        let approved = mode == "auto";
-        let status = match approved {
-            true => tenon_storage::approvals::APPROVED,
-            false => tenon_storage::approvals::DENIED,
-        };
-        // The row outlives the event: P3.5's queue reads this table, and a
-        // verdict answered inline is still part of the history.
-        let id = self
-            .store_of(env)
-            .ok()
-            .and_then(|store| store.put_approval(env, reason, status).ok());
+    /// L0 in RFC section 10's table: the barebone's own config, snapshotted
+    /// before every change and read at the next `tenon start`. Base never
+    /// reloads it into a running process.
+    fn patch_base_config(&mut self, patch: &Value) -> Answer {
+        let path = self.home.config_file();
+        let dir = self.home.config_snapshots("base");
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let stamp = tenon_storage::now();
+        let snapshot = dir.join(format!("config-{stamp}.yml"));
+        std::fs::copy(&path, &snapshot).map_err(|error| error.to_string())?;
+        let body = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let mut config: Value = serde_yaml::from_str(&body).map_err(|error| error.to_string())?;
+        crate::home::merge(&mut config, patch);
+        let body = serde_yaml::to_string(&config).map_err(|error| error.to_string())?;
+        std::fs::write(&path, body).map_err(|error| error.to_string())?;
         self.emit(
-            "approval.request",
-            Some(env),
-            json!({"id": id, "reason": reason, "approved": approved, "mode": mode}),
+            "config.patch",
+            None,
+            json!({"target": "base", "snapshot": snapshot}),
         );
         Ok(json!({
-            "id": id,
-            "status": status,
-            "auto": approved,
-            "reason": match approved {
-                true => reason.to_string(),
-                false => APPROVAL_OFF.to_string(),
-            },
+            "ok": true,
+            "target": "base",
+            "snapshot": snapshot,
+            "config": config,
+            "applies": "next start",
         }))
     }
 
@@ -376,10 +410,19 @@ impl Base {
             Cmd::ConfigGet { env, reply } => {
                 let _ = reply.send(self.config_get(&env));
             }
-            Cmd::ConfigPatch { env, patch, reply } => self.config_patch(&env, &patch, reply),
-            Cmd::Approval { env, reason, reply } => {
-                let _ = reply.send(self.approval_request(&env, &reason));
-            }
+            Cmd::ConfigPatch {
+                env,
+                target,
+                patch,
+                approved,
+                reply,
+            } => self.config_patch(&env, &target, &patch, approved, reply),
+            Cmd::Approval {
+                env,
+                reason,
+                kind,
+                reply,
+            } => self.approval_request(&env, &reason, &kind, reply),
             Cmd::HarnessBoot { env } => self.harness_boot(&env),
             Cmd::HarnessReady { env, pid, error } => self.harness_ready(&env, pid, error),
             Cmd::HarnessExit {

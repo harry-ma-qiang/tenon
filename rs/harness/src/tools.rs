@@ -1,6 +1,6 @@
-use crate::bus::{Answer, Bus};
+use crate::bus::{Answer, Bus, Gate};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 pub const MANAGE: &str = "manage";
@@ -54,6 +54,8 @@ pub struct Tools {
     bus: Arc<dyn Bus>,
     rows: Mutex<BTreeMap<String, Row>>,
     seq: Mutex<u64>,
+    gated: Mutex<BTreeSet<String>>,
+    gate: Mutex<Option<Arc<dyn Gate>>>,
 }
 
 impl Tools {
@@ -62,7 +64,27 @@ impl Tools {
             bus,
             rows: Mutex::new(BTreeMap::new()),
             seq: Mutex::new(0),
+            gated: Mutex::new(BTreeSet::new()),
+            gate: Mutex::new(None),
         }
+    }
+
+    /// The profile's `gated_tools` and the gate that answers for them. An
+    /// empty list is the default and costs nothing per call.
+    pub fn set_gate(&self, gate: Arc<dyn Gate>, names: &[String]) {
+        *self.gate.lock().expect("tools lock") = Some(gate);
+        let mut gated = self.gated.lock().expect("tools lock");
+        gated.clear();
+        for name in names {
+            gated.insert(name.clone());
+        }
+    }
+
+    fn gate_for(&self, name: &str) -> Option<Arc<dyn Gate>> {
+        if !self.gated.lock().expect("tools lock").contains(name) {
+            return None;
+        }
+        self.gate.lock().expect("tools lock").clone()
     }
 
     pub fn register(&self, row: Row) -> Value {
@@ -140,6 +162,15 @@ impl Tools {
                 value: json!(format!("unknown tool {name}")),
             };
         };
+        if let Some(gate) = self.gate_for(name) {
+            if let Err(reason) = gate.check(name, &args).await {
+                return Outcome {
+                    ok: false,
+                    denied: true,
+                    value: json!(reason),
+                };
+            }
+        }
         let request = json!({"name": name, "arguments": args, "callId": call_id});
         let request = match self
             .bus

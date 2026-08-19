@@ -35,6 +35,49 @@ pub struct Retention {
     pub blob_grace_ms: i64,
 }
 
+/// Hard rules v1, approval half (RFC section 5): `mode` decides how a gate is
+/// resolved (`ask` queues a row for a human, `auto` waves it through, `deny`
+/// refuses at once), `timeout_s` is how long a pending row waits before it
+/// expires. The gates themselves are host-affecting actions only.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Approvals {
+    #[serde(default = "approval_mode")]
+    pub mode: String,
+    #[serde(default = "approval_timeout_s")]
+    pub timeout_s: u64,
+    #[serde(default = "spawn_soft_limit")]
+    pub spawn_soft_limit: usize,
+    #[serde(default)]
+    pub gate_config_patch: bool,
+    #[serde(default = "enabled")]
+    pub gate_snap_export: bool,
+    #[serde(default)]
+    pub gated_tools: Vec<String>,
+}
+
+/// Hard rules v1, budget half: every limit is off at `0`, and every one of
+/// them is a hard stop rather than a warning.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct Budgets {
+    #[serde(default)]
+    pub tokens: i64,
+    #[serde(default)]
+    pub usd: f64,
+    #[serde(default)]
+    pub wall_s: u64,
+    #[serde(default)]
+    pub processes: i64,
+}
+
+/// The price table the usd budget needs, in dollars per 1000 tokens.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct Prices {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Envs {
     #[serde(default = "max_total")]
@@ -67,6 +110,16 @@ pub struct Config {
     pub envs: Envs,
     #[serde(default)]
     pub retention: Retention,
+    #[serde(default)]
+    pub approval: Approvals,
+    #[serde(default)]
+    pub budgets: Budgets,
+    #[serde(default)]
+    pub usd_per_1k: Prices,
+    #[serde(default = "enabled")]
+    pub budget_reset_on_reset: bool,
+    #[serde(default = "budget_tick_ms")]
+    pub budget_tick_ms: u64,
 }
 
 fn root_env() -> String {
@@ -133,6 +186,26 @@ fn child_ram_mb() -> u64 {
     512
 }
 
+fn approval_mode() -> String {
+    "ask".to_string()
+}
+
+fn approval_timeout_s() -> u64 {
+    60
+}
+
+fn spawn_soft_limit() -> usize {
+    2
+}
+
+fn enabled() -> bool {
+    true
+}
+
+fn budget_tick_ms() -> u64 {
+    5_000
+}
+
 fn interval_ms() -> u64 {
     2_000
 }
@@ -171,6 +244,19 @@ impl Default for Retention {
     }
 }
 
+impl Default for Approvals {
+    fn default() -> Self {
+        Self {
+            mode: approval_mode(),
+            timeout_s: approval_timeout_s(),
+            spawn_soft_limit: spawn_soft_limit(),
+            gate_config_patch: false,
+            gate_snap_export: enabled(),
+            gated_tools: Vec::new(),
+        }
+    }
+}
+
 impl Default for Envs {
     fn default() -> Self {
         Self {
@@ -194,6 +280,11 @@ impl Default for Config {
             worker: Worker::default(),
             envs: Envs::default(),
             retention: Retention::default(),
+            approval: Approvals::default(),
+            budgets: Budgets::default(),
+            usd_per_1k: Prices::default(),
+            budget_reset_on_reset: enabled(),
+            budget_tick_ms: budget_tick_ms(),
         }
     }
 }

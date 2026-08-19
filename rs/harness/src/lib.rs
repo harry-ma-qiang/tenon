@@ -10,7 +10,7 @@ pub mod tools;
 pub mod wire;
 
 use crate::agent::Agent;
-use crate::api::{Api, BaseLog};
+use crate::api::{Api, ApiGate, BaseLog};
 use crate::bus::{Bus, Log};
 use crate::config::Settings;
 use crate::manage::Manage;
@@ -75,6 +75,7 @@ async fn serve(env: String) -> Result<()> {
     let log: Arc<dyn Log> = Arc::new(BaseLog::new(api.clone()));
     let llm = Arc::new(llm::Client::new(settings.llm.clone()));
     let tools = Arc::new(Tools::new(bus.clone()));
+    tools.set_gate(Arc::new(ApiGate::new(api.clone())), &settings.gated_tools);
     let prompt = Arc::new(Prompt::new());
     let manage = Arc::new(Manage::new(api.clone(), bus.clone()));
     let agent = Arc::new(Agent::new(
