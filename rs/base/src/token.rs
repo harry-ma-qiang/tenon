@@ -7,7 +7,7 @@ pub fn generate() -> String {
     if read_urandom.is_err() {
         fallback(&mut bytes);
     }
-    hex(&bytes)
+    crate::hash::hex(bytes)
 }
 
 fn fallback(bytes: &mut [u8; 32]) {
@@ -19,14 +19,6 @@ fn fallback(bytes: &mut [u8; 32]) {
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = ((seed >> ((index % 16) * 8)) & 0xff) as u8;
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }
 
 #[cfg(test)]

@@ -8,7 +8,6 @@ pub use tenon_sdk::{Error, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-pub const ROLE: &str = "worker";
 pub const TAIL_BYTES: usize = 32 * 1024;
 pub const OUT_DIR: &str = ".tenon-out";
 pub const SNAP_DIR: &str = ".tenon-snap";

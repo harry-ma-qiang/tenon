@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const DEMO_ID: &str = "demo";
@@ -203,11 +202,7 @@ impl Home {
     /// that ties every sandbox instance this home ever spawns back to it, so a
     /// reap pass never touches a container that belongs to a different home.
     pub fn hash(&self) -> String {
-        let sum = Sha256::digest(self.root.display().to_string().as_bytes());
-        sum.iter()
-            .take(6)
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        crate::hash::short(self.root.display().to_string(), 6)
     }
 
     pub fn scaffold(&self) -> Result<()> {

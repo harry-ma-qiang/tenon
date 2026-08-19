@@ -22,7 +22,6 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const ROLE: &str = "harness";
 pub const CONFIG_ENV: &str = "TENON_HARNESS_CONFIG";
 
 pub fn run(args: &[String]) -> i32 {

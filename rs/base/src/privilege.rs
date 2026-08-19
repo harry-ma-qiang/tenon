@@ -229,8 +229,10 @@ impl crate::base::Base {
 mod tests {
     use super::*;
 
-    fn passwd() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("tenon-passwd-{}", std::process::id()));
+    /// One file per test, not one per process: `fs::write` truncates, so two
+    /// tests sharing a path race a read against a truncate.
+    fn passwd(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("tenon-passwd-{}-{tag}", std::process::id()));
         std::fs::write(
             &path,
             "root:x:0:0:root:/root:/bin/sh\ntenon:x:1200:1300:Tenon:/home/tenon:/bin/sh\n",
@@ -241,7 +243,7 @@ mod tests {
 
     #[test]
     fn none_and_an_unknown_user_never_drop() {
-        let passwd = passwd();
+        let passwd = passwd("unknown");
         assert_eq!(plan("none", &passwd, None), Plan::Off);
         assert_eq!(plan("", &passwd, None), Plan::Off);
         assert_eq!(
@@ -253,11 +255,12 @@ mod tests {
             .line()
             .expect("a line")
             .contains("does not exist"));
+        let _ = std::fs::remove_file(&passwd);
     }
 
     #[test]
     fn a_known_user_drops_only_when_base_is_permitted() {
-        let passwd = passwd();
+        let passwd = passwd("known");
         let dropped = plan("tenon", &passwd, None);
         assert_eq!(dropped.active(), Some((1200, 1300)));
         assert_eq!(dropped.view()["dropping"], true);

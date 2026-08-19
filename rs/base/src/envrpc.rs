@@ -4,7 +4,6 @@ use crate::rpc::Cmd;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tenon_storage::{Retention, Store};
 use tokio::sync::oneshot;
@@ -497,9 +496,5 @@ fn value<T: serde::Serialize>(row: &T) -> Option<Value> {
 /// The state a step started from, in 16 hex chars: the workspace at that
 /// moment (the newest snapshot ref) plus the message being answered.
 fn state_hash(reference: &str, user_event: i64) -> String {
-    let sum = Sha256::digest(format!("{reference}:{user_event}").as_bytes());
-    sum.iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hash::short(format!("{reference}:{user_event}"), 8)
 }

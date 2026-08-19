@@ -1,7 +1,6 @@
 use crate::home::Home;
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub fn resolve(
@@ -66,9 +65,5 @@ fn release_root(staging: &Path) -> Result<PathBuf> {
 }
 
 fn digest(payload: &[u8]) -> String {
-    let sum = Sha256::digest(payload);
-    sum.iter()
-        .take(6)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hash::short(payload, 6)
 }

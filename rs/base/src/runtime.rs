@@ -2,7 +2,6 @@ use crate::base::Base;
 use crate::peer::Peer;
 use crate::rpc::Cmd;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
@@ -178,8 +177,7 @@ pub fn self_hash() -> String {
         let Ok(bytes) = std::fs::read(&exe) else {
             return "unknown".to_string();
         };
-        let sum = Sha256::digest(&bytes);
-        sum.iter().map(|byte| format!("{byte:02x}")).collect()
+        crate::hash::sha256(&bytes)
     })
     .clone()
 }

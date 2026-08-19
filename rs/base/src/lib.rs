@@ -13,6 +13,7 @@ pub mod envfiber;
 pub mod envrpc;
 pub mod frame;
 pub mod harness;
+pub mod hash;
 pub mod home;
 #[cfg(feature = "http")]
 pub mod http;
