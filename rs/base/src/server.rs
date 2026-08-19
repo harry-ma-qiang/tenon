@@ -1,3 +1,5 @@
+use crate::bus::Facades;
+use crate::facaderpc::{self, Conn};
 use crate::frame;
 use crate::params::{array, i64_or, object, opt_text, str_of, strings, text_or, u64_or, value};
 use crate::peer::Peer;
@@ -5,7 +7,7 @@ use crate::rpc::{Cmd, NodeView};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 type Answer = Result<Value, String>;
 type Cmds = mpsc::UnboundedSender<Cmd>;
@@ -15,10 +17,11 @@ type Cmds = mpsc::UnboundedSender<Cmd>;
 /// for a mount that is merely slow.
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Opts {
     pub root_env: String,
     pub timeout: Duration,
+    pub facades: Option<Facades>,
 }
 
 pub async fn serve(listener: UnixListener, cmds: Cmds, opts: Opts) {
@@ -34,6 +37,8 @@ async fn connection(stream: UnixStream, id: u64, cmds: Cmds, opts: Opts) {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let peer = Peer::new(id, tx);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let conn = Conn::new(peer.clone(), opts.root_env.clone(), cancel_rx);
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if frame::write(&mut writer, &frame).await.is_err() {
@@ -46,19 +51,21 @@ async fn connection(stream: UnixStream, id: u64, cmds: Cmds, opts: Opts) {
             peer.resolve(&body);
             continue;
         }
-        let (peer, cmds, opts) = (peer.clone(), cmds.clone(), opts.clone());
+        let (conn, cmds, opts) = (conn.clone(), cmds.clone(), opts.clone());
         tokio::spawn(async move {
-            let outcome = dispatch(&body, &peer, &cmds, &opts).await;
+            let outcome = dispatch(&body, &conn, &cmds, &opts).await;
             if let Some(id) = frame::id(&body) {
-                peer.send(frame::rep_id(id, outcome));
+                conn.peer.send(frame::rep_id(id, outcome));
             }
         });
     }
+    let _ = cancel_tx.send(true);
     peer.fail_all("disconnected");
     let _ = cmds.send(Cmd::Gone { peer: id });
 }
 
-async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer {
+async fn dispatch(body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer {
+    let peer = &conn.peer;
     let method = frame::method(body).unwrap_or_default();
     let env = text_or(body, "env", &opts.root_env);
     match method {
@@ -233,6 +240,30 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         "stop" => ask(cmds, |reply| Cmd::Stop { reply }).await,
         "status" => status(cmds, opts).await,
         "subscribe" => subscribe(peer, body, cmds).await,
+        "auth.scope" => facaderpc::scope(conn, body, cmds).await,
+        method if is_facade(method) => facade(method, body, conn, opts).await,
+        other => Err(format!("unknown_method:{other}")),
+    }
+}
+
+fn is_facade(method: &str) -> bool {
+    ["bus.", "kv.", "blob.", "timer."]
+        .iter()
+        .any(|prefix| method.starts_with(prefix))
+}
+
+/// Routes the four facade families to their handlers, which need the shared
+/// hub/kv/blob/timer and the per-connection scope, not the actor.
+async fn facade(method: &str, body: &Value, conn: &Conn, opts: &Opts) -> Answer {
+    let Some(facades) = opts.facades.as_ref() else {
+        return Err("facades_unavailable".to_string());
+    };
+    match method {
+        "bus.publish" => facaderpc::bus_publish(conn, facades, body).await,
+        "bus.subscribe" => facaderpc::bus_subscribe(conn, facades, body),
+        method if method.starts_with("kv.") => facaderpc::kv(conn, facades, method, body),
+        method if method.starts_with("blob.") => facaderpc::blob(conn, facades, method, body),
+        method if method.starts_with("timer.") => facaderpc::timer(conn, facades, method, body),
         other => Err(format!("unknown_method:{other}")),
     }
 }

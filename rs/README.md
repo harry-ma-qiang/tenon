@@ -18,8 +18,9 @@ tenon start                      the base process
 
 | Crate | What |
 |---|---|
-| `base` | home layout, config, UDS RPC server, the node supervisor actor, LKG, release payload |
-| `storage` | the state files: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, versioned schema, `events`, `envs`, `packs`, `snapshots`, `tool_results`, `blobs`, `episodes`, `memory_*`, `embeddings`, `approvals`, retention |
+| `base` | home layout, config, UDS RPC server, the node supervisor actor, LKG, release payload, and the P4.0 facades (bus/kv/blob/timer) |
+| `bus` | the P4 message fabric: the `Envelope`, the `Hub` (lock-free publish, per-subscriber rings, durable writer, replay), and the `tracing` layer. See `rs/bus/README.md` |
+| `storage` | the state files: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, versioned schema, `events`, `envs`, `packs`, `snapshots`, `tool_results`, `blobs`, `episodes`, `memory_*`, `embeddings`, `approvals`, `envelopes`, `kv`, retention |
 | `sandbox` | the `Sandbox` trait plus the `none`, `oci` (podman/docker), `landlock` and `krun` (libkrun microVM) backends |
 | `harness` | the `tenon harness` role (P3.3): the agent loop, the llm adapter, the session log, the tools bus and the management tools, one host process per env |
 | `worker` | the `tenon worker` role (P3.2): one resident process inside the sandbox serving `bash`, `pty.*`, `fs.*` and `snap.*` over the wire |
@@ -1191,6 +1192,13 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `stop` | CLI | graceful shutdown of everything, base included |
 | `status` | CLI | the snapshot plus one `tree` request per registered node |
 | `subscribe{env}` | CLI | this connection starts receiving `{"t":"event",...}` frames; `env` keeps only that env's events plus the base-wide ones |
+| `bus.publish{envelope}` | any | publish one envelope; a durable one answers `{offset}` after its group-commit batch is persisted, a non-durable one after memory fan-out |
+| `bus.subscribe{topics?,levels?,env?,session?,since_offset?,coalesce_ms?,latest_only?}` | any | stream matching envelopes to this connection as `{"t":"ev",...}` frames; `since_offset` replays the durable log first (reconnect) |
+| `kv.get/set/del/cas/incr/expire/lease/keep_alive/range{...}` | any | the etcd-lite facade, env-scoped; `set{durable?,ttl_ms?,lease_id?}`, a global monotonic `rev`/`revision` |
+| `kv.watch{prefix,since_rev?}` | any | a since_rev snapshot then a live `kv/<key>` subscription over the bus |
+| `blob.put{data}` / `blob.get/open/stat{hash}` | any | content-addressed blobs over the existing `blobs` table; `open{offset,len}` is the paged window |
+| `timer.set{topic,after_ms\|every_ms,payload?,timer_id?,ttl_s?}` / `timer.list` / `timer.del{timer_id}` | any | a timer stored in durable kv under `/timers/`; the wheel fires it as an envelope and it survives a restart. The timer's id travels as `timer_id` because `id` is the frame's own correlation key |
+| `auth.scope{env,token}` | plugin | bind this connection to `env` after checking `run/rt-<env>.token`; every later facade call is then pinned to that env (RFC 8d.2) |
 
 Requests to a node are answered outside the supervisor actor, so a `health` probe never
 queues behind a `reset`. `reset` and `stop` do run inside it, for at most `stop_grace_ms`.
@@ -1205,6 +1213,44 @@ through `session.resume`.
 `status`'s per-node `sandbox` field is now an object rather than a bare id string:
 `{"backend":"oci","id":"tenon-6af3f8eda318-root-171...","attach":"unix:/home/x/.tenon/run/gateway-root.sock"}`,
 or `null` for the guardian.
+
+## The plumbing: bus, kv, blob, timer (P4.0)
+
+RFC P4 gives every component one message fabric and one state facade, with SQLite demoted to
+an implementation detail behind them. P4.0 lands the facades and the timer; the legacy record
+RPCs above stay until P4.1 migrates their producers.
+
+- **`rs/bus`** (its own crate, see `rs/bus/README.md`): the `Envelope` of RFC section 2 and the
+  `Hub` — lock-free publish over an `ArcSwap` subscriber snapshot, per-subscriber rings
+  (drop-oldest for non-durable, never-drop for durable), `latest_only` compaction, `coalesce_ms`
+  batching, a single durable writer with a 5 ms group commit, `since_offset` replay, and a
+  `tracing` layer so `info!(topic = ..., env = ...)` becomes an envelope. The hub is built with a
+  `Durable` backed by the barebone `state.sqlite` (`envelopes` table); non-durable envelopes never
+  touch disk. Measured: 344k msg/s fan-out, p99 publish→subscriber latency ~1 µs (RFC budget: 100k
+  msg/s, p99 < 1 ms).
+- **kv** (`base/src/kv.rs` + storage `kv` table): `get/set{durable?,ttl?}/del/cas/incr/expire/
+  lease/keep_alive/range/watch`, a global monotonic revision, ephemeral keys in memory and durable
+  keys in SQLite. Leases expire on a 1 s tick and delete every key bound to them, firing watch
+  events. ControlLease (RFC) is just a documented convention over a `/ctl/<env>` key — no special
+  code.
+- **blob** (`base/src/blob.rs`): thin `put/get/open/stat` over the existing `blobs` table,
+  content-addressed and deduplicated. The sha256 hash is the read capability; per-env spill files
+  are deferred (RFC section 6), so blob scoping is capability-by-hash rather than a per-env
+  partition.
+- **timer** (`base/src/timer.rs`): `timer.set` stores a timer in durable kv under `/timers/`; one
+  wheel in base fires it as an envelope and reloads its timers on boot, so a timer survives a
+  restart. `after_ms` (one-shot) and `every_ms` (repeating) only — cron is deferred (documented).
+
+**Env-scoping (RFC 8d.2).** `bus.subscribe`, `bus.publish`, every `kv.*`, `blob.*` and `timer.*`
+call is a capability bounded to the caller's env: a connection that has bound itself with
+`auth.scope{env, token}` (the env's runtime token) can never name another env — cross-env requests
+are refused `cross_env_denied`. base/barebone/CLI callers are unscoped and may target any env. This
+extends P3's "children cannot touch parents" from the record RPCs to the facades.
+
+**The session bridge (temporary, P4.0 only).** So `bus.subscribe` sees real traffic before its
+producers are migrated, every `events.append` ALSO publishes a durable, model-visible
+`session/<kind>` envelope on the bus (`facaderpc::bridge_session`, called from one place in
+`events_append`). P4.1 removes this duplication when the harness emits through the fabric directly.
 
 ## What base does when something dies
 

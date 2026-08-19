@@ -257,6 +257,13 @@ pub enum Cmd {
     Ready {
         reply: oneshot::Sender<bool>,
     },
+    /// `auth.scope`: does this env's runtime token match, so the connection may
+    /// bind itself to that env (RFC 8d.2 env-scoping)?
+    ScopeCheck {
+        env: String,
+        token: String,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 pub struct NodeView {

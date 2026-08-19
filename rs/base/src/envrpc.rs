@@ -47,6 +47,12 @@ impl Base {
         }
         let answer = json!({"id": event.id, "at": event.at});
         self.account(env, &kind, &data);
+        // P4.0 session bridge (deleted in P4.1): every appended event is also a
+        // durable `session/<kind>` envelope on the bus, so nothing regresses
+        // while producers still write the old log path.
+        if let Some(hub) = &self.hub {
+            crate::facaderpc::bridge_session(hub, env, &kind, &data);
+        }
         Ok(answer)
     }
 

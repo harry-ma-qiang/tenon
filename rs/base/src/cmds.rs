@@ -169,6 +169,14 @@ impl Base {
             Cmd::Ready { reply } => {
                 let _ = reply.send(self.ready());
             }
+            Cmd::ScopeCheck { env, token, reply } => {
+                let ok = self
+                    .nodes
+                    .get(&env)
+                    .map(|node| !token.is_empty() && node.runtime_token == token)
+                    .unwrap_or(false);
+                let _ = reply.send(ok);
+            }
         }
     }
 }

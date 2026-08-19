@@ -43,6 +43,10 @@ pub struct Base {
     /// The node a blue/green switch has replaced, held between the swap and
     /// the drain so the old process is stopped after the front door moved.
     pub draining: BTreeMap<String, Drained>,
+    /// The message hub, when the facades are wired. The session bridge (P4.0,
+    /// removed in P4.1) publishes every appended event here as a durable
+    /// `session/<kind>` envelope so `bus.subscribe` sees real traffic.
+    pub hub: Option<std::sync::Arc<tenon_bus::Hub>>,
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -85,6 +89,7 @@ impl Base {
             probes: crate::probes::Approved::default(),
             privilege: crate::privilege::Plan::Off,
             draining: BTreeMap::new(),
+            hub: None,
         }
     }
 
