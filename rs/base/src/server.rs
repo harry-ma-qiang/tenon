@@ -211,6 +211,20 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             .await
         }
         "runtime.stop" => ask(cmds, |reply| Cmd::RuntimeStop { env, reply }).await,
+        "upgrade.propose" => {
+            let params = body.clone();
+            ask(cmds, |reply| Cmd::UpgradePropose { env, params, reply }).await
+        }
+        "upgrade.status" => {
+            let id = body.get("upgrade_id").or_else(|| body.get("id_of"));
+            let id = id.and_then(Value::as_i64).unwrap_or(0);
+            ask(cmds, |reply| Cmd::UpgradeStatus { id, reply }).await
+        }
+        "upgrade.list" => {
+            let env = body.get("env").and_then(Value::as_str).map(str::to_string);
+            let limit = body.get("limit").and_then(Value::as_i64).unwrap_or(50);
+            ask(cmds, |reply| Cmd::UpgradeList { env, limit, reply }).await
+        }
         "snap.list" => ask(cmds, |reply| Cmd::SnapList { env, reply }).await,
         "snap.export" => {
             let path = string(body, "path", "");

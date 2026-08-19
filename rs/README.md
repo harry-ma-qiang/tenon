@@ -128,6 +128,10 @@ once. Measured here: 21 MB tarball, 68 MB binary, 1.2 s from `start` to both nod
 | `run/harness-<env>.log` | stdout and stderr of that env's harness process |
 | `envs/<env>/workspace/` | that env's sandbox workspace, bind-mounted at `/workspace` (oci) or granted read-write at the same path (landlock). `.tenon-snap/` (the snapshot GIT_DIR), `.tenon-out/` (handles and spill files) and `.tenon-restore/` (packs staged for a restore) live inside it |
 | `profiles/<child>/overlay.patch.yml` | a spawned child env's own patch layer; its `TENON_PROFILE` is the parent's layers plus this file |
+| `upgrades/<id>/release/` | a kernel upgrade's staged release: a copy of the running one with the candidate `tenon.beam` in it. The env's node A boots from here after a promotion |
+| `profiles/<env>/kernel.json` | which release that env's node A boots from, when a promoted kernel moved it off base's own |
+| `profiles/<env>/worker.json` | the promoted candidate worker of that env; absent means the built-in worker, the LKG fallback |
+| `run/gw-<env>/gateway-green.sock` | the second socket of a blue/green switch, in the same directory so the sandbox reaches either node |
 | `lkg/` | `config.yml`, `profiles/`, `state.sqlite` copied at every successful boot, plus `manifest.json`: the hashes `tenon rollback` verifies |
 
 ## Double start, boot signals, state integrity, node auth
@@ -187,6 +191,18 @@ retention:
   milestone_every: 10      # plus every Mth step, forever
   keep_events: 0           # 0 = keep the whole session log; N = keep the last N rows
   blob_grace_ms: 60000     # an unreferenced blob younger than this is left alone
+tiers:                     # the human gate per change-protocol tier
+  kernel: auto             # auto | ask
+  plugin: auto
+  worker: auto
+  config: auto
+benchmark:                 # the promotion gate's task set
+  model: fake              # the label the numbers are filed and compared under
+  timeout_s: 120
+  cost_tolerance: 1.5
+  tasks:
+    - prompt: "benchmark: reply with the single word tenon-bench-ok"
+      expect_substring: tenon-bench-ok
 ```
 
 The default profile mounts `plugins/term`'s release binary if it is built, otherwise
@@ -494,6 +510,8 @@ the CLI read the same rows.
 | `blobs` | `sha256, bytes, size, created_at` | the harness (large tool outputs), deduplicated by hash |
 | `episodes` | `id, session_id, step, state_hash, action, verifier_score, cost, created_at` | the harness, one row per step |
 | `approvals` | `id, env, reason, status, created_at, decided_at` | base, on every `approval.request` |
+| `upgrades` | `id, env, target, status, artifact, notes, reason, phases, created_at, updated_at` | base, one row per `upgrade.propose` and one update per phase |
+| `benchmarks` | `id, env, label, upgrade_id, tasks, passed, success_rate, cost, lkg, created_at` | base, one row per benchmark pass; `lkg = 1` is the baseline a candidate is compared against |
 | `memory_nodes` | `id, kind, text, confidence, outcomes, created_at, updated_at` | nobody yet (P5) |
 | `memory_edges` | `src, dst, rel, confidence` | nobody yet (P5) |
 | `embeddings` | `node_id, model, vector, dims` | nobody yet (P5) |
@@ -675,6 +693,7 @@ DSH profile when ours are mounted — a config note in the bridge's profile, not
 | `snapshot{op}` | `worker.snap.commit/list/restore` (list via base) | workspace time travel |
 | `plugin{op, id, spec}` | `manage.plugin.*` | list/mount/unmount/restart the fibers of this node |
 | `config{op, patch}` | `manage.config.*` | read or patch this env's overlay |
+| `upgrade{op, target, artifact, notes, id}` | `manage.upgrade.*` | propose a change through the change protocol, or read what one did |
 | `runtime_spawn{overrides}` | base `runtime.spawn` | a child environment |
 | `approval_request{reason}` | base `approval.request` | ask a human |
 
@@ -962,6 +981,112 @@ runtime  --runtime.register{env, token, manifest, health, channels}-->  base
 - **One row per env.** Registering again replaces it; starting or resetting an env drops
   it and the token with it. A refusal never disturbs the runtime already recorded.
 
+## The change protocol (P3.7)
+
+RFC section 10's one protocol, executed only by base:
+
+```
+upgrade.propose{env, target, artifact, notes}
+   |
+   +-- tier gate (config `tiers:`)  auto -> straight on; ask -> the approvals queue
+   |
+   +-> snapshot  what is mounted now + the manifest, and the LKG benchmark measured now
+   +-> canary    the artifact mounted beside the old one, and its conformance
+   +-> verify    hard rules (`Cmd::Guard`: halted env, kill switch, budgets) + benchmark vs LKG
+   +-> promote   swap, write the LKG manifest      | rollback  destroy the canary, restore,
+                                                   |           and return the reason
+```
+
+Every phase is written to the `upgrades` row before the next one starts and emitted as
+`upgrade.phase` in that env's log, so `upgrade.status{upgrade_id}` answers what happened and
+why even after a base restart — the row is the truth, base keeps no second copy in memory.
+The caller is never held: an upgrade outlives one request, so `propose` answers with an id.
+
+| Target | Canary | Conformance | Promote | Rollback |
+|---|---|---|---|---|
+| `plugin` | the spec mounted under `<id>-canary`, with `TENON_CANARY` and `TENON_CANARY_SERVICE` added to its env | the fiber is `active` (the wire `hello` and `load` happened) plus the declared `selfcheck` svc method, which takes no arguments and may declare an `expect` | unmount the canary, unmount the fiber that owns the service, mount the artifact under the real id, install `plugins/<name>@<version>/manifest.json` and rewrite `lkg/manifest.json` | unmount the canary |
+| `worker` | the `{cmd, args, env}` launched inside the sandbox with `TENON_WORKER_SERVICE=worker-canary`, beside the built-in one | `bash` echoes a marker, `fs.write` + `fs.view` round trip, `snap.commit` answers | unmount the canary fiber and the fiber owning `worker`, launch the candidate again as `worker`, record the spec so restarts use it | unmount the canary; the built-in worker never stopped |
+| `kernel` | `tenon check kernel --beam <artifact.beam>` in a fresh node | the ten contract points of `../kernel/README.md` | blue/green, below | nothing was started |
+| `config` | the patch object itself; there is nothing live to mount | it parses as an object | `config.patch` with the gate already passed, then a loader `reload` | copy the snapshot back and reload |
+
+**The canary names its own service.** The kernel is the single authority over service names, so
+a second plugin cannot `provide` a name the old one still holds. A canary is therefore handed
+`TENON_CANARY_SERVICE=<service>-canary` in its environment and is expected to use it; the
+worker reads the same idea from `TENON_WORKER_SERVICE`. That convention is what lets the old
+artifact keep answering under the real name for the whole canary and verify phases.
+
+**Which fiber owns a service** is a `plugin{op: "owner", name}` frame the node's `Link`
+answers (one `ets:lookup` in the kernel's services table plus a tree walk for the id). A
+socket fiber's id is the gateway's connection id, not anything the caller chose, so a
+promotion could not otherwise know what to unmount.
+
+**Tiers.** `tiers: {kernel, plugin, worker, config}` in `config.yml`, `auto` or `ask` each. An
+`ask` tier writes the proposal as `awaiting_approval`, puts a row in the approvals queue
+(`tenon approvals`, `tenon approve <id>`) and starts nothing until a human answers; a denial
+or a timeout ends the proposal as `rolled_back` with that reason. The default is `auto`
+everywhere, which is RFC section 10's "L1 auto + notify, L2/L3 auto" — L0 has no row here
+because the barebone never changes at runtime.
+
+**The benchmark gate.** `benchmark:` in `config.yml` is a task set — a prompt plus either an
+`expect_substring` or the `tool_calls` the turn has to make — run through that env's own agent
+loop, the same seam a human drives. The baseline is measured in the *snapshot* phase, before
+the canary exists, and stored as the `lkg = 1` row of the `benchmarks` table; the candidate
+pass runs in *verify* with the canary live and is compared against it: a lower success rate
+refuses the promotion, and so does a cost above `cost_tolerance` (1.5) times the LKG's. Rows
+are filed under a `label` (the `model:` knob, `fake` or `real`) and only ever compared within
+one label, because numbers from a fake model and from a real one are not the same
+measurement. With no comparable LKG row the first pass is a baseline, not a verdict.
+
+**The model drives it too.** The management tool `upgrade{op, target, artifact, notes, id}`
+(`manage.upgrade.*` for plugins) is the same front door: an agent proposes, base judges, and a
+refusal comes back as the tool result the model reads — the reason, not a broken turn.
+
+```
+tenon upgrade propose plugin --artifact '{"name":"demo","version":"2.0.0","id":"demo",
+  "service":"demo","selfcheck":{"method":"selfcheck","expect":"ok"},
+  "spec":{"cmd":"/usr/bin/python3","args":["/srv/demo.py","2"]}}'
+tenon upgrade status 1
+```
+
+## Blue/green node A (P3.7)
+
+The kernel's promote path, and the only one that replaces a running process rather than a
+fiber. The guardian node G is never touched.
+
+```
+before        base --- node A (blue, release R)  --- gateway.sock <-- worker, harness
+switch        base --- node A (blue)             --- gateway.sock
+                   \-- node A' (green, release R') --- gateway-green.sock     both in `status`
+after         base --- node A' (now the env's node) --- gateway-green.sock <-- worker, harness
+                       node A drained (SIGTERM, grace, SIGKILL)
+```
+
+1. **Stage.** `<home>/upgrades/<id>/release` is a `cp -a` of the release the env runs, with the
+   candidate `tenon.beam` written over `lib/tenon-*/ebin/tenon.beam`. A release in embedded
+   mode loads its modules from that tree, so replacing the file *is* "run the new kernel".
+2. **Green.** Base spawns a second agent node from that release with the **same profile**, its
+   own node token and a second socket, `run/gw-<env>/gateway-green.sock` — in the same
+   directory, because that directory is what the sandbox bind-mounts, so the worker can reach
+   either node without a new mount. It is staged under the name `<env>~green` and marked as a
+   shadow: no worker, no harness, no probe, no LKG promotion, and `ready()` ignores it. It is
+   in `status` while it is up, which is how "both nodes during the switch" is observable.
+3. **Health.** The driver waits for `node.register` and then asks the green node itself:
+   `health{ok: true}` and a `tree` whose root fiber is `active`. A beam that fails
+   `check kernel`, never registers or comes up unhealthy ends the proposal as `rolled_back`
+   with that reason and **leaves A running** — nothing was moved.
+4. **Switch.** A' takes the env's name, its sandbox instance, its state file, its budget and
+   its parent; the old node's pid moves to a drain list. `profiles/<env>/kernel.json` records
+   the release, so a later restart of that env boots from it — and because it lives under
+   `profiles/`, `tenon rollback` puts the old pointer back with everything else it restores.
+5. **Drain.** Only then is A stopped. Its socket closing is what ends the old worker and the
+   old harness; base boots a fresh worker (the promoted candidate spec, if there is one) and a
+   fresh harness against A''s gateway, and the sessions in the log answer again.
+
+An env's node exits are reported under the env's own name even while the node is green
+(`Spec.exit_env`), so the generation check is what tells "a candidate died" (ignored, the
+driver reports the timeout) from "the env's node died" (restarted normally). Blue/green needs
+a unix gateway; under a `tcp:` gateway (krun) the switch refuses with that reason.
+
 ## The built-in ASCII UI (P3.5)
 
 `rs/ui` is the pure renderer (its own README covers the layout); base is what fills its model
@@ -996,6 +1121,8 @@ public surface — and it works with JavaScript off.
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon install-service --user [--print]` | write the OS service unit for this binary and home, and enable it where there is a user service manager; `--print` prints it instead. Never starts base |
 | `tenon status [--lkg]` | one JSON document: base, both nodes, and each node's fiber tree. `--lkg` prints what the last promotion pinned and verifies it instead, without needing a running base, and exits non-zero when a hash moved |
+| `tenon upgrade propose <target> --artifact JSON [--env NAME] [--notes TEXT]` | drive the change protocol by hand: the same frame the model-facing `upgrade` tool sends. Prints `{id, tier, status}` |
+| `tenon upgrade status <id>` / `tenon upgrade list [--env NAME]` | what one proposal did, phase by phase; or every proposal and every benchmark row |
 | `tenon check kernel [--beam PATH] [--release-dir DIR]` | run the kernel contract suite that ships inside the beam release against a `tenon.beam` — the one the release ships, or a candidate. Prints the JSON report and exits non-zero when a point failed. Needs no running base |
 | `tenon rollback [--force]` | restore the LKG config, profiles and state copy. Verifies every pinned hash first and refuses with what differs; `--force` overrides. Refuses while base is running |
 | `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
@@ -1056,6 +1183,9 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `approval.list{status?,limit?}` | CLI, plugins | the queue from the barebone's own state file; `status` defaults to every row, `all` is the same, `pending` is what `tenon approvals` asks for |
 | `approval.answer{approval_id,decision,note?}` | CLI, the UI | `approve` or `deny` one pending row. The approval's id travels as `approval_id`: `id` is the frame's own correlation id |
 | `snap.export{env,path}` | CLI, plugins | write that env's newest stored pack to a host path as a self-contained bundle. Workspace push-out, so it is gated |
+| `upgrade.propose{env,target,artifact,notes?}` | harness, CLI | start the change protocol for `plugin`, `worker`, `kernel` or `config`. Answers `{id, tier, status}` at once — an upgrade outlives one request — and an `ask` tier waits in the approvals queue before anything runs |
+| `upgrade.status{upgrade_id}` | harness, CLI | one proposal: its status, its reason and every phase it went through. The id travels as `upgrade_id`, the way `approval_id` does |
+| `upgrade.list{env?,limit?}` | harness, CLI | the proposals and the benchmark rows of that env |
 | `kill{reason?}` / `resume{reason?}` | CLI, plugins | the kill switch over the socket: halt every harness and refuse every prompt, or let them back |
 | `stop` | CLI | graceful shutdown of everything, base included |
 | `status` | CLI | the snapshot plus one `tree` request per registered node |
@@ -1108,7 +1238,7 @@ gone) start failing on load rather than on logic — seen twice in whole-suite r
 every time the suite runs alone (`cargo test -p tenon-cli --test adversarial`, 195 s). The
 numbers below are from the whole suite plus that separate adversarial run.
 
-128 tests in the crates below (`cargo test --all-features` prints 152: `rs/ui` brings its own
+129 tests in the crates below (`cargo test --all-features` prints 153: `rs/ui` brings its own
 24, covered by its README): `sandbox` unit 5, `boot.rs` 8, `storage` 14, `base` unit 16
 (`token`, `home::hash` — stable per home, distinct across homes — the two `ui` model builders,
 the http form decoder, the runtime contract's two, the probe approver, the three LKG-manifest
@@ -1120,7 +1250,8 @@ P3.2 worker suites (`worker/tests/fs_test.rs` 9, `snap_test.rs` 9, `pty_test.rs`
 `loop_test.rs` 12, `cli/tests/harness_gate.rs` 1, `harness_model.rs` 1), the P3.4 gate
 (`cli/tests/storage_gate.rs` 1) and the seven P3.5 gates
 (`cli/tests/approvals_gate.rs` 1, `budget_gate.rs` 2, `ui_gate.rs` 2, `contract_gate.rs` 1,
-`guardian_gate.rs` 1, `manifest_gate.rs` 1, `replay_gate.rs` 1), which share
+`guardian_gate.rs` 1, `manifest_gate.rs` 1, `replay_gate.rs` 1) and the P3.7 gate
+(`cli/tests/upgrade_gate.rs` 1), which share
 `cli/tests/gate/mod.rs` — one fixture (temp home, `config.yml`, `profiles/root/harness.yml`,
 container reap on `Drop`) instead of seven copies of the one `harness_gate.rs` grew.
 
@@ -1139,6 +1270,24 @@ one logs `probes.loaded{count: 1}` and `probes.rejected` naming the file and the
 found; then `SIGSTOP` on the harness makes the `harness` probe wedge, and within two probe
 passes base logs `guardian.reset` carrying the failing probe names and the env comes back
 with a fresh harness pid.
+
+`cli/tests/upgrade_gate.rs` (1, skipped without oci or a release, ~30 s here) is the P3.7
+gate: one boot, one change protocol, four targets. A python plugin providing `demo.version`
+is mounted at v1; a v2 proposal is snapshotted, canaried as `demo-canary`, verified against
+the benchmark and promoted, after which `svc demo.version` is 2 and `lkg/manifest.json` pins
+`demo@2.0.0`; a v3 whose `selfcheck` answers the wrong thing is rolled back with that reason
+and the version stays 2. A candidate worker — `tenon worker` itself with a marker in its
+environment — passes the worker conformance and takes the name, and `bash` through the
+promoted worker echoes the marker; a candidate that exits instead of speaking the wire is
+rolled back with "never answered" and the built-in worker still answers `ping`. A canary that
+passes its own selfcheck and then short-circuits every `llm/request` is refused by the
+benchmark gate, naming it. A `config` tier set to `ask` is proposed **by the model** (a fake
+tool call to `upgrade`), waits as `awaiting_approval` until `tenon approve`, and then patches
+the overlay. Finally the kernel: `tenon check kernel` passes on the shipped beam and refuses a
+corrupted one by name, that same corrupted beam ends a proposal as `rolled_back` without
+touching node A, and the shipped beam proposed as "new" runs the blue/green switch — `status`
+is polled throughout and does see both nodes, ends with exactly one `root`, a different node
+pid and no `~green`, and a turn after the switch still answers.
 
 `cli/tests/manifest_gate.rs` (1, needs only a release, 3.5 s here) is the LKG-manifest gate:
 a boot with a plugin installed under `plugins/echo@1.0.0/` writes `lkg/manifest.json` with
@@ -1634,3 +1783,59 @@ accumulate across CI runs.
     itself has never executed them. The krun conformance job is written to report the reason
     and pass on a runner without a hypervisor or without libkrun, which is what a stock
     `ubuntu-latest` is — libkrun is not in the Ubuntu archive.
+
+57. **The kernel contract suite is a pure Elixir suite in the release, not the ExUnit files.**
+    The plan says "package the kernel's ExUnit contract tests". A `mix release` ships no test
+    files and no `ex_unit`, and adding both to ship a suite that has to run on a machine with
+    no development tree would be a bigger dependency than the suite itself. So the curated
+    subset is rewritten as ordinary code in `beam/lib/tenon/beam/check/` — the same
+    assertions, expressed as ten named contract points with reasons — and `mix test` runs it
+    once (`beam/test/check_test.exs`) so it cannot rot. Its wire points need no python either:
+    the plugin half is a process of the same VM on a loopback socket.
+58. **A canary provides a different service name, by convention.** RFC section 10 says "mount
+    new beside the old", and the kernel raises `{service_exists, Name}` on a duplicate, so
+    "beside" cannot mean "under the same name". Base hands the canary
+    `TENON_CANARY_SERVICE=<service>-canary` (and `TENON_WORKER_SERVICE` for a worker) and the
+    conformance calls that name. A candidate that ignores the variable fails its canary phase
+    with the kernel's own error, which is the right answer: it is not mountable beside the
+    thing it wants to replace.
+59. **`selfcheck` takes no arguments.** The conformance calls `svc <service>-canary.selfcheck`
+    with an empty argument list; an artifact declares `selfcheck: {method, expect?}` when it
+    wants the check to be required, and nothing is called when it declares none. Passing a
+    config object instead would make every language's zero-argument handler wrong.
+60. **The benchmark baseline is measured, not remembered.** RFC section 10 compares a
+    candidate against "LKG's recorded numbers". Recording them at LKG promotion would compare
+    against a different machine, a different model and a different day; measuring the baseline
+    in the snapshot phase, seconds before the canary exists, makes the two passes differ only
+    in the artifact under test. The `lkg = 1` row in `benchmarks` is that measurement, and it
+    is what an operator reads afterwards.
+61. **A benchmark set nothing can pass blocks nothing.** The gate is "not worse than the LKG",
+    so if the baseline scores 0.0 the candidate is not refused for scoring 0.0 too. A set that
+    does not discriminate is a configuration problem, not a reason to freeze the environment.
+62. **`upgrade.propose` does not block, and `ask` does not hold the caller either.** An
+    upgrade takes tens of seconds (two benchmark passes, a container exec, sometimes a node
+    boot), which is longer than a request should live. The id plus `upgrade.status` is the
+    answer, and an `ask` tier parks the proposal as `awaiting_approval` rather than holding a
+    socket open until a human wakes up. That also makes the model-facing tool usable: the
+    agent gets the id inside its turn and can look at the outcome in a later one.
+63. **Blue/green gives A' a second socket in the same gateway directory.** The sandbox
+    bind-mounts `run/gw-<env>/`, not the socket file, so a second socket in that directory is
+    reachable from inside the guest with no new mount and no container restart — which is what
+    makes "move the front door" possible at all. The address is remembered on the node and in
+    `profiles/<env>/kernel.json`, and blue/green refuses on a `tcp:` gateway (krun) with that
+    reason rather than pretending.
+64. **The old node is drained after the switch, and that is what stops the old worker.** Base
+    has no "detach a fiber" call into a live node; the worker and the harness notice their
+    socket closing and exit, exactly the way every node notices base dying. So the order is:
+    swap the env's node, then SIGTERM the old one, then boot the worker and harness against
+    the new gateway. A turn in flight is lost and resumes from the session log, the same
+    contract a harness restart already has.
+65. **A promoted candidate worker is a file under `profiles/`, not a runtime-only fact.** It
+    has to survive a node restart, an env reset and a base restart, and it has to be
+    rollback-able; `profiles/<env>/worker.json` is both, since `tenon rollback` restores the
+    profiles. The built-in worker is the fallback: a candidate that cannot take the name after
+    the old one was unmounted puts the spec back to `None` and boots the built-in again.
+66. **The kernel tier stages a whole copy of the release.** 68 MB per proposal, `cp -a`, under
+    `<home>/upgrades/<id>/`. The alternative — symlinking every entry but the one `ebin` —
+    saves a second and a few tens of megabytes and makes `RELEASE_ROOT` resolution depend on
+    how the release script resolves its own path. A rare operation buys simplicity here.

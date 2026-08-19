@@ -96,6 +96,47 @@ pub struct Prices {
     pub output: f64,
 }
 
+/// Human gates per tier of RFC section 10's table, one knob each: `auto`
+/// promotes on a green verify, `ask` puts the proposal in the approvals queue
+/// first. L0 (the barebone itself) has no row here because it never changes at
+/// runtime.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tiers {
+    #[serde(default = "tier")]
+    pub kernel: String,
+    #[serde(default = "tier")]
+    pub plugin: String,
+    #[serde(default = "tier")]
+    pub worker: String,
+    #[serde(default = "tier")]
+    pub config: String,
+}
+
+/// One benchmark task of the promotion gate: a prompt for that env's agent and
+/// what its answer has to contain, or which tools it has to have called.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BenchTask {
+    pub prompt: String,
+    #[serde(default)]
+    pub expect_substring: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<String>,
+}
+
+/// "Better" made measurable (RFC section 10): the task set a candidate has to
+/// score at least as well on as the LKG did, and how much more it may cost.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Benchmark {
+    #[serde(default = "bench_model")]
+    pub model: String,
+    #[serde(default = "bench_tasks")]
+    pub tasks: Vec<BenchTask>,
+    #[serde(default = "bench_timeout_s")]
+    pub timeout_s: u64,
+    #[serde(default = "cost_tolerance")]
+    pub cost_tolerance: f64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Envs {
     #[serde(default = "max_total")]
@@ -144,6 +185,10 @@ pub struct Config {
     pub budget_reset_on_reset: bool,
     #[serde(default = "budget_tick_ms")]
     pub budget_tick_ms: u64,
+    #[serde(default)]
+    pub tiers: Tiers,
+    #[serde(default)]
+    pub benchmark: Benchmark,
 }
 
 fn root_env() -> String {
@@ -234,6 +279,69 @@ fn budget_tick_ms() -> u64 {
     5_000
 }
 
+fn tier() -> String {
+    "auto".to_string()
+}
+
+fn bench_model() -> String {
+    "fake".to_string()
+}
+
+fn bench_timeout_s() -> u64 {
+    120
+}
+
+fn cost_tolerance() -> f64 {
+    1.5
+}
+
+/// The default set is deliberately tiny and model-independent: one turn that
+/// proves the loop answers at all. A host that wants a real gate writes its
+/// own tasks into `config.yml`.
+fn bench_tasks() -> Vec<BenchTask> {
+    vec![BenchTask {
+        prompt: "benchmark: reply with the single word tenon-bench-ok".to_string(),
+        expect_substring: Some("tenon-bench-ok".to_string()),
+        tool_calls: Vec::new(),
+    }]
+}
+
+impl Default for Tiers {
+    fn default() -> Self {
+        Self {
+            kernel: tier(),
+            plugin: tier(),
+            worker: tier(),
+            config: tier(),
+        }
+    }
+}
+
+impl Default for Benchmark {
+    fn default() -> Self {
+        Self {
+            model: bench_model(),
+            tasks: bench_tasks(),
+            timeout_s: bench_timeout_s(),
+            cost_tolerance: cost_tolerance(),
+        }
+    }
+}
+
+impl Tiers {
+    /// The gate in front of one target, `auto` for anything unknown: a target
+    /// nobody configured is not a reason to refuse an upgrade.
+    pub fn of(&self, target: &str) -> &str {
+        match target {
+            "kernel" => &self.kernel,
+            "plugin" => &self.plugin,
+            "worker" => &self.worker,
+            "config" => &self.config,
+            _ => "auto",
+        }
+    }
+}
+
 fn interval_ms() -> u64 {
     2_000
 }
@@ -320,6 +428,8 @@ impl Default for Config {
             usd_per_1k: Prices::default(),
             budget_reset_on_reset: enabled(),
             budget_tick_ms: budget_tick_ms(),
+            tiers: Tiers::default(),
+            benchmark: Benchmark::default(),
         }
     }
 }

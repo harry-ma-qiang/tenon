@@ -82,10 +82,16 @@ pub fn serve(root: &Path) -> Result<()> {
 
     let loaded = state.clone();
     plugin.on_load(move |config: Value, next: &mut Next| {
+        // The service name is how a candidate worker runs beside the built-in
+        // one during an upgrade: the gateway mounts a socket fiber with no
+        // config, so the name comes from the environment the candidate was
+        // launched with.
         let name = config["service"]
             .as_str()
-            .unwrap_or(DEFAULT_SERVICE)
-            .to_string();
+            .map(str::to_string)
+            .or_else(|| std::env::var("TENON_WORKER_SERVICE").ok())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| DEFAULT_SERVICE.to_string());
         loaded
             .cap
             .set((next.max_frame() / 8).clamp(MIN_CAP, MAX_CAP));

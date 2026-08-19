@@ -55,6 +55,63 @@ pub struct Node {
     pub ticker: Option<Ticker>,
     pub restore: Vec<(i64, String)>,
     pub budget: crate::budget::Budget,
+    /// A blue/green candidate node: it is in the map so `tenon status` shows
+    /// both nodes during a switch, and out of everything else — no worker, no
+    /// harness, no probe, no LKG promotion — until it becomes the env's node.
+    pub shadow: bool,
+    /// The release this node was started from. Normally base's own; after a
+    /// promoted kernel upgrade, that env's staged release.
+    pub release: std::path::PathBuf,
+    /// The gateway address this node listens on, when it is not the env's
+    /// default one: the green node of a switch takes a second socket in the
+    /// same directory and keeps it after the promotion.
+    pub gateway: Option<String>,
+    /// The promoted candidate worker, if any. `None` is the built-in worker,
+    /// which is the LKG fallback.
+    pub worker_spec: Option<Value>,
+}
+
+impl Node {
+    /// A node record before anything has been spawned for it: what a child env
+    /// is staged as, and what a blue/green candidate starts from.
+    pub fn staged(
+        role: &str,
+        parent: Option<String>,
+        depth: u32,
+        profile: String,
+        ram_mb: u64,
+    ) -> Self {
+        Self {
+            role: role.to_string(),
+            pid: None,
+            generation: 0,
+            registered: false,
+            restarts: 0,
+            peer: None,
+            sandbox: None,
+            exited: None,
+            token: String::new(),
+            runtime_token: String::new(),
+            parent,
+            depth,
+            profile,
+            ram_mb,
+            worker: WorkerState::Off,
+            harness: crate::harness::State::Off,
+            harness_pid: None,
+            harness_restarts: 0,
+            harness_exited: None,
+            store: None,
+            fiber: None,
+            ticker: None,
+            restore: Vec::new(),
+            budget: crate::budget::Budget::default(),
+            shadow: false,
+            release: std::path::PathBuf::new(),
+            gateway: None,
+            worker_spec: None,
+        }
+    }
 }
 
 pub fn worker_view(state: &WorkerState) -> Value {

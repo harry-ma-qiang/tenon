@@ -178,6 +178,59 @@ pub enum Cmd {
         env: String,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// The change protocol of RFC section 10, one variant per step base has to
+    /// perform itself; everything else runs in the driver, off the actor.
+    UpgradePropose {
+        env: String,
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    UpgradeStatus {
+        id: i64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    UpgradeList {
+        env: Option<String>,
+        limit: i64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    UpgradeApproved {
+        id: i64,
+        refused: Option<String>,
+    },
+    UpgradePhase {
+        id: i64,
+        status: String,
+        reason: Option<String>,
+        step: Value,
+    },
+    UpgradeBench {
+        env: String,
+        label: String,
+        id: i64,
+        row: (i64, i64, f64, i64),
+        lkg: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    UpgradeWorker {
+        env: String,
+        spec: Option<Value>,
+    },
+    KernelSwitch {
+        id: i64,
+        env: String,
+        release: PathBuf,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    KernelReady {
+        id: i64,
+        env: String,
+        outcome: Result<(), String>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    KernelDrain {
+        env: String,
+    },
     Restored {
         env: String,
         result: Value,

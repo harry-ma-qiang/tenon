@@ -434,6 +434,29 @@ pub fn builtins(timeout_ms: u64) -> Vec<Row> {
             ),
         ),
         manage(
+            "upgrade",
+            "upgrade.tool",
+            schema(
+                "upgrade",
+                "Propose a change to this environment through the change protocol: a plugin, \
+                 the worker, the kernel or the config. Base snapshots, canaries, verifies \
+                 against the benchmark set and then promotes or rolls back with a reason.",
+                json!({
+                    "op": {"type": "string", "enum": ["propose", "status", "list"]},
+                    "target": {"type": "string", "enum": ["plugin", "worker", "kernel", "config"]},
+                    "artifact": {
+                        "type": "object",
+                        "description": "plugin: {name, version, spec:{cmd,args,env}, service, \
+                                        selfcheck}; worker: {cmd, args, env}; kernel: {beam}; \
+                                        config: {patch}",
+                    },
+                    "notes": text("why this change"),
+                    "id": number("the proposal id, for status"),
+                }),
+                &["op"],
+            ),
+        ),
+        manage(
             "runtime_spawn",
             "runtime.spawn",
             schema(

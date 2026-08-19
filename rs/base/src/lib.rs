@@ -1,10 +1,14 @@
 pub mod approvals;
 pub mod base;
+pub mod bench;
+pub mod bluegreen;
 pub mod budget;
+pub mod candidate;
 pub mod check;
 pub mod client;
 pub mod cmds;
 pub mod config;
+pub mod drive;
 pub mod envfiber;
 pub mod envrpc;
 pub mod frame;
@@ -33,6 +37,7 @@ pub mod state;
 pub mod token;
 pub mod tui;
 pub mod ui;
+pub mod upgrade;
 pub mod worker;
 
 use crate::client::Client;

@@ -46,17 +46,19 @@ async fn listening(gateway: &str, deadline: tokio::time::Instant) -> Result<(), 
 /// back once it answers on the wire. Every step runs off the actor's task: the
 /// container exec is a blocking call and the readiness poll is a round trip
 /// through the node's gateway.
+#[allow(clippy::too_many_arguments)]
 pub fn boot(
     env: String,
     instance: Arc<dyn Instance>,
     peer: Peer,
     gateway: String,
+    spec: Option<Value>,
     timeout: Duration,
     cmds: mpsc::UnboundedSender<Cmd>,
 ) {
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + timeout;
-        if let Some(error) = launch(&env, instance, &gateway, deadline).await.err() {
+        if let Some(error) = launch(&env, instance, &gateway, spec, deadline).await.err() {
             let _ = cmds.send(Cmd::WorkerReady {
                 env,
                 pid: None,
@@ -84,6 +86,7 @@ async fn launch(
     env: &str,
     instance: Arc<dyn Instance>,
     gateway: &str,
+    spec: Option<Value>,
     deadline: tokio::time::Instant,
 ) -> Result<(), String> {
     listening(gateway, deadline).await?;
@@ -103,9 +106,21 @@ async fn launch(
     let workspace = instance.workspace_path();
     let binary = instance.binary_path();
     let address = gateway;
+    // A promoted candidate worker replaces the built-in launch line; the
+    // built-in one stays the LKG fallback and is what a rollback comes back to.
+    // Its own variables go in front of `nohup`, which takes a command, not an
+    // assignment.
+    let (exports, command) = match &spec {
+        Some(spec) => (candidate_env(spec), candidate_cmd(spec)),
+        None => (
+            String::new(),
+            format!("{binary} worker --workspace {workspace}"),
+        ),
+    };
     let line = format!(
-        "cd {workspace} && TENON_GATEWAY={address} TENON_ENV={env} nohup {binary} worker \
-         --workspace {workspace} >> {workspace}/{LOG} 2>&1 </dev/null & echo started"
+        "cd {workspace} && TENON_GATEWAY={address} TENON_ENV={env} \
+         TENON_WORKSPACE={workspace} {exports}nohup {command} >> {workspace}/{LOG} 2>&1 \
+         </dev/null & echo started"
     );
     let outcome = tokio::task::spawn_blocking(move || {
         instance.exec("sh", &["-c".to_string(), line], LAUNCH_TIMEOUT)
@@ -121,6 +136,32 @@ async fn launch(
         ));
     }
     Ok(())
+}
+
+/// The `env` of a candidate worker spec, as shell assignments.
+pub fn candidate_env(spec: &Value) -> String {
+    let mut line = String::new();
+    for pair in spec["env"].as_array().cloned().unwrap_or_default() {
+        let name = pair[0].as_str().unwrap_or_default();
+        let value = pair[1].as_str().unwrap_or_default();
+        if !name.is_empty() {
+            line.push_str(&format!("{name}={value} "));
+        }
+    }
+    line
+}
+
+/// The `cmd` and `args` of a candidate worker spec, as one command line: the
+/// same shape `upgrade.propose{target: worker}` takes.
+pub fn candidate_cmd(spec: &Value) -> String {
+    let mut line = spec["cmd"].as_str().unwrap_or_default().to_string();
+    for arg in spec["args"].as_array().cloned().unwrap_or_default() {
+        if let Some(arg) = arg.as_str() {
+            line.push(' ');
+            line.push_str(arg);
+        }
+    }
+    line
 }
 
 async fn ready(peer: &Peer, deadline: tokio::time::Instant) -> Result<Option<i64>, String> {

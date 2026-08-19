@@ -21,6 +21,7 @@ impl Base {
             return;
         }
         node.worker = WorkerState::Booting;
+        let spec = node.worker_spec.clone();
         let timeout = Duration::from_millis(self.config.worker.boot_timeout_ms);
         let gateway = self.gateway_address(env);
         worker::boot(
@@ -28,6 +29,7 @@ impl Base {
             instance,
             peer,
             gateway,
+            spec,
             timeout,
             self.cmds.clone(),
         );

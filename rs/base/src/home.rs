@@ -106,6 +106,58 @@ impl Home {
         format!("unix:{}", self.gateway_sock(env).display())
     }
 
+    /// The blue/green candidate's socket, in the **same** directory as the
+    /// env's own: that directory is what a sandbox mounts, so the worker
+    /// reaches either node without a second mount.
+    pub fn green_gateway_sock(&self, env: &str) -> PathBuf {
+        self.gateway_dir(env).join("gateway-green.sock")
+    }
+
+    pub fn green_gateway_address(&self, env: &str) -> String {
+        format!("unix:{}", self.green_gateway_sock(env).display())
+    }
+
+    /// Where one upgrade proposal keeps whatever it has to stage on disk: a
+    /// candidate release, for now.
+    pub fn upgrade_dir(&self, id: i64) -> PathBuf {
+        self.root.join("upgrades").join(id.to_string())
+    }
+
+    /// The promoted candidate worker of an env, or nothing when the built-in
+    /// worker (the LKG fallback) is what base launches.
+    pub fn worker_spec_file(&self, env: &str) -> PathBuf {
+        self.profiles().join(env).join("worker.json")
+    }
+
+    /// The release an env's node A boots from, when a kernel upgrade moved it
+    /// off base's own. It lives under `profiles/`, so the LKG copy of the
+    /// profiles is what `tenon rollback` puts back.
+    pub fn kernel_file(&self, env: &str) -> PathBuf {
+        self.profiles().join(env).join("kernel.json")
+    }
+
+    pub fn write_kernel_release(&self, env: &str, release: &Path) -> Result<()> {
+        let path = self.kernel_file(env);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = json!({"release": release}).to_string();
+        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn kernel_release(&self, env: &str) -> Option<PathBuf> {
+        let body = std::fs::read_to_string(self.kernel_file(env)).ok()?;
+        let value: Value = serde_json::from_str(&body).ok()?;
+        let path = PathBuf::from(value.get("release")?.as_str()?);
+        path.join("bin/tenon_beam").is_file().then_some(path)
+    }
+
+    pub fn worker_spec(&self, env: &str) -> Option<Value> {
+        let body = std::fs::read_to_string(self.worker_spec_file(env)).ok()?;
+        serde_json::from_str(&body).ok()
+    }
+
     /// Prepared root filesystems, one directory per image name, shared by every
     /// env: `tenon sandbox image pull` writes them and the krun backend reads
     /// them. Nothing here is per-env, so nothing here is agent-writable.

@@ -12,6 +12,11 @@ pub const GUARDIAN: &str = "guardian";
 pub struct Spec {
     pub role: String,
     pub env: String,
+    /// The env an exit of this node is reported under. It is the node's own
+    /// env everywhere but in a blue/green switch, where the candidate is
+    /// spawned under a staging name and has to be supervised as the env it is
+    /// about to become.
+    pub exit_env: String,
     pub profile: String,
     pub sock: PathBuf,
     pub target: String,
@@ -46,6 +51,7 @@ pub fn spec(
     Spec {
         role: role.to_string(),
         env: env.to_string(),
+        exit_env: env.to_string(),
         profile,
         sock: home.sock(),
         target: config.root_env.clone(),
@@ -113,7 +119,7 @@ pub fn spawn(
         .with_context(|| format!("spawn {}", binary.display()))?;
     let pid = child.id().context("node has no pid")? as i32;
     let (tx, rx) = oneshot::channel();
-    let env = spec.env.clone();
+    let env = spec.exit_env.clone();
     tokio::spawn(async move {
         let code = child.wait().await.ok().and_then(|status| status.code());
         let _ = tx.send(code);

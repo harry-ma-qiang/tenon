@@ -190,6 +190,10 @@ fn router(
         "snapshot.list",
         "snapshot.commit",
         "snapshot.restore",
+        "upgrade.tool",
+        "upgrade.propose",
+        "upgrade.status",
+        "upgrade.list",
         "runtime.spawn",
         "approval.request",
     ] {

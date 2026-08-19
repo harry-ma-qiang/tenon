@@ -33,6 +33,10 @@ impl Manage {
             "snapshot.list" => self.snapshot("list", &params).await,
             "snapshot.commit" => self.snapshot("commit", &params).await,
             "snapshot.restore" => self.snapshot("restore", &params).await,
+            "upgrade.tool" => self.upgrade(&op(&params, "status"), &params).await,
+            "upgrade.propose" => self.upgrade("propose", &params).await,
+            "upgrade.status" => self.upgrade("status", &params).await,
+            "upgrade.list" => self.upgrade("list", &params).await,
             "runtime.spawn" => {
                 let overrides = params.get("overrides").cloned().unwrap_or(json!({}));
                 let parent = self.api.env().to_string();
@@ -84,6 +88,38 @@ impl Manage {
                     .await
             }
             other => Err(format!("unknown config op {other}")),
+        }
+    }
+
+    /// The change protocol from inside the environment (RFC section 6): the
+    /// agent proposes, base executes and judges, and a refusal comes back as
+    /// the reason so the agent can fix the artifact and propose again.
+    async fn upgrade(&self, op: &str, params: &Value) -> Answer {
+        match op {
+            "propose" => {
+                let target = params.get("target").cloned().unwrap_or(Value::Null);
+                let artifact = params.get("artifact").cloned().unwrap_or(json!({}));
+                if !artifact.is_object() {
+                    return Err("upgrade propose needs an artifact object".to_string());
+                }
+                let notes = params.get("notes").cloned().unwrap_or(json!(""));
+                self.api
+                    .env_call(
+                        "upgrade.propose",
+                        json!({"target": target, "artifact": artifact, "notes": notes}),
+                    )
+                    .await
+            }
+            "status" => {
+                let Some(id) = params.get("id").and_then(Value::as_i64) else {
+                    return Err("upgrade status needs an id".to_string());
+                };
+                self.api
+                    .env_call("upgrade.status", json!({"upgrade_id": id}))
+                    .await
+            }
+            "list" => self.api.env_call("upgrade.list", json!({})).await,
+            other => Err(format!("unknown upgrade op {other}")),
         }
     }
 

@@ -6,6 +6,7 @@ pub mod memory;
 pub mod packs;
 pub mod retain;
 pub mod schema;
+pub mod upgrades;
 
 pub use approvals::Approval;
 pub use blobs::{sha256, Blob};
@@ -15,6 +16,7 @@ pub use memory::{Embedding, MemoryEdge, MemoryNode};
 pub use packs::{EnvRow, PackRow, SnapshotRow};
 pub use retain::{Retained, Retention};
 pub use schema::VERSION;
+pub use upgrades::{Benchmark, Upgrade};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;

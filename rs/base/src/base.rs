@@ -17,6 +17,10 @@ use tokio::sync::{mpsc, oneshot};
 
 const BOOT_ABORT_GRACE_MS: u64 = 300;
 
+/// The pid of a node that has been replaced, and the receiver that reports its
+/// exit: what a blue/green drain needs to stop the old node after the switch.
+pub type Drained = (i32, Option<oneshot::Receiver<Option<i32>>>);
+
 pub struct Base {
     pub home: Home,
     pub config: Config,
@@ -36,6 +40,9 @@ pub struct Base {
     pub runtimes: BTreeMap<String, crate::runtime::Runtime>,
     pub probes: crate::probes::Approved,
     pub privilege: crate::privilege::Plan,
+    /// The node a blue/green switch has replaced, held between the swap and
+    /// the drain so the old process is stopped after the front door moved.
+    pub draining: BTreeMap<String, Drained>,
 }
 
 fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
@@ -77,6 +84,7 @@ impl Base {
             runtimes: BTreeMap::new(),
             probes: crate::probes::Approved::default(),
             privilege: crate::privilege::Plan::Off,
+            draining: BTreeMap::new(),
         }
     }
 
@@ -111,6 +119,9 @@ impl Base {
     /// loopback TCP address, and node A, the harness and the worker are all
     /// handed the same string.
     pub fn gateway_address(&self, env: &str) -> String {
+        if let Some(address) = self.nodes.get(env).and_then(|node| node.gateway.clone()) {
+            return address;
+        }
         let default = self.home.gateway_address(env);
         self.sandbox
             .gateway_address(env, &default)
@@ -153,6 +164,19 @@ impl Base {
             .prepare_env(env)
             .map_err(|error| error.to_string())?;
         self.hand_over(role, env);
+        // A promoted kernel moved this env off base's own release; the
+        // profiles hold the pointer, so `tenon rollback` puts the old one back
+        // with everything else it restores.
+        let release = match role == GUARDIAN {
+            true => self.release.clone(),
+            false => self
+                .nodes
+                .get(env)
+                .map(|node| node.release.clone())
+                .filter(|path| path.join("bin/tenon_beam").is_file())
+                .or_else(|| self.home.kernel_release(env))
+                .unwrap_or_else(|| self.release.clone()),
+        };
         let spec = node::spec(
             &self.config,
             &self.home,
@@ -167,7 +191,7 @@ impl Base {
             &spec,
             &self.config,
             &self.home,
-            &self.release,
+            &release,
             &self.privilege,
             generation,
             self.exits.clone(),
@@ -219,6 +243,13 @@ impl Base {
                 .map(|old| old.restore.clone())
                 .unwrap_or_default(),
             budget,
+            shadow: false,
+            release,
+            gateway: previous.as_ref().and_then(|old| old.gateway.clone()),
+            worker_spec: previous
+                .as_mut()
+                .and_then(|old| old.worker_spec.take())
+                .or_else(|| self.home.worker_spec(env)),
         };
         let first = previous.is_none() && role != GUARDIAN;
         self.nodes.insert(env.to_string(), node);
@@ -301,7 +332,12 @@ impl Base {
             json!({"role": role, "pid": pid}),
         );
         let _ = reply.send(Ok(json!({"ok": true})));
-        if role != GUARDIAN {
+        let shadow = self
+            .nodes
+            .get(&env)
+            .map(|node| node.shadow)
+            .unwrap_or(false);
+        if role != GUARDIAN && !shadow {
             let _ = self.cmds.send(Cmd::WorkerBoot { env: env.clone() });
         }
         if self.ready() && !self.promoted {
@@ -528,7 +564,11 @@ impl Base {
     }
 
     pub(crate) fn ready(&self) -> bool {
-        !self.nodes.is_empty() && self.nodes.values().all(|node| node.registered)
+        !self.nodes.is_empty()
+            && self
+                .nodes
+                .values()
+                .all(|node| node.registered || node.shadow)
     }
 
     pub fn emit(&mut self, kind: &str, env: Option<&str>, data: Value) {

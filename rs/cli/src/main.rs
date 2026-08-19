@@ -92,6 +92,11 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Drive the change protocol: propose an upgrade, or read what happened
+    Upgrade {
+        #[command(subcommand)]
+        command: UpgradeCommand,
+    },
     /// Run a contract suite against an artifact before it is trusted
     Check {
         #[command(subcommand)]
@@ -127,6 +132,29 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpgradeCommand {
+    /// Propose a change: plugin, worker, kernel or config
+    Propose {
+        /// plugin | worker | kernel | config
+        target: String,
+        /// The artifact as JSON, the same object the tool takes
+        #[arg(long, value_name = "JSON")]
+        artifact: String,
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+        #[arg(long, default_value = "", value_name = "TEXT")]
+        notes: String,
+    },
+    /// What one proposal did, phase by phase
+    Status { id: i64 },
+    /// Every proposal and every benchmark row
+    List {
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
     },
 }
 
@@ -263,15 +291,33 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             false => tenon_base::rpc(home, "status", json!({})).await,
         },
         Command::Rollback { force } => tenon_base::rollback(home, force).await,
+        Command::Upgrade { command } => match command {
+            UpgradeCommand::Propose {
+                target,
+                artifact,
+                env,
+                notes,
+            } => {
+                let artifact: serde_json::Value = serde_json::from_str(&artifact)?;
+                let mut params = json!({"target": target, "artifact": artifact, "notes": notes});
+                if let Some(env) = env {
+                    params["env"] = json!(env);
+                }
+                tenon_base::rpc(home, "upgrade.propose", params).await
+            }
+            UpgradeCommand::Status { id } => {
+                tenon_base::rpc(home, "upgrade.status", json!({ "upgrade_id": id })).await
+            }
+            UpgradeCommand::List { env } => {
+                let params = env.map(|env| json!({ "env": env })).unwrap_or(json!({}));
+                tenon_base::rpc(home, "upgrade.list", params).await
+            }
+        },
         Command::Check {
             command: CheckCommand::Kernel { beam, release_dir },
-        } => tenon_base::check::command(
-            home,
-            beam,
-            release_dir,
-            payload::PAYLOAD,
-            payload::VERSION,
-        ),
+        } => {
+            tenon_base::check::command(home, beam, release_dir, payload::PAYLOAD, payload::VERSION)
+        }
         Command::InstallService { user, print } => match user || print {
             true => tenon_base::service::install(home, print),
             false => {
