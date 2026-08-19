@@ -32,11 +32,7 @@ impl Base {
     /// held: an upgrade outlives one request, so the id and `upgrade.status`
     /// are the answer.
     pub fn upgrade_propose(&mut self, env: &str, params: &Value, reply: oneshot::Sender<Answer>) {
-        let target = params
-            .get("target")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let target = crate::params::text(params, "target");
         if !targets().contains(&target.as_str()) {
             let _ = reply.send(Err(format!(
                 "upgrade.propose needs target one of {:?}, not {target:?}",
@@ -48,16 +44,12 @@ impl Base {
             let _ = reply.send(Err(format!("unknown env {env}")));
             return;
         }
-        let artifact = params.get("artifact").cloned().unwrap_or_else(|| json!({}));
+        let artifact = crate::params::object(params, "artifact");
         if !artifact.is_object() {
             let _ = reply.send(Err("upgrade.propose needs an artifact object".to_string()));
             return;
         }
-        let notes = params
-            .get("notes")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let notes = crate::params::text(params, "notes");
         let tier = self.config.tiers.of(&target).to_string();
         let status = match tier.as_str() {
             "auto" => PROPOSED,

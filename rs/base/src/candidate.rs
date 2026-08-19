@@ -97,11 +97,7 @@ async fn selfcheck(drive: &Drive, service: &str) -> Answer {
         return Ok(json!({"ran": false, "reason": "the artifact declares no selfcheck"}));
     }
     let declared = declared.unwrap_or(json!({}));
-    let method = declared
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("selfcheck")
-        .to_string();
+    let method = crate::params::text_or(&declared, "method", "selfcheck");
     let name = format!("{service}{CANARY_SUFFIX}");
     let answer = drive
         .svc_args(&name, &method, vec![])

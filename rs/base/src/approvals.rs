@@ -44,14 +44,9 @@ impl Base {
         let overlay = self.home.harness_config(env).unwrap_or_else(|_| json!({}));
         match overlay.get("approval") {
             Some(Value::String(mode)) => (mode.clone(), config.timeout_s),
-            Some(Value::Object(rows)) => (
-                rows.get("mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&config.mode)
-                    .to_string(),
-                rows.get("timeout_s")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(config.timeout_s),
+            Some(rows @ Value::Object(_)) => (
+                crate::params::text_or(rows, "mode", &config.mode),
+                crate::params::u64_or(rows, "timeout_s", config.timeout_s),
             ),
             _ => (config.mode.clone(), config.timeout_s),
         }

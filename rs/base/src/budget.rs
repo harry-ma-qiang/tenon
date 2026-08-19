@@ -120,18 +120,15 @@ impl Base {
         let Some(table) = overlay.get("usd_per_1k") else {
             return self.config.usd_per_1k;
         };
-        let provider = overlay
-            .get("llm")
-            .and_then(|llm| llm.get("provider"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let llm = crate::params::value(&overlay, "llm");
+        let provider = crate::params::text(&llm, "provider");
         let row = match table.get("input").is_some() || table.get("output").is_some() {
             true => table.clone(),
             false => table.get(provider).cloned().unwrap_or(Value::Null),
         };
         Prices {
-            input: row.get("input").and_then(Value::as_f64).unwrap_or(0.0),
-            output: row.get("output").and_then(Value::as_f64).unwrap_or(0.0),
+            input: crate::params::f64_or(&row, "input", 0.0),
+            output: crate::params::f64_or(&row, "output", 0.0),
         }
     }
 

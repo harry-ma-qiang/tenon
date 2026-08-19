@@ -195,24 +195,18 @@ pub async fn pull(
     guest_workspace: &str,
 ) -> Result<Option<Pulled>, String> {
     let answer = svc(peer, "snap.pack", json!({ "since": since })).await?;
-    let step = answer.get("step").and_then(Value::as_i64).unwrap_or(0);
-    let reference = answer
-        .get("ref")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let step = crate::params::i64_or(&answer, "step", 0);
+    let reference = crate::params::text(&answer, "ref");
     if step <= since || reference.is_empty() {
         return Ok(None);
     }
-    let bytes = match answer.get("handle").and_then(Value::as_str) {
+    let bytes = match crate::params::str_of(&answer, "handle") {
         Some(handle) => {
             let path = host_path(handle, workspace, guest_workspace);
             std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?
         }
         None => {
-            let body = answer
-                .get("pack")
-                .and_then(Value::as_str)
+            let body = crate::params::str_of(&answer, "pack")
                 .ok_or_else(|| "snap.pack answered without pack or handle".to_string())?;
             decode(body)?
         }

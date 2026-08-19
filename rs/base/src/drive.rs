@@ -113,11 +113,7 @@ impl Drive {
     }
 
     pub fn text(&self, key: &str) -> String {
-        self.artifact
-            .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
+        crate::params::text(&self.artifact, key)
     }
 }
 

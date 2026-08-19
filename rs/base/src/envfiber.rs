@@ -78,12 +78,8 @@ async fn serve(
                 write(&mut stream, &json!({"t": "provide", "name": service})).await?;
             }
             Some("svc") => {
-                let req = request.get("req").cloned().unwrap_or(Value::Null);
-                let method = request
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let req = crate::params::value(&request, "req");
+                let method = crate::params::text(&request, "method");
                 let answer = call(&env, &method, &cmds).await;
                 let frame = match answer {
                     Ok(result) => json!({"t": "rep", "req": req, "result": result}),

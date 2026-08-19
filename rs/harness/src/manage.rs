@@ -2,6 +2,7 @@ use crate::api::Api;
 use crate::bus::{Answer, Bus};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tenon_base::params::{str_of, text_or};
 
 /// The management tools behind the `manage` service (RFC section 6): the
 /// agent's hands on its own environment. Everything that touches the host goes
@@ -48,10 +49,7 @@ impl Manage {
                     .await
             }
             "approval.request" => {
-                let text = params
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unspecified");
+                let text = str_of(&params, "reason").unwrap_or("unspecified");
                 self.api
                     .env_call("approval.request", json!({"reason": text}))
                     .await
@@ -146,9 +144,5 @@ impl Manage {
 }
 
 fn op(params: &Value, fallback: &str) -> String {
-    params
-        .get("op")
-        .and_then(Value::as_str)
-        .unwrap_or(fallback)
-        .to_string()
+    text_or(params, "op", fallback)
 }

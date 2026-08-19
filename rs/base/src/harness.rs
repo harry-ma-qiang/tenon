@@ -71,11 +71,8 @@ pub fn spawn(
         .env("TENON_GATEWAY", gateway)
         .env("TENON_HARNESS_CONFIG", config.to_string())
         .env("TENON_RUNTIME_TOKEN", runtime_token);
-    if let Some(name) = config
-        .get("llm")
-        .and_then(|llm| llm.get("api_key_env"))
-        .and_then(Value::as_str)
-    {
+    let llm = crate::params::value(config, "llm");
+    if let Some(name) = crate::params::str_of(&llm, "api_key_env") {
         if let Ok(key) = std::env::var(name) {
             command.env(name, key);
         }

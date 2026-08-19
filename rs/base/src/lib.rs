@@ -21,6 +21,7 @@ pub mod integrity;
 pub mod lock;
 pub mod manifest;
 pub mod node;
+pub mod params;
 pub mod peer;
 pub mod privilege;
 pub mod probes;

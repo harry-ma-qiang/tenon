@@ -234,23 +234,12 @@ fn router(
 
 async fn chat(client: &llm::Client, args: Vec<Value>) -> Result<Value, String> {
     let params = args.first().cloned().unwrap_or(json!({}));
-    let messages = params
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let messages = tenon_base::params::array(&params, "messages");
     if messages.is_empty() {
         return Err("llm.chat needs messages".to_string());
     }
-    let tools = params
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let stream = params
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let tools = tenon_base::params::array(&params, "tools");
+    let stream = tenon_base::params::bool_or(&params, "stream", true);
     let request = client.request(messages, tools, stream);
     client
         .chat(&request, |_delta| {})

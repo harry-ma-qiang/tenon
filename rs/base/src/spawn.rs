@@ -95,10 +95,7 @@ impl Base {
         if self.nodes.contains_key(&child) {
             return Err(format!("env {child} already exists"));
         }
-        let ram_mb = overrides
-            .get("ram_mb")
-            .and_then(Value::as_u64)
-            .unwrap_or(self.config.envs.ram_mb);
+        let ram_mb = crate::params::u64_or(overrides, "ram_mb", self.config.envs.ram_mb);
         let overlay = self
             .home
             .write_overlay(&child, &patch(overrides))
@@ -188,7 +185,7 @@ impl Base {
     }
 
     fn child_name(&self, parent: &str, overrides: &Value) -> String {
-        if let Some(name) = overrides.get("name").and_then(Value::as_str) {
+        if let Some(name) = crate::params::str_of(overrides, "name") {
             if !name.is_empty() {
                 return name.to_string();
             }

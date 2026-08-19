@@ -3,6 +3,7 @@ use crate::config::Llm;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use tenon_base::params::i64_or;
 
 const CHUNK_FLUSH: usize = 240;
 
@@ -25,20 +26,11 @@ impl Usage {
     }
 
     fn read(value: &Value) -> Option<Usage> {
-        let object = value.as_object()?;
+        value.as_object()?;
         Some(Usage {
-            prompt: object
-                .get("prompt_tokens")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            completion: object
-                .get("completion_tokens")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            total: object
-                .get("total_tokens")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
+            prompt: i64_or(value, "prompt_tokens", 0),
+            completion: i64_or(value, "completion_tokens", 0),
+            total: i64_or(value, "total_tokens", 0),
         })
     }
 }
@@ -187,7 +179,7 @@ impl Client {
                 false => Err(Fail::Fatal(reason)),
             };
         }
-        match body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        match tenon_base::params::bool_or(body, "stream", false) {
             true => stream(response, sink).await,
             false => {
                 let value: Value = response

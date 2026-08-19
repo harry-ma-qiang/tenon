@@ -1,4 +1,5 @@
 use crate::client::Client;
+use crate::params::{array, i64_or, opt_text, str_of, text, u64_or, value};
 use anyhow::Result;
 use serde_json::{json, Value};
 use tenon_ui::{Approval, EventLine, NodeInfo, Role, StatusLine, TranscriptItem, UiModel};
@@ -48,10 +49,7 @@ impl Ui {
             let created = client
                 .call("session.create", json!({"env": self.env}))
                 .await?;
-            self.session = created
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            self.session = opt_text(&created, "session_id");
         }
         let session = self.session.clone().unwrap_or_default();
         client
@@ -97,18 +95,10 @@ pub fn build(
     model
 }
 
-fn nodes(status: &Value) -> Vec<Value> {
-    status
-        .get("nodes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
 fn tree(status: &Value) -> Vec<NodeInfo> {
-    let rows = nodes(status);
+    let rows = array(status, "nodes");
     rows.iter()
-        .filter(|row| row.get("parent").and_then(Value::as_str).is_none())
+        .filter(|row| str_of(row, "parent").is_none())
         .map(|row| node(row, &rows))
         .collect()
 }
@@ -120,32 +110,32 @@ fn node(row: &Value, rows: &[Value]) -> NodeInfo {
         false => "down",
     };
     let mut info = NodeInfo::new(name.clone(), text(row, "role"), state)
-        .with_restarts(row.get("restarts").and_then(Value::as_u64).unwrap_or(0) as u32);
+        .with_restarts(u64_or(row, "restarts", 0) as u32);
     if let Some(backend) = row.get("sandbox").and_then(|value| value.get("backend")) {
         info = info.with_sandbox(backend.as_str().unwrap_or_default().to_string());
     }
     let children: Vec<NodeInfo> = rows
         .iter()
-        .filter(|child| child.get("parent").and_then(Value::as_str) == Some(name.as_str()))
+        .filter(|child| str_of(child, "parent") == Some(name.as_str()))
         .map(|child| node(child, rows))
         .collect();
     info.with_children(children)
 }
 
 fn status_line(env: &str, status: &Value) -> StatusLine {
-    let budget = nodes(status)
+    let budget = array(status, "nodes")
         .into_iter()
-        .find(|row| row.get("env").and_then(Value::as_str) == Some(env))
+        .find(|row| str_of(row, "env") == Some(env))
         .and_then(|row| row.get("budget").cloned())
         .unwrap_or(Value::Null);
-    let killed = status.get("killed").and_then(Value::as_str);
+    let killed = str_of(status, "killed");
     let line = match killed {
         Some(reason) => Some(format!("KILL SWITCH: {reason}")),
         None => budget_line(env, &budget),
     };
     StatusLine {
-        base_pid: status.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32,
-        attached: status.get("attached").and_then(Value::as_u64).unwrap_or(0) as usize,
+        base_pid: u64_or(status, "pid", 0) as u32,
+        attached: u64_or(status, "attached", 0) as usize,
         budgets: line,
     }
 }
@@ -171,14 +161,9 @@ fn budget_line(env: &str, budget: &Value) -> Option<String> {
 }
 
 fn transcript(history: &Value) -> Vec<TranscriptItem> {
-    let rows = history
-        .get("events")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let mut items = Vec::new();
-    for row in rows {
-        let data = row.get("data").cloned().unwrap_or(Value::Null);
+    for row in array(history, "events") {
+        let data = value(&row, "data");
         match text(&row, "kind").as_str() {
             "user/message" => items.push(TranscriptItem::message(Role::User, text(&data, "text"))),
             "assistant/message" => {
@@ -201,15 +186,11 @@ fn transcript(history: &Value) -> Vec<TranscriptItem> {
 }
 
 fn event_lines(events: &Value) -> Vec<EventLine> {
-    events
-        .get("events")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+    array(events, "events")
         .iter()
         .map(|row| {
             EventLine::new(
-                row.get("at").and_then(Value::as_i64).unwrap_or(0),
+                i64_or(row, "at", 0),
                 text(row, "kind"),
                 summary(row.get("data").unwrap_or(&Value::Null)),
             )
@@ -218,11 +199,7 @@ fn event_lines(events: &Value) -> Vec<EventLine> {
 }
 
 fn approval_rows(approvals: &Value) -> Vec<Approval> {
-    approvals
-        .get("approvals")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+    array(approvals, "approvals")
         .iter()
         .map(|row| {
             Approval::new(
@@ -244,14 +221,6 @@ fn summary(data: &Value) -> String {
         true => body.chars().take(SUMMARY_CHARS).collect(),
         false => body,
     }
-}
-
-fn text(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 #[cfg(test)]

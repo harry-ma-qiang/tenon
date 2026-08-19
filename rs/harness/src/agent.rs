@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tenon_base::params::{i64_or, str_of, text, text_or};
 
 const HISTORY_LIMIT: i64 = 5_000;
 
@@ -143,15 +144,12 @@ impl Agent {
     }
 
     async fn history(&self, id: &str, params: &Value) -> Answer {
-        let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_i64)
-            .unwrap_or(HISTORY_LIMIT);
+        let after = i64_or(params, "after", 0);
+        let limit = i64_or(params, "limit", HISTORY_LIMIT);
         let events = self.log.tail(after, limit).await?;
         let rows: Vec<Value> = events
             .into_iter()
-            .filter(|event| id.is_empty() || event.data.get("session").and_then(Value::as_str) == Some(id))
+            .filter(|event| id.is_empty() || str_of(&event.data, "session") == Some(id))
             .map(|event| json!({"id": event.id, "at": event.at, "kind": event.kind, "data": event.data}))
             .collect();
         Ok(json!({"session_id": id, "count": rows.len(), "events": rows}))
@@ -168,7 +166,7 @@ impl Agent {
         let mut turns = 0u64;
         let mut user_event = 0i64;
         for event in events {
-            if event.data.get("session").and_then(Value::as_str) != Some(id) {
+            if str_of(&event.data, "session") != Some(id) {
                 continue;
             }
             match event.kind.as_str() {
@@ -187,7 +185,7 @@ impl Agent {
                 "tool/result" => messages.push(json!({
                     "role": "tool",
                     "tool_call_id": event.data.get("id").cloned().unwrap_or(json!("")),
-                    "content": event.data.get("text").and_then(Value::as_str).unwrap_or_default(),
+                    "content": text(&event.data, "text"),
                 })),
                 "turn/end" => turns += 1,
                 _ => {}
@@ -518,11 +516,7 @@ impl Agent {
             Err(_) => Value::Null,
         };
         if value.get("stop").and_then(Value::as_bool) == Some(false) {
-            let text = value
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("continue")
-                .to_string();
+            let text = text_or(&value, "text", "continue");
             let mut sessions = self.sessions.lock().expect("session lock");
             if let Some(session) = sessions.get_mut(id) {
                 session

@@ -1,4 +1,5 @@
 use crate::frame;
+use crate::params::{array, i64_or, object, opt_text, str_of, strings, text_or, u64_or, value};
 use crate::peer::Peer;
 use crate::rpc::{Cmd, NodeView};
 use serde_json::{json, Value};
@@ -66,11 +67,7 @@ fn reply(id: u64, outcome: Answer) -> Value {
 
 async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer {
     let method = frame::method(body).unwrap_or_default();
-    let env = body
-        .get("env")
-        .and_then(Value::as_str)
-        .unwrap_or(&opts.root_env)
-        .to_string();
+    let env = text_or(body, "env", &opts.root_env);
     match method {
         "node.register" => register(body, peer, cmds).await,
         "health" | "tree" | "reload" => forward(method, &env, cmds, opts).await,
@@ -79,8 +76,8 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         "session.create" | "session.prompt" | "session.status" | "session.history"
         | "session.resume" => session(method, body, &env, cmds, opts).await,
         "events.append" => {
-            let kind = string(body, "kind", "");
-            let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
+            let kind = text_or(body, "kind", "");
+            let data = object(body, "data");
             ask(cmds, |reply| Cmd::EventsAppend {
                 env,
                 kind,
@@ -90,8 +87,8 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             .await
         }
         "events.tail" => {
-            let after = body.get("after").and_then(Value::as_i64).unwrap_or(0);
-            let limit = body.get("limit").and_then(Value::as_i64).unwrap_or(500);
+            let after = i64_or(body, "after", 0);
+            let limit = i64_or(body, "limit", 500);
             ask(cmds, |reply| Cmd::EventsTail {
                 env,
                 after,
@@ -119,8 +116,8 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         }
         "config.get" => ask(cmds, |reply| Cmd::ConfigGet { env, reply }).await,
         "config.patch" => {
-            let patch = body.get("patch").cloned().unwrap_or_else(|| json!({}));
-            let target = string(body, "target", "env");
+            let patch = object(body, "patch");
+            let target = text_or(body, "target", "env");
             ask(cmds, |reply| Cmd::ConfigPatch {
                 env,
                 target,
@@ -132,7 +129,7 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         }
         "runtime.register" => {
             let params = body.clone();
-            let token = string(body, "token", "");
+            let token = text_or(body, "token", "");
             ask(cmds, |reply| Cmd::RuntimeRegister {
                 env,
                 params,
@@ -142,8 +139,8 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             .await
         }
         "approval.request" => {
-            let reason = string(body, "reason", "unspecified");
-            let kind = string(body, "kind", "agent");
+            let reason = text_or(body, "reason", "unspecified");
+            let kind = text_or(body, "kind", "agent");
             ask(cmds, |reply| Cmd::Approval {
                 env,
                 reason,
@@ -153,12 +150,10 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             .await
         }
         "approval.list" => {
-            let status = body
-                .get("status")
-                .and_then(Value::as_str)
+            let status = str_of(body, "status")
                 .filter(|status| *status != "all")
                 .map(str::to_string);
-            let limit = body.get("limit").and_then(Value::as_i64).unwrap_or(200);
+            let limit = i64_or(body, "limit", 200);
             ask(cmds, |reply| Cmd::ApprovalList {
                 status,
                 limit,
@@ -169,9 +164,9 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         "approval.answer" => {
             // `id` is the frame's own correlation id on every hop, so the
             // approval's id travels as `approval_id`, the way `plugin_id` does.
-            let id = body.get("approval_id").and_then(Value::as_i64).unwrap_or(0);
-            let decision = string(body, "decision", "approve");
-            let note = body.get("note").and_then(Value::as_str).map(str::to_string);
+            let id = i64_or(body, "approval_id", 0);
+            let decision = text_or(body, "decision", "approve");
+            let note = opt_text(body, "note");
             ask(cmds, |reply| Cmd::ApprovalAnswer {
                 id,
                 decision,
@@ -182,7 +177,7 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
         }
         "kill" | "resume" => {
             let on = method == "kill";
-            let reason = string(body, "reason", "requested over the front door");
+            let reason = text_or(body, "reason", "requested over the front door");
             ask(cmds, |reply| Cmd::Kill {
                 on,
                 reason,
@@ -195,11 +190,8 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             ask(cmds, |reply| Cmd::Reset { env, probes, reply }).await
         }
         "runtime.spawn" => {
-            let parent = body
-                .get("parent")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let overrides = body.get("overrides").cloned().unwrap_or_else(|| json!({}));
+            let parent = opt_text(body, "parent");
+            let overrides = object(body, "overrides");
             let id = peer.id();
             ask(cmds, |reply| Cmd::Spawn {
                 peer: id,
@@ -221,13 +213,13 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
             ask(cmds, |reply| Cmd::UpgradeStatus { id, reply }).await
         }
         "upgrade.list" => {
-            let env = body.get("env").and_then(Value::as_str).map(str::to_string);
-            let limit = body.get("limit").and_then(Value::as_i64).unwrap_or(50);
+            let env = opt_text(body, "env");
+            let limit = i64_or(body, "limit", 50);
             ask(cmds, |reply| Cmd::UpgradeList { env, limit, reply }).await
         }
         "snap.list" => ask(cmds, |reply| Cmd::SnapList { env, reply }).await,
         "snap.export" => {
-            let path = string(body, "path", "");
+            let path = text_or(body, "path", "");
             ask(cmds, |reply| Cmd::SnapExport {
                 env,
                 path,
@@ -255,9 +247,9 @@ async fn dispatch(body: &Value, peer: &Peer, cmds: &Cmds, opts: &Opts) -> Answer
 async fn svc(body: &Value, env: &str, cmds: &Cmds, opts: &Opts) -> Answer {
     let node = peer_of(env, cmds).await?;
     let params = json!({
-        "name": body.get("name").cloned().unwrap_or(Value::Null),
-        "method": body.get("method").cloned().unwrap_or(Value::Null),
-        "args": body.get("args").cloned().unwrap_or_else(|| json!([])),
+        "name": value(body, "name"),
+        "method": value(body, "method"),
+        "args": array(body, "args"),
     });
     node.request("svc", params, opts.timeout).await
 }
@@ -300,21 +292,9 @@ async fn session(method: &str, body: &Value, env: &str, cmds: &Cmds, opts: &Opts
 }
 
 async fn sandbox_exec(body: &Value, env: String, cmds: &Cmds) -> Answer {
-    let cmd = string(body, "cmd", "");
-    let args = body
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let timeout_ms = body
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .unwrap_or(30_000);
+    let cmd = text_or(body, "cmd", "");
+    let args = strings(body, "args");
+    let timeout_ms = u64_or(body, "timeout", 30_000);
     ask(cmds, |reply| Cmd::SandboxExec {
         env,
         cmd,
@@ -326,10 +306,10 @@ async fn sandbox_exec(body: &Value, env: String, cmds: &Cmds) -> Answer {
 }
 
 async fn register(body: &Value, peer: &Peer, cmds: &Cmds) -> Answer {
-    let role = string(body, "role", "agent");
-    let env = string(body, "env", "root");
-    let pid = body.get("pid").and_then(Value::as_i64).unwrap_or(0);
-    let token = string(body, "token", "");
+    let role = text_or(body, "role", "agent");
+    let env = text_or(body, "env", "root");
+    let pid = i64_or(body, "pid", 0);
+    let token = text_or(body, "token", "");
     ask(cmds, |reply| Cmd::Register {
         peer: peer.clone(),
         role,
@@ -396,7 +376,7 @@ async fn subscribe(peer: &Peer, body: &Value, cmds: &Cmds) -> Answer {
     let (tx, rx) = oneshot::channel();
     cmds.send(Cmd::Subscribe {
         peer: peer.clone(),
-        env: body.get("env").and_then(Value::as_str).map(str::to_string),
+        env: opt_text(body, "env"),
         reply: tx,
     })
     .map_err(|_| "base_gone".to_string())?;
@@ -422,22 +402,4 @@ where
     let (tx, rx) = oneshot::channel();
     cmds.send(build(tx)).map_err(|_| "base_gone".to_string())?;
     rx.await.map_err(|_| "base_gone".to_string())?
-}
-
-fn strings(body: &Value, key: &str) -> Vec<String> {
-    body.get(key)
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| row.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn string(body: &Value, key: &str, fallback: &str) -> String {
-    body.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or(fallback)
-        .to_string()
 }
