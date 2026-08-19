@@ -13,6 +13,9 @@ a fiber dies, cleanly or violently, nothing it registered survives it.
 
 Design reference: Cordis (MIT), see NOTICE. Decisions, phase plans and status: `NOTES.md`.
 
+Status: P3.0-3.8 landed and independently QA'd (2026-08-19) - gates, e2e (real model,
+CLI + HTTP), and a Tenon-native vs DSH performance comparison. See `REVIEW-P3.md`.
+
 ## Layout
 
 | Path | What | Language |
