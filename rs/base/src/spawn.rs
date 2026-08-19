@@ -2,7 +2,7 @@ use crate::base::Base;
 use crate::envfiber;
 use crate::node::GUARDIAN;
 use crate::rpc::Cmd;
-use crate::state::{Node, WorkerState};
+use crate::state::Node;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -183,32 +183,7 @@ impl Base {
     fn stage_child(&mut self, child: &str, parent: &str, depth: u32, profile: String, ram_mb: u64) {
         self.nodes.insert(
             child.to_string(),
-            Node {
-                role: "agent".to_string(),
-                pid: None,
-                generation: 0,
-                registered: false,
-                restarts: 0,
-                peer: None,
-                sandbox: None,
-                exited: None,
-                token: String::new(),
-                runtime_token: String::new(),
-                parent: Some(parent.to_string()),
-                depth,
-                profile,
-                ram_mb,
-                worker: WorkerState::Off,
-                harness: crate::harness::State::Off,
-                harness_pid: None,
-                harness_restarts: 0,
-                harness_exited: None,
-                store: None,
-                fiber: None,
-                ticker: None,
-                restore: Vec::new(),
-                budget: crate::budget::Budget::default(),
-            },
+            Node::staged("agent", Some(parent.to_string()), depth, profile, ram_mb),
         );
     }
 

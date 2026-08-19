@@ -125,6 +125,25 @@ impl Base {
                 let outcome = self.runtime_stop(&env).await;
                 let _ = reply.send(outcome);
             }
+            Cmd::UpgradePropose { .. }
+            | Cmd::UpgradeStatus { .. }
+            | Cmd::UpgradeList { .. }
+            | Cmd::UpgradeApproved { .. }
+            | Cmd::UpgradePhase { .. }
+            | Cmd::UpgradeWorker { .. }
+            | Cmd::KernelSwitch { .. }
+            | Cmd::KernelReady { .. } => self.on_upgrade_cmd(cmd),
+            Cmd::UpgradeBench {
+                env,
+                label,
+                id,
+                row,
+                lkg,
+                reply,
+            } => {
+                let _ = reply.send(self.upgrade_bench(&env, &label, id, row, lkg));
+            }
+            Cmd::KernelDrain { env } => self.kernel_drain(&env).await,
             Cmd::Restored { env, result, error } => self.restored(&env, result, error),
             Cmd::EnvStatus { env, reply } => {
                 let _ = reply.send(self.env_status(&env));

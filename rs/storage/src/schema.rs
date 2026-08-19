@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 
 const VERSION_TABLE: &str = "
 create table if not exists schema_version (
@@ -104,7 +104,36 @@ create table if not exists approvals (
 );
 ";
 
-const STEPS: &[(i64, &str)] = &[(1, V1), (2, V2)];
+const V3: &str = "
+create table if not exists upgrades (
+  id integer primary key autoincrement,
+  env text not null,
+  target text not null,
+  status text not null,
+  artifact text not null,
+  notes text not null default '',
+  reason text,
+  phases text not null default '[]',
+  created_at integer not null,
+  updated_at integer not null
+);
+create index if not exists upgrades_env on upgrades (env);
+create table if not exists benchmarks (
+  id integer primary key autoincrement,
+  env text not null,
+  label text not null,
+  upgrade_id integer,
+  tasks integer not null,
+  passed integer not null,
+  success_rate real not null,
+  cost integer not null,
+  lkg integer not null default 0,
+  created_at integer not null
+);
+create index if not exists benchmarks_env on benchmarks (env, label);
+";
+
+const STEPS: &[(i64, &str)] = &[(1, V1), (2, V2), (3, V3)];
 
 /// Forward only: every state file carries the highest version it has been
 /// migrated to, and a file written before `schema_version` existed reports 0

@@ -101,6 +101,16 @@ defmodule Tenon.Beam.Link.Handlers do
     end)
   end
 
+  # Which fiber provides a service name, which is what a change protocol needs
+  # before it can unmount the plugin it is replacing: a socket fiber's id is the
+  # gateway's connection id, not anything the caller chose.
+  defp run_plugin("owner", kernel, frame) do
+    name = Map.get(frame, "name", "")
+    fiber = owner(kernel, name)
+    id = if fiber, do: id_of(:tenon.tree(kernel), fiber), else: nil
+    %{"ok" => true, "name" => name, "id" => id, "fiber" => fiber && inspect(fiber)}
+  end
+
   defp run_plugin(op, kernel, frame) when op in ["unmount", "restart"] do
     id = to_string(Map.get(frame, "plugin_id", ""))
 
@@ -123,6 +133,28 @@ defmodule Tenon.Beam.Link.Handlers do
   defp act("restart", fiber, id) do
     :tenon.restart(fiber)
     %{"ok" => true, "id" => id, "op" => "restart", "status" => status(fiber)}
+  end
+
+  defp owner(_kernel, ""), do: nil
+
+  defp owner(kernel, name) do
+    table = kernel |> :tenon.root() |> Map.get(:tabs, %{}) |> Map.get(:services)
+
+    case table && :ets.lookup(table, String.to_atom(name)) do
+      [row | _rest] -> elem(row, 2)
+      _other -> nil
+    end
+  rescue
+    _error -> nil
+  end
+
+  defp id_of(nil, _fiber), do: nil
+
+  defp id_of(node, fiber) do
+    case Map.get(node, :pid) == fiber do
+      true -> to_string(Frame.jsonable(Map.get(node, :id)))
+      false -> Enum.find_value(Map.get(node, :children, []), &id_of(&1, fiber))
+    end
   end
 
   defp put_config(spec, nil), do: spec
