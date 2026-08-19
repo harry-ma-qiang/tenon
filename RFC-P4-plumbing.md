@@ -118,11 +118,28 @@ Envelope has `host` + `origin`; `bus.bridge{peer}` reserved (unsupported); ids h
   appends; `worker/step`, `budget.*`, `guardian.*`, `upgrade.phase` become plain topics.
 - UI (rs/ui carriers): 100% subscription-driven (decided) with coalesce + latest_only; the status
   RPC remains only for `tenon status` one-shots. Multi-terminal attach uses ControlLease.
-- serve --http optional hardening seams (not critical, feature-gated, off by default): TLS via
-  rustls + rcgen self-signed for dev (`--https --cert --key`); auth layer 1 = bearer token
-  (`TENON_AUTH_TOKEN`, ~20 lines); production guidance = reverse proxy (Caddy/Tailscale) or JWT
-  header pass-through. Documented seams only; not in the P4 gates.
+- serve --http hardening, IN P4 scope (feature-gated, off by default): `tenon serve --https
+  [--cert PEM --key PEM]` via rustls; no cert given -> rcgen generates an in-memory self-signed cert
+  (dev mode, fingerprint printed); auth = bearer token (`TENON_AUTH_TOKEN` or `--auth-token`,
+  checked on every HTTP/WS/SSE request; constant-time compare); production guidance = reverse proxy
+  (Caddy/Tailscale) or JWT header pass-through (documented seam only).
 - kernel, loader, sandbox, sdk wire: unchanged. Kernel stays frozen.
+
+## 8b. Media and mobile seams (documented now, plugins later)
+
+Control plane on the bus, media plane by handle — streaming is the streaming case of the existing
+bulk-data rule. Signaling topics (`media/offer|accept|stop`, non-durable fast path); negotiated media
+runs plugin-to-plugin: same host = UDS/shared-memory + fd passing (already used for PTY), remote or
+browser = WebRTC (RTP/Opus/VP8) or binary WS. A `media` plugin (or the Bruno sidecar) owns
+devices/codecs and registers capabilities in kv; native-audio models connect the media channel
+directly to the provider endpoint while the harness only initiates and logs events. The frame cap
+keeps streams off the bus by construction.
+
+Mobile: the App is just another subscriber — same RPC + SSE (WS bridge ~150 lines later); log = truth
++ `since_offset` replay is the sync protocol (reconnect pulls the delta, nothing durable is lost);
+`latest_only` topics for light state; one env per user/device for tenancy, budgets and approvals; a
+`notify` plugin (APNs/FCM) subscribes to the bus; thin device SDKs (~200 lines Swift/Kotlin) mirror
+sdk/py/ts/rs. All L2 plugins; no architecture change.
 
 ## 9. Plan
 
@@ -132,7 +149,8 @@ Envelope has `host` + `origin`; `bus.bridge{peer}` reserved (unsupported); ids h
 | P4.1 | migration: harness/worker/guardian/UI/CLI onto the facades; delete legacy RPC families; Elixir Logger/telemetry bridge | net LoC reduction in base recorded; all suites green; UI runs on subscribe (no polls) |
 | P4.2 | query hot layer: typed `query.text/scan`, FTS5 over durable topics, composite indexes, retention window config | text < 10 ms and scan < 100 ms at 1M events (bench in tests) |
 | P4.3 | warm segments: compactor to Parquet + Tantivy (vector stub), fan-out merge, version-gated rebuild, `derived/` lifecycle | 10M-event budgets of section 5; rebuild-from-log test |
-| P4.4 | docs + REVIEW-P4 (perf tables incl. UI latency), NOTES update | all gates; secret scan; no leftover containers |
+| P4.4 | `--https` (rustls + rcgen dev self-signed) + bearer auth on serve, feature-gated | curl over https with the printed fingerprint works; requests without the token are 401; feature off = binary unchanged |
+| P4.5 | docs + REVIEW-P4 (perf tables incl. UI latency), NOTES update | all gates; secret scan; no leftover containers |
 
 LoC estimate: bus 0.8-1k, kv 0.4k, blob facade 0.1k, query hot 0.5k, warm compactor 0.8-1k, minus
 ~0.5-0.8k deleted legacy RPC/plumbing = net ~+2k Rust for the whole of P4, tests separate. Crates:
