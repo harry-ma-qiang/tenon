@@ -13,7 +13,7 @@ query facade (numeric scan/aggregate + full-text now, vector-ready) whose speed 
 volume grows; the fewest host files; cluster-ready seams at zero single-host cost; smaller LoC by
 deleting the ad-hoc RPC families P3 accumulated.
 
-Non-goals (explicitly): no broker process (no Kafka/NATS/Redis/zenoh now); no cross-network
+Non-goals (explicitly): MCP is an adapter plugin (P4.7), never a facade; no broker process (no Kafka/NATS/Redis/zenoh now); no cross-network
 exactly-once; no Raft yet; no SQL exposure; no embedding model (interface only).
 
 ## 1. Lessons folded in
@@ -178,7 +178,8 @@ backups) — not built now.
 | P4.3 | warm segments: compactor to Parquet + Tantivy (vector stub), fan-out merge, version-gated rebuild, `derived/` lifecycle | 10M-event budgets of section 5; rebuild-from-log test |
 | P4.4 | `--https` (rustls + rcgen dev self-signed) + bearer auth on serve, feature-gated; WebSocket as the 5th wire carrier (tokio-tungstenite, same feature): `/ws` on serve (RPC + subscribe over WS text frames, binary frames reserved for media chunks) and WS accept on the gateway (`TENON_GATEWAY` gains `ws:`; each connection mounts as a fiber — lets browser extensions such as the vibe-browse Chrome bridge register as plugins without a python side-server) | curl over https works; no token = 401; a WS client subscribes and receives coalesced envelopes; a WS client speaks hello/provide and its svc answers through the kernel; feature off = binary unchanged |
 | P4.5 | ingress (section 8c): `ingress.register/list`, kv lease routes, `/app/<name>/*` proxy incl. WS pass-through, quotas | an app started inside the sandbox registers and is reachable through https with the token; killing the app expires the route; a second env cannot claim the same name |
-| P4.6 | docs + REVIEW-P4 (perf tables incl. UI latency), NOTES update | all gates; secret scan; no leftover containers |
+| P4.7 | MCP bridge plugin, both directions: client (spawn/connect an MCP server, `tools/list` registered into the tools bus under single authority, `tools/call` forwarded; guard/budget/approval hooks apply to bridged tools) and server (expose worker + management tools over MCP stdio and streamable HTTP on serve, token-authenticated, gated tools go through approvals) | an external MCP server's tool is callable by the model through our loop and is denied by a guard hook; Claude Code connects to Tenon-as-MCP-server and runs bash in the sandbox |
+| P4.8 | docs + REVIEW-P4 (perf tables incl. UI latency), NOTES update | all gates; secret scan; no leftover containers |
 
 LoC estimate: bus 0.8-1k, kv 0.4k, blob facade 0.1k, query hot 0.5k, warm compactor 0.8-1k, minus
 ~0.5-0.8k deleted legacy RPC/plumbing = net ~+2k Rust for the whole of P4, tests separate. Crates:
