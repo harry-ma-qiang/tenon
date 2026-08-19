@@ -46,6 +46,18 @@ pub async fn task(
             Ok(Ok(None)) => bail!("base closed the connection"),
             Ok(Err(error)) => return Err(error),
         };
+        match event["kind"].as_str().unwrap_or_default() {
+            "budget.exceeded" | "kill.switch" => {
+                eprintln!(
+                    "tenon run: halted: {}",
+                    event["data"]["reason"]
+                        .as_str()
+                        .unwrap_or("no reason given")
+                );
+                return Ok(1);
+            }
+            _ => {}
+        }
         if event["data"]["session"] != json!(session) {
             continue;
         }
