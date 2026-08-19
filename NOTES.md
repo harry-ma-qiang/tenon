@@ -1267,3 +1267,140 @@ that are pure host bookkeeping.
 
 P3.6: the krun backend on a Mac and on CI, and the release CI that produces the single `tenon`
 binary with the BEAM payload embedded.
+
+## 27. P3.6 result: the krun backend, and one file to ship (2026-08-19)
+
+The phase where the barebone stops needing a checkout. Two deliverables that share nothing
+technically and everything in intent: a VM backend for machines that have a hypervisor, and a
+single binary for machines that have nothing at all.
+
+### Lines
+
+Rust: +~1.1k (`sandbox/krun/mod.rs` 477, `image.rs` 258, `vmm.rs` 183, `ffi.rs` 147, plus the
+two trait methods and their wiring through base), tests +11 unit +1 conformance. Shell: +150
+(`scripts/build-release.sh`, `scripts/krun-smoke.sh`). YAML: +230 (two workflows).
+
+### A backend you cannot run is still a backend you can be precise about
+
+This box has no `/dev/kvm` and no libkrun, and the RFC says so up front. What that changes is
+the standard of proof, not the standard of work: everything that does not need a hypervisor is
+tested here, and the one thing that does prints why it did not run.
+
+`detect()` now answers with both halves at once —
+`krun unavailable: /dev/kvm absent (no hardware virtualisation on this host); libkrun not found
+(tried libkrun.so.1, libkrun.so): ...` — because a person reading a skip line wants to know
+what to install, and "krun unavailable" alone tells them nothing. A unit test asserts the
+reason mentions whichever half actually failed on the machine running the test, so it stays
+true on a Mac too.
+
+The rest is ordinary code with an unusual amount of care per line: the VMM config round-trips
+through the file the child process reads, the guest argv and environment are asserted field by
+field, the per-env gateway port is asserted stable and inside its span, and the two ways to
+name an image (a name under `<home>/images`, an absolute rootfs path) each have a test that
+checks the *error* names the command that fixes it.
+
+### `libkrun-sys` was the wrong reuse
+
+The RFC's reuse list said `libkrun-sys`. That is a build-time link dependency, and it would
+have made `tenon` unbuildable on any machine without libkrun headers — including this one, and
+including every CI runner — to gain a backend that is unavailable on most of them. `dlopen`
+through `libloading` moves the entire question to first use, where the answer is already a
+string the detection prints. The cost is a symbol table written by hand against libkrun 1.9's
+`krun.h`, nine required entry points and five optional ones, each optional one worth exactly
+one feature when it is missing.
+
+The second-order effect is the one worth remembering: this is why the shipped binary is
+glibc-dynamic. A static musl build works here (2.5 minutes, `musl-tools` + `musl-dev`, rusqlite
+bundled, reqwest on rustls, git2 against musl-gcc) — and a fully static binary has no dynamic
+loader, so it can never `dlopen` libkrun. One backend's implementation strategy decided the
+libc of the release.
+
+### There is no exec into a microVM
+
+The oci backend launches the worker with `sh -c "... nohup tenon worker ... &"`. libkrun has no
+equivalent: it starts one process and that process *is* the guest. So the worker becomes the
+guest init via `krun_set_exec`, and two seams opened in the trait to make that base's business
+rather than a special case:
+
+- `Instance::start_worker(env, gateway) -> bool`. Default `false` — oci and landlock keep their
+  launch line. `true` means the backend took the job and base must not try again.
+- `Sandbox::gateway_address(env, default) -> Option<String>`. Default `None`. krun answers
+  `tcp:127.0.0.1:<stable per-env port>`, and node A, the harness and the worker are all handed
+  that one string instead of the per-env unix socket, because a host socket path is not
+  something a guest has. Under TSI the guest's connect reaches the host's loopback.
+
+Both defaults mean nothing about the two working backends changed, which is what let the whole
+suite stay green while a third backend appeared underneath it.
+
+Timing is the part a container hides. Base waits for the gateway before starting the worker;
+for a unix gateway that wait is a file appearing, for a tcp gateway there is no file, so it is
+now a connect that succeeds. It matters more for the VM: the guest gets exactly one chance to
+dial, at boot, and the boot is the launch.
+
+### What is not wired, and said so
+
+`runtime.spawn` under krun. A child env is mounted as an external fiber by base dialing the
+*parent's* gateway, and that dial is a `UnixStream`. Teaching `envfiber` the tcp carrier is
+small and belongs with P3.7's transport cleanup; claiming child environments work under krun
+without having run one would not.
+
+### One file, and the one check that proves it
+
+`scripts/build-release.sh`: `MIX_ENV=prod mix release`, tar, `TENON_RELEASE_TAR=... cargo build
+--release`, `dist/tenon-<os>-<arch>` plus `.sha256`. 77 MB here.
+
+`--verify` is the deliverable, not the build. It starts the produced binary in a throwaway
+`TENON_HOME` with **no** `--release-dir` and no `TENON_RELEASE_DIR`, so the embedded payload is
+the only way it can find a BEAM release at all; waits for that env's harness to report `ready`;
+runs one `tenon run` turn against an OpenAI-compatible endpoint when `TENON_VERIFY_BASE_URL`
+names one; and stops. Verified here against a 40-line fake model: base + guardian + root env +
+oci sandbox + worker + harness up in ~35 s from a fresh `/tmp` home, `tenon run` answered
+`pong`, `tenon stop` clean, no container and no home left behind.
+
+The first two attempts failed and both failures were the script's, not the binary's: `run`
+straight after `start` is an error rather than a wait (the harness comes up last), and the
+readiness grep looked at two lines when serde_json sorts `pid`, `restarts`, `state`
+alphabetically and puts the answer on the fourth. Worth recording because the same mistake is
+available to anyone scripting against `tenon status`.
+
+### CI is written, not run
+
+`.github/workflows/ci.yml` — beam gates, a rust job (build, clippy, fmt, unit tests and the
+sandbox conformance, none of which need an engine), a separate podman job for the
+container-heavy gates with the adversarial suite on its own thread and a leaked-container check
+that fails the job, and a secret-scan job running `scripts/scan-secrets.sh range` over the
+pushed range. `release.yml` — a `v*` tag builds linux-x86_64, linux-aarch64 and macos-arm64
+through `build-release.sh --verify` and uploads each binary with its checksum, plus a krun
+conformance job that reports the reason and passes on a runner without a hypervisor or without
+libkrun, which is what a stock `ubuntu-latest` is.
+
+Both files parse as YAML and every command in them is one this box runs by hand. GitHub Actions
+has never executed them, and the first tag will be the first real test.
+
+### Gates
+
+`cargo build --release`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo fmt --check` clean. `TENON_RELEASE_DIR=... cargo test --all-features`: 152 green plus
+the 11 new krun unit tests and the krun conformance skip — the adversarial suite run on its own
+(20/20 in 213 s) and the gate binaries run individually as `rs/README.md` prescribes. The
+release verification above, twice (once to find the script's own bugs, once clean).
+`podman ps -a --filter label=tenon.home` empty afterwards. The krun conformance run prints
+`skipping krun: krun unavailable: /dev/kvm absent (no hardware virtualisation on this host);
+libkrun not found (tried libkrun.so.1, libkrun.so): libkrun.so: dlopen failed` and passes.
+
+### Deviations
+
+1. `dlopen` instead of `libkrun-sys`, and therefore a glibc-dynamic release.
+2. A krun instance has no `exec`; `sandbox.exec` against one returns the reason.
+3. The gateway address became a backend decision (`Sandbox::gateway_address`).
+4. `runtime.spawn` is oci/landlock only in P3.6.
+5. `tenon sandbox image pull` is a local command like `rollback`: a root filesystem is a
+   human's input to a boot, never something a boot fetches.
+6. The krun conformance test skips on three separate reasons and prints each one.
+7. CI is validated as YAML and by hand, not by having run.
+
+### Next
+
+P3.7: the change protocol and blue/green kernels, `tenon check kernel`, the worker as a
+replaceable plugin, the benchmark gate — and the two small debts this phase named, `envfiber`
+over tcp and the musl shape as a second release matrix entry.
