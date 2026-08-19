@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tenon.base</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@TENON_BIN@</string>
+    <string>start</string>
+    <string>--foreground</string>
+    <string>--home</string>
+    <string>@TENON_HOME@</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TENON_HOME</key>
+    <string>@TENON_HOME@</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>2</integer>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <key>WorkingDirectory</key>
+  <string>@TENON_HOME@</string>
+  <key>StandardOutPath</key>
+  <string>@TENON_HOME@/run/base.log</string>
+  <key>StandardErrorPath</key>
+  <string>@TENON_HOME@/run/base.log</string>
+</dict>
+</plist>

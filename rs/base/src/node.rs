@@ -52,11 +52,13 @@ pub fn spec(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     spec: &Spec,
     config: &Config,
     home: &Home,
     release: &Path,
+    privilege: &crate::privilege::Plan,
     generation: u64,
     exits: mpsc::UnboundedSender<Exit>,
 ) -> Result<Running> {
@@ -99,6 +101,9 @@ pub fn spawn(
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .kill_on_drop(false);
+    if spec.role != GUARDIAN {
+        crate::privilege::apply(&mut command, privilege);
+    }
 
     let mut child = command
         .spawn()

@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+/// A worker that does not answer in this long is not worth holding a shutdown for.
+const FLUSH: Duration = Duration::from_secs(5);
+
 impl Base {
     pub fn worker_boot(&mut self, env: &str) {
         let Some(node) = self.nodes.get_mut(env) else {
@@ -103,6 +106,54 @@ impl Base {
             };
             answer(reply, result);
         });
+    }
+
+    /// The last thing base does before it takes the envs down: ask every live
+    /// worker for what it has committed since the last stored pack and store
+    /// it, then checkpoint every state file. Detaching with `--exit-on-detach`
+    /// must not cost a step the workspace already committed.
+    pub async fn flush_envs(&mut self) {
+        let envs: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role != crate::node::GUARDIAN && matches!(node.worker, WorkerState::Ready(_))
+            })
+            .map(|(env, _)| env.clone())
+            .collect();
+        for env in envs {
+            let Some(node) = self.nodes.get(&env) else {
+                continue;
+            };
+            let (Some(peer), Some(instance)) = (node.peer.clone(), node.sandbox.clone()) else {
+                continue;
+            };
+            let since = node
+                .store
+                .as_ref()
+                .and_then(|store| store.last_pack_step().ok())
+                .unwrap_or(0);
+            let workspace = self.home.workspace_dir(&env);
+            let guest = instance.workspace_path();
+            let pulled =
+                tokio::time::timeout(FLUSH, worker::pull(&peer, since, &workspace, &guest)).await;
+            match pulled {
+                Ok(Ok(Some(pulled))) => {
+                    self.snap_packed(&env, pulled.step, &pulled.reference, &pulled.bytes)
+                }
+                Ok(Err(error)) => {
+                    self.emit("snap.flush_failed", Some(&env), json!({"error": error}))
+                }
+                Err(_) => self.emit("snap.flush_failed", Some(&env), json!({"error": "timeout"})),
+                Ok(Ok(None)) => {}
+            }
+        }
+        self.emit("base.flush", None, json!({"ok": true}));
+        for node in self.nodes.values() {
+            if let Some(store) = node.store.as_ref() {
+                let _ = store.checkpoint();
+            }
+        }
     }
 
     pub fn snap_list(&self, env: &str) -> Result<Value, String> {

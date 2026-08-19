@@ -77,6 +77,15 @@ enum Command {
         #[arg(long)]
         lkg: bool,
     },
+    /// Write (and on Linux enable) the OS service unit for this binary and home
+    InstallService {
+        /// The only supported scope: a user unit, never a system one
+        #[arg(long)]
+        user: bool,
+        /// Print the unit instead of writing it
+        #[arg(long)]
+        print: bool,
+    },
     /// Restore the last known good config, profiles and state copy
     Rollback {
         /// Restore even though the LKG manifest does not match what is on disk
@@ -210,6 +219,13 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             false => tenon_base::rpc(home, "status", json!({})).await,
         },
         Command::Rollback { force } => tenon_base::rollback(home, force).await,
+        Command::InstallService { user, print } => match user || print {
+            true => tenon_base::service::install(home, print),
+            false => {
+                eprintln!("tenon: install-service needs --user (system units are not written)");
+                Ok(1)
+            }
+        },
         Command::Run { task, env, timeout } => {
             tenon_base::run::task(home, env, task, std::time::Duration::from_secs(timeout)).await
         }

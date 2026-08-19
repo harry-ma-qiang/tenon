@@ -41,11 +41,13 @@ pub struct Running {
 /// spawns it once that env's worker has answered, hands it the env's profile
 /// overlay as JSON and the gateway address to register itself on, and never
 /// lets it see anything of another env.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     home: &Home,
     env: &str,
     config: &Value,
     runtime_token: &str,
+    privilege: &crate::privilege::Plan,
     generation: u64,
     exits: mpsc::UnboundedSender<Cmd>,
 ) -> Result<Running> {
@@ -82,6 +84,7 @@ pub fn spawn(
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .kill_on_drop(false);
+    crate::privilege::apply(&mut command, privilege);
     let mut child = command.spawn().context("start the harness")?;
     let pid = child.id().context("harness has no pid")? as i32;
     let (tx, rx) = oneshot::channel();
@@ -173,6 +176,7 @@ impl Base {
             env,
             &config,
             &runtime_token,
+            &self.privilege,
             generation,
             self.cmds.clone(),
         ) {

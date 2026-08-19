@@ -45,3 +45,7 @@ tokio = { version = "1", features = [
 
 [profile.release]
 strip = true
+# Base runs no user code and supervises everything else; a panic in it is a bug,
+# not a condition to unwind out of. `cargo test` uses the dev profile, so the
+# test harness still unwinds.
+panic = "abort"
