@@ -1936,3 +1936,83 @@ count, index rebuild reproduces from the log, env-scope A≠B), storage_gate, ha
 bus_gate 6, bus_adversarial 11, guardian_gate, ui_gate, boot 8 — all pass. `MIX_ENV=prod mix release`
 rebuilt for the probe repoint. `podman ps -a --filter label=tenon.home` shows only the live demo
 `tenon.base=647207`; no test containers leaked.
+
+## P4.4 result — serve hardening: one authorizer, https, the WS carrier, secrets (2026-08-20)
+
+P4.3 (warm segments) skipped for now. Everything here is behind the `http` cargo feature, off by
+default; the default binary pulls no TLS/WS/secrets dependency and its compiled behaviour is
+unchanged. Four commits.
+
+### One authorizer (RFC 8d.1)
+
+`base::auth::authorize(carrier, request, auth) -> Result<Scope, Reject>` in `rs/base/src/auth.rs` is
+the only place the bearer-token check lives, for every serve carrier (`Carrier::{Http, Ws, Sse}`);
+adding a route never adds an auth path. Token from `--auth-token`/`TENON_AUTH_TOKEN`, constant-time
+compare, required on every request (from `Authorization: Bearer` or `?token=`) unless the surface is
+`--public`. The two local carriers keep P3's authorizer, recorded in the same enum: base UDS =
+peer/runtime-token (`auth.scope` → `Conn::scoped_env`, the one 8d.2 env-scope gate), gateway =
+connection→env by socket location. `serve --http` now refuses to start with neither a token nor
+`--public` (deviation; `--https` may still start tokenless for a local look).
+
+### TLS (rustls + rcgen)
+
+`serve --https [--cert PEM --key PEM]`, rustls with the ring provider, one request handler generic
+over the stream so plaintext and TLS share it. No cert → rcgen mints an in-memory self-signed cert
+and prints its SHA-256 fingerprint for `curl --cacert`/`-k`. Localhost only; SSO stays a seam.
+
+### WebSocket — the 5th wire carrier, same frames, no new protocol
+
+- **serve `/ws`:** bearer-authorized upgrade, then a transparent bridge to base's own front door —
+  each text frame is one front-door request or a pushed `t:"ev"` envelope, so every RPC and
+  `bus.subscribe` stream ride the exact UDS shapes. Binary frames reserved for media (accept+ignore).
+- **gateway `ws:`:** `TENON_GATEWAY` gains `ws:`; each connection mounts as a kernel socket-fiber
+  exactly like tcp/unix, so a browser extension registers as a plugin without a python side-server.
+  The kernel stays frozen: the beam handler bridges the browser socket to a loopback socket-pair
+  whose other end is the real `{packet,4}` socket the kernel mounts. The subtle bug found and fixed:
+  `:tenon.mount`'s `status` blocks until the plugin's hello/load/rep handshake completes, so the
+  bridge loop must run **concurrently** with the mount (own the browser+outer sockets in a spawned
+  process, transfer via `controlling_process`, then call mount). A prime-then-mount attempt
+  deadlocked because load→rep also needs the loop.
+- **SDK:** `sdk/py/tenon.py` gained a stdlib-only `ws:` transport (RFC 6455 client handshake + masked
+  text frames). Proven end to end: a python plugin over `ws:` answered a `svc` through the real
+  kernel (cross-language smoke).
+
+### secrets facade + mask|block (RFC 8d.4)
+
+`secret.set{name, value, leak: mask|block, grants?}` / `secret.get{name}` (grant-checked) /
+`secret.list` (names+policy+grants, never a value). Values live only in base's `secrets.yml`
+(0600), never in an env's state file, never in an envelope. **The Hub is the single leak choke
+point:** base pushes value+policy into the hub, and before any fan-out or persistence the hub scans
+payloads — `mask` rewrites the value to `***<name>***`, `block` refuses the publish and fans out a
+value-free `guardian/violation`. Base's own event-log append calls the same one hub scrub before it
+writes, so the state file never holds a raw value either.
+
+### Tests
+
+`serve_https_gate.rs` (curl over https with `-k`, no/wrong token → 401, valid token GET / →
+`<pre>` UI with env name, POST /prompt drives a fake-model turn), `ws_gate.rs` (a tokio-tungstenite
+client subscribes over `/ws` and receives a coalesced envelope; an unauthenticated upgrade is
+refused), `secrets_gate.rs` (mask → subscriber sees `***api***`; block → publish refused + violation;
+a scoped env not granted cannot `secret.get`; the value never appears in the durable log). The
+gateway `ws:` end-to-end (hello/provide → svc through the kernel) lives in `beam/test/
+gateway_ws_test.exs` (2), which exercises the real kernel more directly than a cross-process Rust
+harness could. All existing gates stay green.
+
+### LoC (new files)
+
+| Area | files | lines |
+|---|---|---:|
+| authorizer + tls + ws + secrets (rs) | auth.rs, tls.rs, ws.rs, base/secret.rs, bus/secret.rs | 635 |
+| serve rewrite (http.rs) | +148 / -22 | — |
+| hub leak guard + wiring | hub.rs +60, base.rs/bus.rs/server.rs/facaderpc.rs/home.rs/lib.rs | ~41 |
+| beam ws carrier | gateway/web_socket.ex | 223 |
+| tests (rs gates + beam) | 3 gates + gateway_ws_test | 479 + 143 |
+
+### Deviation: feature-off byte-identity
+
+Feature-off adds no dependency and no compiled-behaviour change (proven: `tenon-base`'s default
+dependency tree has no tungstenite/rcgen/tokio-rustls, and no shared crate version moved in the
+lock). The stripped release binary is *not* literally byte-identical, though: it carries a ~147-byte
+difference in one region — rustc's crate-metadata/symbol hash, which the four gated `pub mod http-*`
+declarations feed even when cfg-stripped. Same size, one localized region, metadata not code.
+Reported honestly rather than claimed away.
