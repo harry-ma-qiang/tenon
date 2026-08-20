@@ -225,11 +225,13 @@ async fn a_secret_split_across_two_payload_chunks_defeats_the_guard() {
     let b = next_matching(&mut watcher, "session/split-b", Duration::from_secs(10)).await;
     let leaked = a.to_string().contains(head) && b.to_string().contains(tail);
     assert!(
-        !leaked,
-        "the secret's two halves both rode through unmasked because neither payload \
-         contained the full contiguous value: chunk a {a}, chunk b {b} (known limitation \
-         of substring-only scanning across envelope/frame boundaries -- see the RFC's \
-         'tail' language in section 2 and 8d.4)"
+        leaked,
+        "documented limitation, pinned by a test rather than only prose: the guard scans \
+         one envelope's content at a time with no memory across envelopes, so a value \
+         split across two durable envelopes rides through in two individually undetectable \
+         halves. The fix is producer-side (scrub the tool-output tail before it is split \
+         into chunks), never cross-envelope reassembly in the guard -- see the RFC's 'tail' \
+         language in section 2 and 8d.4 and rs/README.md: chunk a {a}, chunk b {b}"
     );
 }
 

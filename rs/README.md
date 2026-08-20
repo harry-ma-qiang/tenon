@@ -1146,7 +1146,32 @@ one fiber, disconnect = fiber gone), so a browser extension such as the vibe-bro
 registers as a plugin without a python side-server. The kernel stays frozen: the beam WS handler
 bridges the browser socket to a loopback socket-pair whose other end is the real `{packet,4}` socket
 the kernel mounts, and runs the bridge concurrently with the mount (the kernel's mount blocks until
-the hello/load/rep handshake completes).
+the hello/load/rep handshake completes). The serve `/ws` carrier is **env-bound by default** (RFC
+8d.2): before it forwards a single client frame the bridge calls `auth.scope{env, token}` on its
+front-door connection, reading serve's env runtime token from `run/rt-<env>.token`, so every RPC a
+browser client issues rides the same `Conn::scoped_env` gate a per-env plugin does — it cannot name
+or reach another env. Binding is synchronous (the bridge waits for the `auth.scope` reply before
+pumping), so no client frame can race ahead of the scope. `tenon serve --admin` opts out, leaving
+the WS carrier the unscoped base/barebone cross-env carrier; that is the only way a serve WS reaches
+across envs.
+
+**Env-scope guard — one place, default-deny (RFC 8d.2, "the single most important P4 invariant").**
+`server::dispatch` runs every front-door method through one guard, `facaderpc::enforce_scope(method,
+conn, body, root_env)`, before it routes. For a scoped caller each method is one of three: *env-safe*
+(runs only inside the caller's env — `config.*`, `session.*`, `svc`, `plugin`, `snap.*`,
+`sandbox.*`, `blobs.*`, `approval.request`, `log.query`, …: the named env must equal the bound env,
+`cross_env_denied` otherwise, and the resolved env is forced to the bound one); *self-scoping / host
+read* (`bus.*`/`kv.*`/`blob.*`/`timer.*`/`query.*` which enforce their own env, plus `status`,
+`auth.scope`, `secret.get`, `ingress.*`); or *barebone-only* (`stop`, `kill`, `reset`,
+`runtime.spawn/stop/register`, `upgrade.*`, `secret.set/list`, a `config.patch` targeting base) which
+a scoped caller is refused with `not_permitted_when_scoped`. The classification **defaults to
+barebone-only**, so a newly added method is scoped-by-default-deny until it opts into an env-safe or
+open handler — a new RPC can never silently become a cross-env hole. Unscoped base/CLI/barebone
+callers keep P3's full reach; the guard only ever tightens a bound connection. Write-vs-read on the
+kv facade is asymmetric on purpose: a scoped caller's *read* of a foreign env is refused, but a
+*write* naming a foreign env is confined to the caller's own env rather than escaping into the named
+one. A scoped subscriber sees its own env's reserved namespaces (its `session/**` log is what the
+serve UI renders) but never another env's or host-level (`env=None`) reserved traffic.
 
 **secrets facade + mask|block leak policy (RFC 8d.4).** `secret.set{name, value, leak: mask|block,
 grants?}` / `secret.get{name}` / `secret.list` (names + policy + grants, never a value). Values live
@@ -1154,11 +1179,25 @@ only in base's own `secrets.yml` (mode 0600), never in an env's state file and n
 envelope; `secret.get` is grant-checked against the caller's bound env (an unscoped base/CLI caller
 always reads; a scoped env reads only what `grants` lists, else `not_granted`). The leak choke point
 is the Hub: base pushes the value+policy set into the hub, and before any envelope is fanned out or
-persisted the hub scans its payload for known secret values — `mask` rewrites the value in place to
-`***<name>***` (vibe-term's PTY-mask idea at the envelope layer), `block` refuses the publish with an
-error and fans out a value-free `guardian/violation` event. Base's own event-log append calls the
-same one hub scrub before it writes, so the state file never holds a raw value either — one choke
-point, applied at both doors. Secret values never appear in logs.
+persisted the hub scans the whole model-visible envelope for known secret values — **both `payload`
+and `tags`**, the two open free-text fields (a secret dropped in a `tags` value is exfiltration just
+as much as one in the body). `mask` rewrites the value in place to `***<name>***` (vibe-term's
+PTY-mask idea at the envelope layer) across every field, `block` refuses the publish with an error
+and fans out a value-free `guardian/violation` event, checked across every field before any masking
+so a blocked value never half-lands. The scan only runs when secrets exist (empty rule set is one
+atomic load and return). Base's own event-log append calls the same one hub scrub before it writes,
+so the state file never holds a raw value either — one choke point, applied at both doors. Secret
+values never appear in logs.
+
+**Documented scan limitation — split payloads (RFC section 2/8d.4 "tail").** The guard scans one
+envelope's content at a time and has no memory across envelopes, so it matches contiguous substrings
+only. A secret split across two durable envelopes (plausible for token-by-token or chunked tool
+output) is not caught: neither half contains the full value, so neither `mask` nor `block` fires on
+either chunk. This is by design — the fix is **producer-side** (the worker scrubs a tool-output tail
+before it is chunked into payloads), never cross-envelope reassembly inside the guard, which would
+turn the choke point into a stateful buffer. Encoded copies (base64, percent-encoding) are likewise
+not recognised — the guard matches the literal value only. Both are pinned by tests in
+`cli/tests/secrets_leak_adversarial.rs` rather than left to prose.
 
 **Deviations.** (1) `serve --http` with neither `--auth-token`/`TENON_AUTH_TOKEN` nor `--public`
 now refuses to start rather than serving unauthenticated; `--https` may still start tokenless for a

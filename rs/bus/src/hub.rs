@@ -120,7 +120,10 @@ impl Hub {
         if self.guard.is_empty() {
             return Ok(());
         }
-        match self.guard.scan(&mut envelope.payload) {
+        match self
+            .guard
+            .scan_envelope(&mut envelope.payload, &mut envelope.tags)
+        {
             Ok(()) => Ok(()),
             Err(name) => {
                 self.emit_violation(&name, &envelope.topic, envelope.env.clone());
