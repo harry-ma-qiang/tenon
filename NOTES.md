@@ -1793,3 +1793,72 @@ segment-aligned globs (`kv/<prefix>**`), which suits the path-like keys (`/timer
 exists.
 
 P4.0 adversarial: 4 defects fixed — ttl_s enforcement (bus fan-out/replay/vacuum), env-scope firehose (scoped subscribers exclude reserved namespaces), kv revision monotonic across restart (kv_meta.rev_hwm high-water), blob unknown-hash/out-of-range errors.
+
+## P4.1 result — facade migration (收口)
+
+Producers publish once through the bus, readers read through the facade, the UI runs on
+`bus.subscribe`, and base's own parallel subscriber list is gone. Behavior-preserving: the durable
+truth of the session log stays the per-env `events` table (`log = truth`), so retention, per-env
+isolation and byte-identical `session.history`/`session.resume` are untouched. The one change to the
+producer path is the fan-out: `emit`/`emit_env`/`events_append` now call `Base::publish_event` once,
+which emits a non-durable `session/<kind>` (env) or `base/<kind>` (barebone) envelope on the hub.
+That single call replaced BOTH the P4.0 durable session bridge (a second copy in the `envelopes`
+table) AND base's own `subs`/`subscribe` fan-out. `model_visible` is left off the live envelope on
+purpose — it implies `durable`, which would re-persist and re-create the duplication being deleted;
+the session-log law is already met by the `events`-table write.
+
+Deleted: the `subscribe` RPC, `Cmd::Subscribe`, base's `subs` map, `wanted()`, and
+`facaderpc::bridge_session`. `exit_on_detach`/`status.attached` now count the connections holding a
+`bus.subscribe` (the `attached` set, decremented on `Gone`). Added: `log.query{env,session?}` typed
+reader, `Base::publish_event`, the `{kind,data,at}` compat mirror on `t:"ev"` frames, and the UI
+`ingest`/`backfill` stream path. `tenon run`, `tenon attach`, `attach --ui` and `serve` all stream
+from `bus.subscribe` now; `status` stays a one-shot for `tenon status`.
+
+Kept as-is (per-env storage model + retention gate depend on them): `events.tail`, `episodes.*`,
+`tool_results.*`, `blobs.*`, `state.retain`, and the approvals decision path
+`approval.request/answer`. ControlLease documented as a `/ctl/<env>` lease-backed kv key (read path
+wired, full takeover minimal).
+
+Elixir: guardian and node `Link` forward `guardian/pass|failed|reset` + node lifecycle to base's bus
+as envelopes over the Link socket (`bus.publish`), and a Logger handler maps Elixir Logger events to
+`log/<node>` envelopes (loop-guarded). The guardian's `violations` probe still reads `events.tail`
+(kept), so the P3.5b reset gate is unchanged.
+
+### LoC delta (`git diff --numstat` across the four P4.1 commits)
+
+| Scope | added | removed | net |
+|---|---:|---:|---:|
+| rs/base/src | 263 | 113 | +150 |
+| rs (all crate src) | 264 | 114 | +150 |
+| rs tests | 84 | 2 | +82 |
+| beam/lib (elixir src) | 169 | 1 | +168 |
+| beam/test | 106 | 0 | +106 |
+| workspace src (rs + beam) | 433 | 115 | +318 |
+
+Deviation on the net-LoC goal: base src is +150, not negative. The duplication targeted by P4.1 —
+the durable session bridge and base's parallel subscriber list — WAS removed (113 lines), but the
+behavior-preserving scope keeps the per-env record RPCs (`episodes.*`/`tool_results.*`/`blobs.*`/
+`state.retain`) and `events.tail` that the P3.4 storage model and `storage_gate` depend on, and adds
+the facade readers, the UI stream path, and the compat frame. The RFC's ~0.5-0.8k deletion estimate
+assumed moving episodes/tool_results/events wholesale onto bus topics and rewriting the retention
+gate — high-risk surgery that would red the storage/retention gates — so it was deliberately not
+taken. Net effect: one fan-out instead of two, one reader path, all gates green.
+
+### Gates (all green)
+
+Rust: `cargo build --release`, `cargo clippy --all-targets --all-features -D warnings`,
+`cargo fmt --check` all clean. Unit tests: bus 14, base lib, ui 18, storage 18, harness loop 13 (incl.
+the new `session_history_and_resume_are_byte_identical_for_a_fake_model_session` golden), worker
+fs/pty/snap, sandbox. Integration (release, oci, individually): boot 8, harness_gate, storage_gate,
+replay_gate (exercises `bus.subscribe` + `exit_on_detach`), bus_gate 6, bus_adversarial 11,
+guardian_gate, approvals_gate, upgrade_gate, ui_gate (attach --ui PTY renders on the subscribe
+stream), budget_gate 2, contract_gate, spawn_gate, manifest_gate, gateway_gate, worker_boot,
+harness_model, and the adversarial suite 20 — all pass. `podman ps -a --filter label=tenon.home`
+shows only the live demo `tenon.base=647207`; no test containers leaked.
+
+Beam: `mix compile --warnings-as-errors`, `mix format --check-formatted`, `mix credo --strict`
+(311 mods/funs, no issues) all clean; `mix test` 43 tests / 0 failures (5 new in `bridge_test.exs`
+covering the envelope builder + level map, the node lifecycle publish, the link `publish` service,
+and the LogBridge forward/drop paths); `MIX_ENV=prod mix release --overwrite` builds. The rebuilt
+release with the bridge active passes the Rust `boot` and `guardian_gate` gates — base accepts the
+guardian/log envelopes and the guardian still triggers reset.
