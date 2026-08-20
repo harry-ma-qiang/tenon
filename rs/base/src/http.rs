@@ -21,12 +21,19 @@ pub struct ServeConfig {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
     pub auth: Auth,
+    /// RFC 8d.2: leave the WebSocket carrier unscoped (base/barebone cross-env
+    /// access). The default binds every WS connection to serve's env.
+    pub admin: bool,
 }
 
 struct Ctx {
     ui: Arc<Mutex<Ui>>,
     sock: PathBuf,
     auth: Auth,
+    /// The env every WebSocket carrier is bound to and the runtime token used to
+    /// bind it (RFC 8d.2). `None` for an `--admin` serve, whose WS stays the
+    /// unscoped base/barebone carrier.
+    scope: Option<(String, String)>,
     /// RFC 8c ingress caps: the per-response streamed-byte ceiling and a permit
     /// pool bounding how many `/app` proxy connections run at once.
     max_body: usize,
@@ -71,10 +78,20 @@ pub async fn serve(
     };
     let scheme = if config.https { "https" } else { "http" };
     println!("tenon: env {env} on {scheme}://{bound}");
+    let scope = match config.admin {
+        true => None,
+        false => {
+            let token = std::fs::read_to_string(home.runtime_token_file(&env))
+                .map(|token| token.trim().to_string())
+                .unwrap_or_default();
+            Some((env.clone(), token))
+        }
+    };
     let ctx = Arc::new(Ctx {
         ui: Arc::new(Mutex::new(Ui::new(env))),
         sock: home.sock(),
         auth: config.auth,
+        scope,
         max_body: ingress.body_limit,
         conns: Arc::new(Semaphore::new(ingress.max_connections.max(1))),
     });
@@ -145,7 +162,11 @@ where
         return reply(&mut stream, 401, "text/plain", reject.message()).await;
     }
     if carrier == Carrier::Ws {
-        return upgrade(stream, &head, ctx.sock.clone()).await;
+        let bind = match &ctx.scope {
+            Some((env, token)) => crate::ws::Bind::Scoped(env.clone(), token.clone()),
+            None => crate::ws::Bind::Admin,
+        };
+        return upgrade(stream, &head, ctx.sock.clone(), bind).await;
     }
     let mut client = match Client::connect(&ctx.sock).await {
         Ok(client) => client,
@@ -188,7 +209,7 @@ where
 /// Completes the WebSocket handshake on the already-authorized stream, then
 /// hands it to the transparent bridge. The accept key derives from the client's
 /// `Sec-WebSocket-Key`; no body follows a GET upgrade.
-async fn upgrade<S>(mut stream: S, head: &str, sock: PathBuf) -> Result<()>
+async fn upgrade<S>(mut stream: S, head: &str, sock: PathBuf, bind: crate::ws::Bind) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -201,7 +222,7 @@ where
     );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
-    crate::ws::bridge(stream, sock).await
+    crate::ws::bridge(stream, sock, bind).await
 }
 
 fn is_upgrade(head: &str, path: &str) -> bool {

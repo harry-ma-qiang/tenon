@@ -46,7 +46,15 @@ impl Filter {
     }
 
     pub fn matches(&self, envelope: &Envelope) -> bool {
-        if self.scoped && is_reserved(&envelope.topic) {
+        // A scoped subscriber never sees another env's or a host-level
+        // (env=None) reserved namespace, but does see its own env's reserved
+        // stream (its `session/**` log is what the serve UI carrier renders).
+        // Cross-env reserved and host-level traffic is already excluded by the
+        // env check below; this only bars a reserved topic that outruns it.
+        if self.scoped
+            && is_reserved(&envelope.topic)
+            && envelope.env.as_deref() != self.env.as_deref()
+        {
             return false;
         }
         if !self.topics.is_empty() && !self.topics.iter().any(|p| glob(p, &envelope.topic)) {

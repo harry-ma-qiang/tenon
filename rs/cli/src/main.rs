@@ -74,6 +74,10 @@ enum Command {
         /// Skip the bearer check for this serve surface (ingress is P4.5)
         #[arg(long)]
         public: bool,
+        /// Leave the WebSocket carrier unscoped (base/barebone cross-env access);
+        /// by default every WS connection is bound to this serve's env
+        #[arg(long)]
+        admin: bool,
     },
     /// List the `/app/<name>` ingress routes base is serving (RFC 8c, P4.5)
     #[cfg(feature = "http")]
@@ -304,12 +308,14 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             key,
             auth_token,
             public,
+            admin,
         } => {
             let config = tenon_base::http::ServeConfig {
                 https,
                 cert,
                 key,
                 auth: tenon_base::auth::Auth::resolve(auth_token, public),
+                admin,
             };
             tenon_base::http::serve(home, env, http, config).await
         }
