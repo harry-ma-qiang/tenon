@@ -34,6 +34,8 @@ pub mod params;
 pub mod peer;
 pub mod privilege;
 pub mod probes;
+#[cfg(feature = "http")]
+pub mod proxy;
 pub mod query;
 pub mod release;
 pub mod rpc;

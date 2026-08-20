@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 const MAX_REQUEST: usize = 64 * 1024;
@@ -27,6 +27,10 @@ struct Ctx {
     ui: Arc<Mutex<Ui>>,
     sock: PathBuf,
     auth: Auth,
+    /// RFC 8c ingress caps: the per-response streamed-byte ceiling and a permit
+    /// pool bounding how many `/app` proxy connections run at once.
+    max_body: usize,
+    conns: Arc<Semaphore>,
 }
 
 /// The web carrier of RFC section 6b, hardened by P4.4: CGI-like one render per
@@ -41,9 +45,12 @@ pub async fn serve(
     config: ServeConfig,
 ) -> Result<i32> {
     let home = Home::resolve(home)?;
-    let root = crate::config::Config::load(&home.config_file())
-        .map(|config| config.root_env)
-        .unwrap_or_else(|_| "root".to_string());
+    let loaded = crate::config::Config::load(&home.config_file()).ok();
+    let root = loaded
+        .as_ref()
+        .map(|config| config.root_env.clone())
+        .unwrap_or_else(|| "root".to_string());
+    let ingress = loaded.map(|config| config.ingress).unwrap_or_default();
     let env = env.unwrap_or(root);
     if !config.https && !config.auth.is_public() && !config.auth.has_token() {
         bail!("serve over http needs --auth-token or --public (ingress is the public seam)");
@@ -68,6 +75,8 @@ pub async fn serve(
         ui: Arc::new(Mutex::new(Ui::new(env))),
         sock: home.sock(),
         auth: config.auth,
+        max_body: ingress.body_limit,
+        conns: Arc::new(Semaphore::new(ingress.max_connections.max(1))),
     });
     loop {
         let Ok((stream, _peer)) = listener.accept().await else {
@@ -106,6 +115,23 @@ where
         None => (target.clone(), String::new()),
     };
     let token = bearer(&head).or_else(|| field(&query, "token"));
+    let ws_upgrade = is_websocket(&head);
+    // RFC 8c: `/app/<name>/*` proxies into that app's sandbox. Resolved and
+    // authorized here (public apps skip the token) before any general route.
+    if let Some((name, rest)) = app_route(&path, &query) {
+        return app(
+            stream,
+            &ctx,
+            ws_upgrade,
+            token.as_deref(),
+            &method,
+            &name,
+            &rest,
+            &head,
+            body.as_bytes(),
+        )
+        .await;
+    }
     let carrier = if is_upgrade(&head, &path) {
         Carrier::Ws
     } else {
@@ -179,10 +205,96 @@ where
 }
 
 fn is_upgrade(head: &str, path: &str) -> bool {
-    path == "/ws"
-        && header(head, "upgrade")
-            .map(|value| value.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false)
+    path == "/ws" && is_websocket(head)
+}
+
+fn is_websocket(head: &str) -> bool {
+    header(head, "upgrade")
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+}
+
+/// `/app/<name>/<rest>` split into the app name and the path to forward (prefix
+/// stripped, query re-appended). `None` for any path that is not an app route.
+fn app_route(path: &str, query: &str) -> Option<(String, String)> {
+    let tail = path.strip_prefix("/app/")?;
+    let (name, rest) = match tail.split_once('/') {
+        Some((name, rest)) => (name, format!("/{rest}")),
+        None => (tail, "/".to_string()),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let rest = if query.is_empty() {
+        rest
+    } else {
+        format!("{rest}?{query}")
+    };
+    Some((name.to_string(), rest))
+}
+
+/// Resolve one `/app/<name>` route through base, authorize it (a `public` app
+/// skips the token), then proxy — HTTP, or a WebSocket upgrade on the same path.
+/// A name with no live lease is a clean 404 rather than a hung connection.
+#[allow(clippy::too_many_arguments)]
+async fn app<S>(
+    mut stream: S,
+    ctx: &Arc<Ctx>,
+    upgrade: bool,
+    token: Option<&str>,
+    method: &str,
+    name: &str,
+    rest: &str,
+    head: &str,
+    body: &[u8],
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut client = match Client::connect(&ctx.sock).await {
+        Ok(client) => client,
+        Err(error) => return reply(&mut stream, 503, "text/plain", &error.to_string()).await,
+    };
+    let resolved = client
+        .call("ingress.resolve", serde_json::json!({ "name": name }))
+        .await;
+    let route = match resolved {
+        Ok(route) if route["found"].as_bool().unwrap_or(false) => route,
+        _ => {
+            return reply(&mut stream, 404, "text/plain", "no such app route").await;
+        }
+    };
+    let addr = route["addr"].as_str().unwrap_or_default().to_string();
+    if addr.is_empty() {
+        return reply(
+            &mut stream,
+            502,
+            "text/plain",
+            "ingress route has no address",
+        )
+        .await;
+    }
+    let public = route["public"].as_bool().unwrap_or(false);
+    let env = route["env"].as_str().unwrap_or_default().to_string();
+    let carrier = if upgrade { Carrier::Ws } else { Carrier::Http };
+    let request = Request { token, public };
+    if let Err(reject) = authorize(carrier, &request, &ctx.auth) {
+        return reply(&mut stream, 401, "text/plain", reject.message()).await;
+    }
+    let Ok(_permit) = ctx.conns.clone().try_acquire_owned() else {
+        return reply(&mut stream, 503, "text/plain", "ingress at connection cap").await;
+    };
+    let target = crate::proxy::Target {
+        addr: &addr,
+        app: name,
+        env: &env,
+        max_body: ctx.max_body,
+    };
+    if upgrade {
+        crate::proxy::websocket(&mut stream, &target, rest, head).await
+    } else {
+        crate::proxy::http(&mut stream, &target, method, rest, head, body).await
+    }
 }
 
 /// The bearer token out of an `Authorization: Bearer <token>` header.
