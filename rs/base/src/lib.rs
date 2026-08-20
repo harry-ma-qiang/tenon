@@ -225,13 +225,18 @@ pub async fn attach(home: Option<PathBuf>, env: Option<String>) -> Result<i32> {
     let mut client = Client::connect(&home.sock()).await?;
     let status = client.call("status", json!({})).await?;
     println!("{}", serde_json::to_string_pretty(&status)?);
-    let params = env.map(|env| json!({ "env": env })).unwrap_or(json!({}));
-    let subscribed = client.call("subscribe", params).await?;
-    println!("tenon: attached from event {}", subscribed["last_event"]);
+    let _ = &env;
+    let subscribed = client
+        .call(
+            "bus.subscribe",
+            json!({"topics": ["session/**", "base/**"], "coalesce_ms": 16}),
+        )
+        .await?;
+    println!("tenon: attached from offset {}", subscribed["offset"]);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(0),
-            event = client.event() => match event? {
+            event = client.next_ev() => match event? {
                 None => return Ok(0),
                 Some(event) => println!("{}", line(&event)),
             },

@@ -4,21 +4,76 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use tenon_ui::{Approval, EventLine, NodeInfo, Role, StatusLine, TranscriptItem, UiModel};
 
-const EVENT_TAIL: i64 = 200;
+const EVENT_TAIL: usize = 200;
 const TRANSCRIPT_MAX: usize = 200;
 const SUMMARY_CHARS: usize = 200;
 
-/// Everything the ASCII UI shows, read off base's front door: `status` for the
-/// tree, `session.history` for the transcript, `events.tail` for the tail and
-/// `approval.list` for the queue. Nothing here holds UI state — the carriers do.
+/// The ASCII UI, RFC 8 UI-on-subscribe: the transcript and the event tail are
+/// fed by a live `bus.subscribe` stream (`ingest`), never re-polled; only the
+/// node tree and the approval queue are read one-shot on each refresh (`status`
+/// stays a one-shot RPC, approvals are the decision path, not a topic). The two
+/// stream buffers are the whole of the UI's own state.
 pub struct Ui {
     pub env: String,
     pub session: Option<String>,
+    events: Vec<Value>,
+    history: Vec<Value>,
 }
 
 impl Ui {
     pub fn new(env: String) -> Self {
-        Self { env, session: None }
+        Self {
+            env,
+            session: None,
+            events: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    /// Fold one `bus.subscribe` frame into the buffers: every env frame is a tail
+    /// line, and the ones that carry a `session` are also the transcript. The
+    /// `{kind, data, at}` mirror fields the bus frame carries let the pure
+    /// renderer stay exactly what it was.
+    pub fn ingest(&mut self, ev: &Value) {
+        if str_of(ev, "kind").is_none() {
+            return;
+        }
+        if ev.get("env").and_then(Value::as_str) == Some(self.env.as_str()) {
+            self.events.push(ev.clone());
+            if self.events.len() > EVENT_TAIL {
+                self.events.drain(..self.events.len() - EVENT_TAIL);
+            }
+            if str_of(&ev["data"], "session").is_some() {
+                self.history.push(ev.clone());
+                if self.history.len() > TRANSCRIPT_MAX * 4 {
+                    self.history
+                        .drain(..self.history.len() - TRANSCRIPT_MAX * 4);
+                }
+            }
+        }
+    }
+
+    /// The reconnect snapshot: one `log.query` of the env's log so an attach in
+    /// the middle of a session shows what came before, then the live stream
+    /// carries it forward (RFC 8: log = truth, `since` pulls the delta). One
+    /// read, not a poll loop.
+    pub async fn backfill(&mut self, client: &mut Client) {
+        self.events.clear();
+        self.history.clear();
+        let answer = client
+            .call(
+                "log.query",
+                json!({"env": self.env, "limit": EVENT_TAIL * 4}),
+            )
+            .await
+            .unwrap_or(Value::Null);
+        for row in array(&answer, "events") {
+            let mut ev = row.clone();
+            if let Some(object) = ev.as_object_mut() {
+                object.insert("env".to_string(), json!(self.env));
+            }
+            self.ingest(&ev);
+        }
     }
 
     pub async fn model(&self, client: &mut Client) -> Result<UiModel> {
@@ -26,21 +81,12 @@ impl Ui {
             .call("status", json!({}))
             .await
             .unwrap_or(Value::Null);
-        let events = client
-            .call("events.tail", json!({"env": self.env, "limit": EVENT_TAIL}))
-            .await
-            .unwrap_or(Value::Null);
-        let history = client
-            .call(
-                "session.history",
-                json!({"env": self.env, "session_id": self.session.clone().unwrap_or_default()}),
-            )
-            .await
-            .unwrap_or(Value::Null);
         let approvals = client
             .call("approval.list", json!({"status": "pending"}))
             .await
             .unwrap_or(Value::Null);
+        let events = json!({"events": self.events});
+        let history = json!({"events": self.history});
         Ok(build(&self.env, &status, &events, &history, &approvals))
     }
 
@@ -259,6 +305,37 @@ mod tests {
         assert_eq!(model.approvals[0].id, "3");
         assert_eq!(model.status.base_pid, 42);
         assert!(model.status.budgets.unwrap().contains("10 tokens"));
+    }
+
+    #[test]
+    fn a_turn_renders_from_an_ingested_subscribe_stream_without_polling() {
+        let mut ui = Ui::new("root".to_string());
+        for frame in [
+            json!({"t": "ev", "topic": "session/user/message", "env": "root",
+                   "kind": "user/message", "data": {"session": "s1", "text": "hello"}, "at": 1}),
+            json!({"t": "ev", "topic": "session/assistant/message", "env": "root",
+                   "kind": "assistant/message",
+                   "data": {"session": "s1", "message": {"content": "hi there"}}, "at": 2}),
+            json!({"t": "ev", "topic": "session/tool/result", "env": "root",
+                   "kind": "tool/result", "data": {"session": "s1", "name": "bash", "text": "ok"}, "at": 3}),
+            json!({"t": "ev", "topic": "session/turn/end", "env": "root",
+                   "kind": "turn/end", "data": {"session": "s1", "ok": true}, "at": 4}),
+            json!({"t": "ev", "topic": "base/base.boot", "env": Value::Null,
+                   "kind": "base.boot", "data": {"ok": true}, "at": 5}),
+        ] {
+            ui.ingest(&frame);
+        }
+        let status = json!({"pid": 7, "attached": 1, "killed": Value::Null, "nodes": []});
+        let events = json!({"events": ui.events});
+        let history = json!({"events": ui.history});
+        let model = build("root", &status, &events, &history, &json!({}));
+        assert_eq!(model.transcript.len(), 3, "user, assistant and tool render");
+        assert!(model.transcript[2].is_tool());
+        assert_eq!(
+            model.events.len(),
+            4,
+            "only root env frames, not the base one"
+        );
     }
 
     #[test]

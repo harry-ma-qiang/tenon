@@ -90,8 +90,14 @@ pub async fn attach(home: Option<PathBuf>, env: Option<String>) -> Result<i32> {
     let env = env.unwrap_or(root);
     let mut calls = Client::connect(&home.sock()).await?;
     let mut events = Client::connect(&home.sock()).await?;
-    events.call("subscribe", json!({})).await?;
+    events
+        .call(
+            "bus.subscribe",
+            json!({"topics": ["session/**", "base/**"], "coalesce_ms": 16}),
+        )
+        .await?;
     let mut ui = Ui::new(env);
+    ui.backfill(&mut calls).await;
     let mut expanded: HashSet<usize> = HashSet::new();
     let mut mode = Mode::Keys;
     let mut size = Frame::size();
@@ -113,9 +119,12 @@ pub async fn attach(home: Option<PathBuf>, env: Option<String>) -> Result<i32> {
                     Action::Redraw => {}
                 },
             },
-            event = events.event() => match event? {
+            event = events.next_ev() => match event? {
                 None => return Ok(0),
-                Some(_event) => refresh = true,
+                Some(event) => {
+                    ui.ingest(&event);
+                    refresh = true;
+                }
             },
             _ = tokio::time::sleep(TICK) => {
                 let now = Frame::size();

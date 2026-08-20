@@ -60,7 +60,10 @@ async fn a_detach_stops_everything_and_the_next_start_replays_the_workspace_and_
         .await
         .expect("subscribe connection");
     watcher
-        .call("subscribe", json!({}))
+        .call(
+            "bus.subscribe",
+            json!({"topics": ["session/**", "base/**"]}),
+        )
         .await
         .expect("subscribe");
 

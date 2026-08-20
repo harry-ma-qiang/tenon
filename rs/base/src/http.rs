@@ -65,7 +65,9 @@ async fn handle(mut stream: TcpStream, ui: Arc<Mutex<Ui>>, sock: PathBuf) -> Res
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_COLS)
                 .clamp(40, 400);
-            let model = ui.lock().await.model(&mut client).await?;
+            let mut ui = ui.lock().await;
+            ui.backfill(&mut client).await;
+            let model = ui.model(&mut client).await?;
             reply(&mut stream, 200, "text/html", &tenon_ui::html(&model, cols)).await
         }
         ("POST", "/prompt") => {
