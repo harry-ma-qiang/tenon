@@ -11,9 +11,13 @@ pub mod filter;
 pub mod hub;
 pub mod layer;
 pub mod ring;
+#[cfg(feature = "http")]
+pub mod secret;
 
 pub use envelope::{now_ms, ulid, Envelope, Level};
 pub use filter::{glob, is_reserved, Filter};
 pub use hub::{Durable, Hub, SubOpts};
 pub use layer::BusLayer;
 pub use ring::{Published, Ring, Subscription};
+#[cfg(feature = "http")]
+pub use secret::{Leak, Rule, SecretGuard};

@@ -80,6 +80,8 @@ pub struct Facades {
     pub kv: Arc<KvFacade>,
     pub blob: Arc<BlobFacade>,
     pub timer: Arc<TimerService>,
+    #[cfg(feature = "http")]
+    pub secrets: Arc<crate::secret::Secrets>,
 }
 
 impl Facades {
@@ -94,11 +96,15 @@ impl Facades {
         let blob = Arc::new(BlobFacade::new(store));
         let timer = TimerService::new(kv.clone(), hub.clone());
         install_layer(&hub);
+        #[cfg(feature = "http")]
+        let secrets = crate::secret::Secrets::new(home.secrets_file(), hub.clone());
         Ok(Facades {
             hub,
             kv,
             blob,
             timer,
+            #[cfg(feature = "http")]
+            secrets,
         })
     }
 }

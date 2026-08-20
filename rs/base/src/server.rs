@@ -249,9 +249,21 @@ async fn dispatch(body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer
             })
             .await
         }
+        #[cfg(feature = "http")]
+        method if crate::secret::is_secret(method) => secret(method, body, conn, opts).await,
         method if is_facade(method) => facade(method, body, conn, cmds, opts).await,
         other => Err(format!("unknown_method:{other}")),
     }
+}
+
+/// The secrets facade (RFC 8d.4), reachable only in the `http` build. Values
+/// live in base's own file; `get` is grant-checked against the caller's env.
+#[cfg(feature = "http")]
+async fn secret(method: &str, body: &Value, conn: &Conn, opts: &Opts) -> Answer {
+    let Some(facades) = opts.facades.as_ref() else {
+        return Err("facades_unavailable".to_string());
+    };
+    crate::secret::handle(method, body, conn, facades).await
 }
 
 fn is_facade(method: &str) -> bool {
