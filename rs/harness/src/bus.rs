@@ -62,7 +62,7 @@ pub struct EpisodeRow {
 }
 
 /// The append-only session log and the tables beside it. The harness never
-/// opens sqlite: `BaseLog` speaks `events.append`, `events.tail`,
+/// opens sqlite: `BaseLog` speaks `events.append`, `log.query`,
 /// `episodes.append`, `tool_results.append` and `blobs.put` to base, which
 /// owns the file. The recording methods default to doing nothing, so a double
 /// that only cares about the log stays a two-method implementation.

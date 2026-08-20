@@ -93,17 +93,6 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn tool_results_tail(&self, limit: i64) -> Result<Vec<ToolResult>> {
-        let mut stmt = self.conn.prepare(
-            "select id, event_id, name, status, duration_ms, blob_hash, created_at
-             from tool_results order by id desc limit ?1",
-        )?;
-        let rows = stmt.query_map(params![limit.max(1)], tool_result)?;
-        let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.reverse();
-        Ok(rows)
-    }
-
     pub fn tool_results_of_event(&self, event_id: i64) -> Result<Vec<ToolResult>> {
         let mut stmt = self.conn.prepare(
             "select id, event_id, name, status, duration_ms, blob_hash, created_at

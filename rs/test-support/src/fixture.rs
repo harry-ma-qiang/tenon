@@ -386,9 +386,9 @@ impl Fixture {
     }
 
     pub async fn events_of(&self, env: &str) -> Vec<Value> {
-        self.rpc("events.tail", json!({"env": env, "limit": 5000}))
+        self.rpc("log.query", json!({"env": env, "limit": 5000}))
             .await
-            .expect("events.tail")["events"]
+            .expect("log.query")["events"]
             .as_array()
             .cloned()
             .unwrap_or_default()

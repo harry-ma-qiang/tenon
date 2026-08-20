@@ -162,7 +162,7 @@ impl Log for BaseLog {
                 .api
                 .env_lane(
                     crate::api::LOG,
-                    "events.tail",
+                    "log.query",
                     json!({"after": after, "limit": limit}),
                 )
                 .await?;
