@@ -1862,3 +1862,77 @@ covering the envelope builder + level map, the node lifecycle publish, the link 
 and the LogBridge forward/drop paths); `MIX_ENV=prod mix release --overwrite` builds. The rebuilt
 release with the bridge active passes the Rust `boot` and `guardian_gate` gates — base accepts the
 guardian/log envelopes and the guardian still triggers reset.
+
+## P4.2 result — the query hot layer + finishing the read-RPC 收口 (2026-08-20)
+
+RFC section 5's hot layer landed, and the read half of the P4.1 fold that was deliberately deferred
+is now done. Two things in one step: a typed `query` facade over each env's durable event log, and
+the deletion of the standalone `episodes.tail`/`tool_results.tail`/`events.tail` read RPC families
+whose consumers now speak `query`/`log.query`.
+
+### The query facade
+
+- `query.text{q, filter, topk}` — FTS5 over the log's text payload fields, ranked by bm25, returning
+  a highlighted `snippet` and the source event `ref`. The `events_fts` table is a DERIVED,
+  rebuildable read model (DSH pattern): `query_ensure_index` builds it on first use and walks new
+  events into it incrementally off the `events` table; a `QUERY_INDEX_VERSION` bump drops and
+  rebuilds it from the log. Version gate lives in a `query_meta` k/v table created lazily, not in the
+  schema migration — the index is disposable, so it stays out of `schema_version`.
+- `query.scan{source?, filter?, aggregate?, limit?}` — typed scan over `events`/`episodes`/
+  `tool_results`. No `aggregate` returns the newest `rows` (this replaced the two `.tail` RPCs);
+  `aggregate{op: count|sum|avg, field?, group_by?}` returns grouped `groups`. Every field/group-by
+  name resolves against a per-source allowlist, so the internal SQL is fully parameterised and never
+  exposed.
+- `query.vector` — stub, `{unsupported: true, reason}`; the engine is P5 memory.
+- Composite hot-window indexes built with the derived index: `events(kind, at)`,
+  `events(json_extract(data,'$.session'), id)`, and `created_at` on episodes/tool_results.
+- Env-scoping (8d.2) is enforced by the one authorizer: `server::dispatch` resolves the env through
+  `Conn::scoped_env` before sending `Cmd::Query`, so a scoped caller can only ever hit its own env.
+  base/barebone stays unscoped. Verified in `query_gate` (env A denied on env B with `cross_env_denied`).
+
+### The 收口: deleted, repointed, kept
+
+- **Deleted RPCs:** `episodes.tail`, `tool_results.tail`, `events.tail` (routes, `Cmd::EventsTail`,
+  the `envrpc` handlers, and the dead `TAIL`/`limit()`/`value()` plumbing). **Deleted storage
+  helpers:** `Store::episodes_tail`, `Store::tool_results_tail`.
+- **Repointed consumers:** harness `BaseLog::tail` and the test-support fixture now call `log.query`;
+  the Elixir guardian `violations` probe (`beam/.../guardian/probes.ex`) now calls `log.query` — it
+  was the one external consumer of `events.tail`, and missing it wedged `guardian_gate` in a reset
+  loop until the beam release was rebuilt. `storage_gate` reads through `query.scan`.
+- **Kept:** the `.append` write paths, `blobs.*`, `state.retain`, `approval.request/answer`, and the
+  internal `events_tail` window reader (now used only behind `log.query`). `session.history`/`resume`
+  are byte-identical — the harness golden `loop_test` asserts it and passes unchanged.
+
+### LoC delta (`git diff --numstat`)
+
+| Scope | added | removed | net |
+|---|---:|---:|---:|
+| rs/base + rs/storage **src** | 605 | 101 | **+504** |
+| rs tests (query_gate + storage tests + fixture) | 299 | 15 | +284 |
+| beam/lib (elixir src) | 1 | 1 | 0 |
+
+Deviation on net-negative: base+storage src is **+504**, not negative. The read-RPC fold alone is
+net-negative (~-40 in the touched files plus the deleted storage helpers), but the query hot layer is
+genuinely net-new plumbing — `storage/query.rs` is 454 lines and `base/query.rs` 90, matching the
+RFC's own ~0.5k query-hot estimate. There is no way to add a whole new facade and land net-negative
+src in the same step; the RFC LoC table itself budgets P4 as net ~+2k. Reported honestly rather than
+gamed. The RFC's "delete after migration" net-negative was always about the read families, which are
+now gone.
+
+### Perf (release, `#[ignore]`, `query_gate::perf_1m_events_...`, 1M synthetic events)
+
+- Insert 1M events + build the FTS index from the log (single transaction): index rebuild is the
+  disposable-derivation cost.
+- **text**: p50 ≈ 0.45 ms, p99 ≈ 0.48 ms — budget < 10 ms, ~20x headroom.
+- **scan** (count group_by kind over 1M, index-backed): p50 ≈ 70 ms, p99 ≈ 70 ms — budget < 100 ms.
+
+### Gates (all green)
+
+Rust: `cargo build --release`, `cargo clippy --all-targets --all-features -D warnings`,
+`cargo fmt --check` all clean. Storage unit 18 (incl. the query_scan rows), base lib 21, harness
+loop 13 (golden byte-identical `session.history`/`resume` unchanged). Integration (release, oci,
+individually): `query_gate` (text hit + snippet + ref, scan cost sum = 36 and tool_result status
+count, index rebuild reproduces from the log, env-scope A≠B), storage_gate, harness_gate, replay_gate,
+bus_gate 6, bus_adversarial 11, guardian_gate, ui_gate, boot 8 — all pass. `MIX_ENV=prod mix release`
+rebuilt for the probe repoint. `podman ps -a --filter label=tenon.home` shows only the live demo
+`tenon.base=647207`; no test containers leaked.
