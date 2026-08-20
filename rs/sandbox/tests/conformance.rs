@@ -45,6 +45,7 @@ fn check(name: &str) {
         home_hash: home_hash.clone(),
         base_pid: std::process::id() as i32,
         images: None,
+        ingress_ports: Vec::new(),
     };
     let instance = sandbox.spawn(&spec).expect("spawn");
 
@@ -218,6 +219,7 @@ fn krun_backend_conformance() {
         home_hash: format!("conf{suffix:x}"),
         base_pid: std::process::id() as i32,
         images: None,
+        ingress_ports: Vec::new(),
     };
     let sandbox = backend("krun").expect("the krun backend");
     let instance = sandbox.spawn(&spec).expect("spawn");

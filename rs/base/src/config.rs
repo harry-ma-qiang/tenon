@@ -147,6 +147,27 @@ pub struct Envs {
     pub ram_mb: u64,
 }
 
+/// RFC 8c's app-platform ingress (P4.5): how many `/app/<name>` routes an env
+/// and the whole host may hold, the lease window base keeps a live route alive
+/// within, and the caps the `/app` proxy enforces. `max_per_env` is also how
+/// many host ports each sandbox publishes for its apps to bind (the container
+/// ports are a fixed span from `18080`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Ingress {
+    #[serde(default = "ingress_max_per_env")]
+    pub max_per_env: usize,
+    #[serde(default = "ingress_max_total")]
+    pub max_total: usize,
+    #[serde(default = "ingress_lease_ttl_ms")]
+    pub lease_ttl_ms: i64,
+    #[serde(default = "ingress_probe_ms")]
+    pub probe_ms: u64,
+    #[serde(default = "ingress_body_limit")]
+    pub body_limit: usize,
+    #[serde(default = "ingress_max_connections")]
+    pub max_connections: usize,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "root_env")]
@@ -173,6 +194,8 @@ pub struct Config {
     pub worker: Worker,
     #[serde(default)]
     pub envs: Envs,
+    #[serde(default)]
+    pub ingress: Ingress,
     #[serde(default)]
     pub retention: Retention,
     #[serde(default)]
@@ -257,6 +280,30 @@ fn max_depth() -> u32 {
 
 fn child_ram_mb() -> u64 {
     512
+}
+
+fn ingress_max_per_env() -> usize {
+    4
+}
+
+fn ingress_max_total() -> usize {
+    32
+}
+
+fn ingress_lease_ttl_ms() -> i64 {
+    15_000
+}
+
+fn ingress_probe_ms() -> u64 {
+    1_000
+}
+
+fn ingress_body_limit() -> usize {
+    1_048_576
+}
+
+fn ingress_max_connections() -> usize {
+    64
 }
 
 fn approval_mode() -> String {
@@ -408,6 +455,19 @@ impl Default for Envs {
     }
 }
 
+impl Default for Ingress {
+    fn default() -> Self {
+        Self {
+            max_per_env: ingress_max_per_env(),
+            max_total: ingress_max_total(),
+            lease_ttl_ms: ingress_lease_ttl_ms(),
+            probe_ms: ingress_probe_ms(),
+            body_limit: ingress_body_limit(),
+            max_connections: ingress_max_connections(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -422,6 +482,7 @@ impl Default for Config {
             probes: Probes::default(),
             worker: Worker::default(),
             envs: Envs::default(),
+            ingress: Ingress::default(),
             retention: Retention::default(),
             approval: Approvals::default(),
             budgets: Budgets::default(),

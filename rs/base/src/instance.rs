@@ -59,11 +59,32 @@ impl Base {
             home_hash: self.home.hash(),
             base_pid: std::process::id() as i32,
             images: Some(self.home.images_dir()),
+            ingress_ports: self.ingress_ports(role),
         };
         self.sandbox
             .spawn(&spec)
             .map(Some)
             .map_err(|error| error.to_string())
+    }
+
+    /// The container-side ingress ports an agent env's sandbox publishes for its
+    /// apps (RFC 8c, P4.5): a fixed span from `INGRESS_CPORT_BASE`, `max_per_env`
+    /// wide. Empty in the non-`http` build and for the guardian, so the spawn
+    /// line is unchanged wherever ingress is not compiled or not wanted.
+    #[cfg(feature = "http")]
+    fn ingress_ports(&self, role: &str) -> Vec<u16> {
+        if role == GUARDIAN {
+            return Vec::new();
+        }
+        let count = self.config.ingress.max_per_env.min(64) as u16;
+        (0..count)
+            .map(|i| crate::ingress::INGRESS_CPORT_BASE + i)
+            .collect()
+    }
+
+    #[cfg(not(feature = "http"))]
+    fn ingress_ports(&self, _role: &str) -> Vec<u16> {
+        Vec::new()
     }
 
     pub fn sandbox_exec(

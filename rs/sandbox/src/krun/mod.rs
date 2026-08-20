@@ -362,6 +362,7 @@ mod tests {
             home_hash: "abc123def456".to_string(),
             base_pid: 1,
             images,
+            ingress_ports: Vec::new(),
         }
     }
 

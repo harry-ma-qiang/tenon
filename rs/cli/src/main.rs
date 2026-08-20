@@ -75,6 +75,13 @@ enum Command {
         #[arg(long)]
         public: bool,
     },
+    /// List the `/app/<name>` ingress routes base is serving (RFC 8c, P4.5)
+    #[cfg(feature = "http")]
+    Ingress {
+        /// Only the routes of this env; every env by default
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+    },
     /// Stop every environment, then the guardian, then the base
     Stop {
         /// Also sweep this home's stale sandbox containers whose base is dead
@@ -305,6 +312,11 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
                 auth: tenon_base::auth::Auth::resolve(auth_token, public),
             };
             tenon_base::http::serve(home, env, http, config).await
+        }
+        #[cfg(feature = "http")]
+        Command::Ingress { env } => {
+            let params = env.map(|env| json!({ "env": env })).unwrap_or(json!({}));
+            tenon_base::rpc(home, "ingress.list", params).await
         }
         Command::Stop { all } => {
             let code = tenon_base::rpc(home.clone(), "stop", json!({})).await?;

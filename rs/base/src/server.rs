@@ -236,6 +236,44 @@ async fn dispatch(body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer
         "stop" => ask(cmds, |reply| Cmd::Stop { reply }).await,
         "status" => status(cmds, opts).await,
         "auth.scope" => facaderpc::scope(conn, body, cmds).await,
+        #[cfg(feature = "http")]
+        "ingress.register" => {
+            let peer = peer.id();
+            let name = text_or(body, "name", "");
+            let port = i64_or(body, "port", 0);
+            let public = body.get("public").and_then(Value::as_bool).unwrap_or(false);
+            ask(cmds, |reply| Cmd::IngressRegister {
+                peer,
+                name,
+                port,
+                public,
+                approved: false,
+                reply,
+            })
+            .await
+        }
+        #[cfg(feature = "http")]
+        "ingress.unregister" => {
+            let peer = peer.id();
+            let name = text_or(body, "name", "");
+            ask(cmds, |reply| Cmd::IngressUnregister { peer, name, reply }).await
+        }
+        #[cfg(feature = "http")]
+        "ingress.list" => {
+            let facades = opts
+                .facades
+                .as_ref()
+                .ok_or_else(|| "facades_unavailable".to_string())?;
+            crate::ingress::list(facades, conn.bound_scope(), opt_text(body, "env"))
+        }
+        #[cfg(feature = "http")]
+        "ingress.resolve" => {
+            let facades = opts
+                .facades
+                .as_ref()
+                .ok_or_else(|| "facades_unavailable".to_string())?;
+            crate::ingress::resolve(facades, conn, &text_or(body, "name", ""))
+        }
         "log.query" => {
             let after = i64_or(body, "after", 0);
             let limit = i64_or(body, "limit", 500);
