@@ -2191,3 +2191,66 @@ oci sandbox). Regression green: `bus_gate` (11), `bus_adversarial` (6), `secrets
 (6), `ws_gate` (1), `ingress_gate` (2). `cargo build --release` (feature off + `--features http`),
 `clippy --all-targets --all-features -D warnings`, `fmt --check` all clean. `podman ps -a --filter
 label=tenon.home` shows only the live demo base `tenon.base:647207`.
+
+## P4.6 result — `tenon backup`/`tenon restore` with a checksummed manifest (2026-08-20)
+
+RFC P4.6: a consistent copy of all durable host state out of a home, and a verified restore
+back into the same or a fresh home. No new deps, no running-base requirement.
+
+1. **`base/src/backup.rs` (221 lines).** `backup::run(home, dir)` writes each SQLite state file
+   (barebone `state.sqlite` + every `state-<env>.sqlite`) with `VACUUM INTO` through a fresh
+   read-only connection — one read transaction that sees every committed WAL frame, so the copy
+   is coherent and defragmented *even while base is writing*. `config.yml` and `profiles/` are
+   plain copies (base holds no write lock on them); `lkg/manifest.json` too. `erts/` (re-extractable
+   release), `run/` (sockets/pids/tokens) and `derived/` (rebuildable warm segments) are excluded
+   by construction. A `backup.json` records tenon version, timestamp, env list, and one row per
+   file `{path, sha256, bytes}`. `backup::restore(home, dir)` refuses over a live base
+   (`run/base.ready`), verifies every file against `backup.json` (naming each mismatch and
+   restoring nothing on drift), snapshots the pre-restore state into `<home>/.restore-bak-<ts>`,
+   then replaces the state files, `config.yml`, a clean `profiles/` and the LKG manifest. The next
+   good boot re-promotes the LKG.
+2. **Online snapshot in storage.** `tenon_storage::backup_file(src, dest)` opens `src` read-only
+   and runs `VACUUM INTO`; `Store::backup_into(dest)` does the same off a live handle. WAL-safe,
+   verified against a WAL that still held uncheckpointed rows.
+3. **CLI.** `tenon backup <dir>` / `tenon restore <dir>`, both honoring the global `--home`.
+   `cli/src/main.rs` +12; `base/src/lib.rs` +21 (the two dispatch wrappers).
+
+### The test-infra flake, root cause + fix
+
+`test-support/src/fixture.rs` panicked `start failed: tenon: already running (pid 0)` under a
+full parallel `cargo test`. Root cause: a fixture home was `tenon-it-<pid>-<name>`, and several
+test files run **two** base-booting tests under one shared `const NAME` (`trigger_gate` is the
+one hit here — a `sandbox: none` test and a `sandbox: oci` test, both reachable when podman is
+present). Run in parallel they resolved to the **same** home, so two `tenon start`s raced the one
+`base.lock`/`base.ready` pair (one read the lock file mid-truncate, before the pid was written =
+pid 0) and two sandbox containers collided on one home hash. Fix: a process-wide `AtomicU64`
+sequence in the fixture makes every home unique (`tenon-it-<pid>-<name>-<seq>`), removing the
+shared resource entirely rather than serializing around it. Minimal (+15/-2), and it keeps each
+fixture's home unique as required.
+
+### A pre-existing gate fixed in passing
+
+The full `cargo test --features http` also surfaced `ui_gate::serve_http_renders...` failing
+`connect http: invalid socket address`. Root cause is not P4.6: `ui_gate.rs` has been unchanged
+since P3.8, when `tenon serve` was public; P4.4 made serve auth mandatory (bail without
+`--auth-token`/`--public`) but never updated this P3.5-era test, which spawns `serve --http` with
+no token and expects `200` with no bearer header. It has been red since P4.4 (confirmed: the test
+fails identically on the pre-P4.6 commit). One-line fix: the test spawns `serve --http ... --public`,
+matching its intent (a public localhost render page). Now green.
+
+### Files + LoC
+
+New: `base/src/backup.rs` (221), `cli/tests/backup_gate.rs` (168). Changed: `storage/src/lib.rs`
+(+34: `backup_file`, `Store::backup_into`), `test-support/src/fixture.rs` (+15/-2: unique home),
+`cli/src/main.rs` (+12), `base/src/lib.rs` (+21), `README.md` (+40 doc, +2 command rows).
+
+### Gates
+
+`backup_gate` (new): a live backup while a fake-model turn's session is on disk; `backup.json`
+lists `state.sqlite` and `state-root.sqlite` with sha256 matching the copies; restore refuses over
+the running base; restore refuses a tampered backup, naming `state-root.sqlite`; a clean restore
+into a fresh home + `tenon start` there replays the session (`session.history` returns
+`user/message` and `turn/end`). `trigger_gate` (both tests) run green 3x in parallel — the flake is
+gone. `cargo build --release` (feature off + `--features http`), `clippy --all-targets
+--all-features -D warnings`, `fmt --check` all clean; full `cargo test --features http` green twice.
+`podman ps -a --filter label=tenon.home` shows only the live demo base `tenon.base:647207`.
