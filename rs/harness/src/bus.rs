@@ -26,6 +26,15 @@ pub trait Gate: Send + Sync + 'static {
     fn check<'a>(&'a self, name: &str, args: &Value) -> BoxFut<'a, Result<(), String>>;
 }
 
+/// The bridge to a mounted MCP server (RFC P4.7): a bridged tool is a tools-bus
+/// row whose target service is `mcp`, and its execution is forwarded here by
+/// qualified name (`<server>/<tool>`) after the tools/pre-execute waterfall and
+/// the gate have run, so guard/budget/approval apply to a bridged tool exactly
+/// as to a native one.
+pub trait McpCall: Send + Sync + 'static {
+    fn call<'a>(&'a self, qualified: &str, args: Value) -> BoxFut<'a, Answer>;
+}
+
 /// One row of the session log. `id` is the rowid in the env's state file, so
 /// it doubles as the replay offset.
 #[derive(Debug, Clone)]

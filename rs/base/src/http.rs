@@ -186,6 +186,15 @@ where
         ("POST", hook_path) if hook_path.starts_with("/hook/") => {
             hook(&mut stream, &mut client, &ctx, hook_path, &query, &body).await
         }
+        ("POST", "/mcp") => {
+            let request = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+            match crate::mcp::handle(&request, &ctx.env, &ctx.sock).await {
+                Some(response) => {
+                    reply(&mut stream, 200, "application/json", &response.to_string()).await
+                }
+                None => reply(&mut stream, 202, "text/plain", "").await,
+            }
+        }
         ("GET", "/") => {
             let cols = field(&query, "cols")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -489,6 +498,7 @@ async fn redirect<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
 fn phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         303 => "See Other",
         400 => "Bad Request",
         401 => "Unauthorized",

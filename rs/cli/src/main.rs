@@ -151,6 +151,12 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Expose this env's tools bus as an MCP server over stdio (JSON-RPC 2.0)
+    Mcp {
+        /// The environment whose tools to expose; defaults to the root env
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+    },
     /// Resident tool process inside the sandbox
     Worker {
         /// The workspace it serves; defaults to $TENON_WORKSPACE, then /workspace
@@ -377,6 +383,7 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
         Command::Run { task, env, timeout } => {
             tenon_base::run::task(home, env, task, std::time::Duration::from_secs(timeout)).await
         }
+        Command::Mcp { env } => tenon_base::mcp::stdio(home, env).await,
         Command::Sandbox { command } => match command {
             SandboxCommand::Reap { all } => tenon_base::sandbox_reap(home, all).await,
             SandboxCommand::Image {

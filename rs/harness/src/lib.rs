@@ -5,6 +5,7 @@ pub mod config;
 pub mod fake;
 pub mod llm;
 pub mod manage;
+pub mod mcp;
 pub mod prompt;
 pub mod tools;
 pub mod wire;
@@ -77,6 +78,8 @@ async fn serve(env: String) -> Result<()> {
     tools.set_gate(Arc::new(ApiGate::new(api.clone())), &settings.gated_tools);
     let prompt = Arc::new(Prompt::new());
     let manage = Arc::new(Manage::new(api.clone(), bus.clone()));
+    let mcp = crate::mcp::McpManager::new();
+    tools.set_mcp(mcp.clone());
     let agent = Arc::new(Agent::new(
         bus.clone(),
         log.clone(),
@@ -85,7 +88,7 @@ async fn serve(env: String) -> Result<()> {
         prompt.clone(),
         settings.max_steps,
     ));
-    let router = router(&agent, &tools, &prompt, &manage, &llm);
+    let router = router(&agent, &tools, &prompt, &manage, &llm, &mcp);
     let ready = {
         let tools = tools.clone();
         let prompt = prompt.clone();
@@ -127,8 +130,27 @@ fn router(
     prompt: &Arc<Prompt>,
     manage: &Arc<Manage>,
     llm: &Arc<llm::Client>,
+    mcp: &Arc<crate::mcp::McpManager>,
 ) -> Router {
     let mut router = Router::default();
+    for name in ["mount", "list", "unmount"] {
+        let mcp = mcp.clone();
+        let tools = tools.clone();
+        router.service(
+            "mcp",
+            vec![(
+                name,
+                method(move |args| {
+                    let mcp = mcp.clone();
+                    let tools = tools.clone();
+                    async move {
+                        let params = args.first().cloned().unwrap_or(json!({}));
+                        mcp.call_method(name, &params, &tools).await
+                    }
+                }),
+            )],
+        );
+    }
     for name in [
         "ping",
         "session.create",

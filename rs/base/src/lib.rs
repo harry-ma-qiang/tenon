@@ -29,6 +29,7 @@ pub mod integrity;
 pub mod kv;
 pub mod lock;
 pub mod manifest;
+pub mod mcp;
 pub mod node;
 pub mod params;
 pub mod peer;
