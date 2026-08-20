@@ -29,6 +29,10 @@ pub struct ServeConfig {
 struct Ctx {
     ui: Arc<Mutex<Ui>>,
     sock: PathBuf,
+    /// The env `POST /hook/<topic>` publishes into and the WS carrier binds to.
+    env: String,
+    /// RFC P4.7 inbound-webhook body cap.
+    max_hook: usize,
     auth: Auth,
     /// The env every WebSocket carrier is bound to and the runtime token used to
     /// bind it (RFC 8d.2). `None` for an `--admin` serve, whose WS stays the
@@ -57,6 +61,10 @@ pub async fn serve(
         .as_ref()
         .map(|config| config.root_env.clone())
         .unwrap_or_else(|| "root".to_string());
+    let triggers = loaded
+        .as_ref()
+        .map(|config| config.triggers.clone())
+        .unwrap_or_default();
     let ingress = loaded.map(|config| config.ingress).unwrap_or_default();
     let env = env.unwrap_or(root);
     if !config.https && !config.auth.is_public() && !config.auth.has_token() {
@@ -88,8 +96,10 @@ pub async fn serve(
         }
     };
     let ctx = Arc::new(Ctx {
-        ui: Arc::new(Mutex::new(Ui::new(env))),
+        ui: Arc::new(Mutex::new(Ui::new(env.clone()))),
         sock: home.sock(),
+        env,
+        max_hook: triggers.webhook_body_limit,
         auth: config.auth,
         scope,
         max_body: ingress.body_limit,
@@ -173,6 +183,9 @@ where
         Err(error) => return reply(&mut stream, 503, "text/plain", &error.to_string()).await,
     };
     match (method.as_str(), path.as_str()) {
+        ("POST", hook_path) if hook_path.starts_with("/hook/") => {
+            hook(&mut stream, &mut client, &ctx, hook_path, &query, &body).await
+        }
         ("GET", "/") => {
             let cols = field(&query, "cols")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -318,6 +331,44 @@ where
     }
 }
 
+/// `POST /hook/<topic>` (RFC P4.7): the bearer authorizer already ran, so this
+/// publishes the body as an envelope on `hook/<topic>`, scoped to serve's env.
+/// Non-durable by default (`?durable=1` persists it). The body is JSON when it
+/// parses, otherwise a `{body}` string. Over the configured cap is a 413.
+async fn hook<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    client: &mut Client,
+    ctx: &Arc<Ctx>,
+    path: &str,
+    query: &str,
+    body: &str,
+) -> Result<()> {
+    let topic = path.trim_start_matches("/hook/").trim_matches('/');
+    if topic.is_empty() {
+        return reply(stream, 404, "text/plain", "no hook topic").await;
+    }
+    if body.len() > ctx.max_hook {
+        return reply(stream, 413, "text/plain", "hook body too large").await;
+    }
+    let durable = field(query, "durable").as_deref() == Some("1");
+    let payload = serde_json::from_str::<serde_json::Value>(body)
+        .unwrap_or_else(|_| serde_json::json!({ "body": body }));
+    let envelope = serde_json::json!({
+        "topic": format!("hook/{topic}"),
+        "env": ctx.env,
+        "src": "webhook",
+        "durable": durable,
+        "payload": payload,
+    });
+    match client
+        .call("bus.publish", serde_json::json!({ "envelope": envelope }))
+        .await
+    {
+        Ok(result) => reply(stream, 200, "application/json", &result.to_string()).await,
+        Err(error) => reply(stream, 502, "text/plain", &error.to_string()).await,
+    }
+}
+
 /// The bearer token out of an `Authorization: Bearer <token>` header.
 fn bearer(head: &str) -> Option<String> {
     let value = header(head, "authorization")?;
@@ -442,6 +493,8 @@ fn phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "OK",
     }
