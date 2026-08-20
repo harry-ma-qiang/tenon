@@ -36,11 +36,28 @@ impl Conn {
         self.scope.lock().expect("scope").clone()
     }
 
+    /// Whether this connection has been bound to one env by `auth.scope`. An
+    /// unbound connection is a base/CLI caller that reads across envs.
+    pub fn is_scoped(&self) -> bool {
+        self.bound().is_some()
+    }
+
     /// The env this connection is scoped to (RFC 8d.2), for the secrets facade's
     /// grant check. Gated to the http feature so the default binary is unchanged.
     #[cfg(feature = "http")]
     pub fn bound_scope(&self) -> Option<String> {
         self.bound()
+    }
+
+    /// The write-side env resolution: a scoped caller's mutation is confined to
+    /// its own env rather than refused, so naming another env silently lands in
+    /// the caller's own env instead of escaping it (RFC 8d.2). Reads still use
+    /// `scoped_env`, which refuses a foreign name outright.
+    pub fn scoped_env_confine(&self, requested: Option<&str>) -> String {
+        match self.bound() {
+            Some(env) => env,
+            None => requested.unwrap_or(&self.root_env).to_string(),
+        }
     }
 
     /// The optional-env resolution: a scoped caller can never name another env;
@@ -89,6 +106,82 @@ pub async fn scope(conn: &Conn, body: &Value, cmds: &Cmds) -> Answer {
 
 fn req_env(body: &Value) -> Option<String> {
     str_of(body, "env").map(str::to_string)
+}
+
+/// How the RFC 8d.2 scope guard treats one method for a scoped caller.
+enum Policy {
+    /// Runs only inside the caller's own env: the named env must equal the bound
+    /// env, and the resolved env is the bound one.
+    EnvSafe,
+    /// Self-scoping facade or host-level read, safe for a scoped caller as-is.
+    Open,
+    /// base/barebone-only: refused for any scoped caller.
+    Barebone,
+}
+
+/// The single RFC 8d.2 scope guard every front-door method passes through
+/// (`server::dispatch` calls it before routing). Default-deny: a method is
+/// barebone-only unless it is listed here as env-safe or self-scoping, so a new
+/// method is refused to scoped callers until it opts in. Returns the env the
+/// method should act on, or the refusal a scoped caller earns.
+pub fn enforce_scope(
+    method: &str,
+    conn: &Conn,
+    body: &Value,
+    root_env: &str,
+) -> Result<String, String> {
+    let requested = str_of(body, "env");
+    match policy(method) {
+        Policy::EnvSafe => conn.scoped_env(requested),
+        Policy::Open => Ok(requested.unwrap_or(root_env).to_string()),
+        Policy::Barebone => {
+            if conn.is_scoped() {
+                return Err("not_permitted_when_scoped".to_string());
+            }
+            Ok(requested.unwrap_or(root_env).to_string())
+        }
+    }
+}
+
+fn policy(method: &str) -> Policy {
+    if ["bus.", "kv.", "blob.", "timer.", "query."]
+        .iter()
+        .any(|prefix| method.starts_with(prefix))
+    {
+        return Policy::Open;
+    }
+    match method {
+        "status" | "auth.scope" | "secret.get" | "approval.list" | "approval.answer"
+        | "ingress.register" | "ingress.unregister" | "ingress.list" | "ingress.resolve" => {
+            Policy::Open
+        }
+        "health"
+        | "tree"
+        | "reload"
+        | "svc"
+        | "plugin"
+        | "session.create"
+        | "session.prompt"
+        | "session.status"
+        | "session.history"
+        | "session.resume"
+        | "events.append"
+        | "episodes.append"
+        | "tool_results.append"
+        | "blobs.put"
+        | "blobs.get"
+        | "state.retain"
+        | "config.get"
+        | "config.patch"
+        | "approval.request"
+        | "log.query"
+        | "snap.list"
+        | "snap.export"
+        | "snap.pull"
+        | "sandbox.exec"
+        | "sandbox.destroy" => Policy::EnvSafe,
+        _ => Policy::Barebone,
+    }
 }
 
 pub async fn bus_publish(conn: &Conn, facades: &Facades, body: &Value) -> Answer {
@@ -216,7 +309,17 @@ pub fn compat_kind(topic: &str) -> String {
 /// `kv.*`: every RFC section 3 kv verb, env-scoped. `kv.watch` is the streaming
 /// one — a since_rev snapshot then a live `kv/<key>` subscription.
 pub fn kv(conn: &Conn, facades: &Facades, method: &str, body: &Value) -> Answer {
-    let env = conn.scoped_env(req_env(body).as_deref())?;
+    // A scoped caller's read of another env is refused; a write naming another
+    // env is confined to the caller's own env rather than escaping into it.
+    let write = matches!(
+        method,
+        "kv.set" | "kv.del" | "kv.cas" | "kv.incr" | "kv.expire" | "kv.lease" | "kv.keep_alive"
+    );
+    let env = if write {
+        conn.scoped_env_confine(req_env(body).as_deref())
+    } else {
+        conn.scoped_env(req_env(body).as_deref())?
+    };
     let kv = &facades.kv;
     let key = || text_or(body, "key", "");
     let durable = body
