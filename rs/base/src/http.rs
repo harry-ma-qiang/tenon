@@ -1,48 +1,98 @@
+use crate::auth::{authorize, Auth, Carrier, Request};
 use crate::client::Client;
 use crate::home::Home;
 use crate::ui::Ui;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_rustls::TlsAcceptor;
 
 const MAX_REQUEST: usize = 64 * 1024;
 const DEFAULT_COLS: usize = 100;
 
-/// The web carrier of RFC section 6b: CGI-like, one render per request, no UI
-/// state on the server and no JavaScript needed. Localhost only — the page is
-/// the human gate, not a public surface — and hand-rolled on tokio rather than
-/// pulling a web framework in for four routes.
-pub async fn serve(home: Option<PathBuf>, env: Option<String>, address: String) -> Result<i32> {
+/// Everything a `serve` invocation carries beyond its address: whether to wrap
+/// the listener in TLS (with an optional PEM cert/key, else a dev self-signed
+/// one) and the bearer-token gate every route runs through.
+pub struct ServeConfig {
+    pub https: bool,
+    pub cert: Option<PathBuf>,
+    pub key: Option<PathBuf>,
+    pub auth: Auth,
+}
+
+struct Ctx {
+    ui: Arc<Mutex<Ui>>,
+    sock: PathBuf,
+    auth: Auth,
+}
+
+/// The web carrier of RFC section 6b, hardened by P4.4: CGI-like one render per
+/// request, plus a `/ws` upgrade for the WebSocket carrier, optional TLS, and
+/// the single bearer authorizer in front of every route. Localhost only — the
+/// page is the human gate, and production TLS/SSO stays a documented seam
+/// (reverse proxy / JWT pass-through).
+pub async fn serve(
+    home: Option<PathBuf>,
+    env: Option<String>,
+    address: String,
+    config: ServeConfig,
+) -> Result<i32> {
     let home = Home::resolve(home)?;
     let root = crate::config::Config::load(&home.config_file())
         .map(|config| config.root_env)
         .unwrap_or_else(|_| "root".to_string());
     let env = env.unwrap_or(root);
+    if !config.https && !config.auth.is_public() && !config.auth.has_token() {
+        bail!("serve over http needs --auth-token or --public (ingress is the public seam)");
+    }
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("bind {address}"))?;
     let bound = listener.local_addr()?;
     if !bound.ip().is_loopback() {
-        bail!("tenon serve --http binds loopback addresses only, not {bound}");
+        bail!("tenon serve binds loopback addresses only, not {bound}");
     }
-    println!("tenon: env {env} on http://{bound}");
-    let ui = Arc::new(Mutex::new(Ui::new(env)));
-    let sock = home.sock();
+    let acceptor = match config.https {
+        true => Some(TlsAcceptor::from(crate::tls::server_config(
+            config.cert.clone(),
+            config.key.clone(),
+        )?)),
+        false => None,
+    };
+    let scheme = if config.https { "https" } else { "http" };
+    println!("tenon: env {env} on {scheme}://{bound}");
+    let ctx = Arc::new(Ctx {
+        ui: Arc::new(Mutex::new(Ui::new(env))),
+        sock: home.sock(),
+        auth: config.auth,
+    });
     loop {
         let Ok((stream, _peer)) = listener.accept().await else {
             return Ok(0);
         };
-        let (ui, sock) = (ui.clone(), sock.clone());
+        let (ctx, acceptor) = (ctx.clone(), acceptor.clone());
         tokio::spawn(async move {
-            let _ = handle(stream, ui, sock).await;
+            match acceptor {
+                Some(acceptor) => {
+                    if let Ok(tls) = acceptor.accept(stream).await {
+                        let _ = handle(tls, ctx).await;
+                    }
+                }
+                None => {
+                    let _ = handle(stream, ctx).await;
+                }
+            }
         });
     }
 }
 
-async fn handle(mut stream: TcpStream, ui: Arc<Mutex<Ui>>, sock: PathBuf) -> Result<()> {
+async fn handle<S>(mut stream: S, ctx: Arc<Ctx>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let Some((head, body)) = read_request(&mut stream).await? else {
         return Ok(());
     };
@@ -55,7 +105,23 @@ async fn handle(mut stream: TcpStream, ui: Arc<Mutex<Ui>>, sock: PathBuf) -> Res
         Some((path, query)) => (path.to_string(), query.to_string()),
         None => (target.clone(), String::new()),
     };
-    let mut client = match Client::connect(&sock).await {
+    let token = bearer(&head).or_else(|| field(&query, "token"));
+    let carrier = if is_upgrade(&head, &path) {
+        Carrier::Ws
+    } else {
+        Carrier::Http
+    };
+    let request = Request {
+        token: token.as_deref(),
+        public: false,
+    };
+    if let Err(reject) = authorize(carrier, &request, &ctx.auth) {
+        return reply(&mut stream, 401, "text/plain", reject.message()).await;
+    }
+    if carrier == Carrier::Ws {
+        return upgrade(stream, &head, ctx.sock.clone()).await;
+    }
+    let mut client = match Client::connect(&ctx.sock).await {
         Ok(client) => client,
         Err(error) => return reply(&mut stream, 503, "text/plain", &error.to_string()).await,
     };
@@ -65,7 +131,7 @@ async fn handle(mut stream: TcpStream, ui: Arc<Mutex<Ui>>, sock: PathBuf) -> Res
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_COLS)
                 .clamp(40, 400);
-            let mut ui = ui.lock().await;
+            let mut ui = ctx.ui.lock().await;
             ui.backfill(&mut client).await;
             let model = ui.model(&mut client).await?;
             reply(&mut stream, 200, "text/html", &tenon_ui::html(&model, cols)).await
@@ -73,19 +139,19 @@ async fn handle(mut stream: TcpStream, ui: Arc<Mutex<Ui>>, sock: PathBuf) -> Res
         ("POST", "/prompt") => {
             let text = field(&body, "text").unwrap_or_default();
             if !text.trim().is_empty() {
-                let _ = ui.lock().await.prompt(&mut client, &text).await;
+                let _ = ctx.ui.lock().await.prompt(&mut client, &text).await;
             }
             redirect(&mut stream).await
         }
         ("POST", "/rollback") => {
-            let _ = ui.lock().await.rollback(&mut client).await;
+            let _ = ctx.ui.lock().await.rollback(&mut client).await;
             redirect(&mut stream).await
         }
         ("POST", path) if path.starts_with("/approve/") => {
             let id = path.trim_start_matches("/approve/").parse::<i64>().ok();
             let approve = field(&body, "decision").as_deref() != Some("deny");
             if let Some(id) = id {
-                let _ = ui.lock().await.answer(&mut client, id, approve).await;
+                let _ = ctx.ui.lock().await.answer(&mut client, id, approve).await;
             }
             redirect(&mut stream).await
         }
@@ -93,7 +159,51 @@ async fn handle(mut stream: TcpStream, ui: Arc<Mutex<Ui>>, sock: PathBuf) -> Res
     }
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<Option<(String, String)>> {
+/// Completes the WebSocket handshake on the already-authorized stream, then
+/// hands it to the transparent bridge. The accept key derives from the client's
+/// `Sec-WebSocket-Key`; no body follows a GET upgrade.
+async fn upgrade<S>(mut stream: S, head: &str, sock: PathBuf) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(key) = header(head, "sec-websocket-key") else {
+        return reply(&mut stream, 400, "text/plain", "missing Sec-WebSocket-Key").await;
+    };
+    let accept = crate::ws::accept_key(&key);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    crate::ws::bridge(stream, sock).await
+}
+
+fn is_upgrade(head: &str, path: &str) -> bool {
+    path == "/ws"
+        && header(head, "upgrade")
+            .map(|value| value.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false)
+}
+
+/// The bearer token out of an `Authorization: Bearer <token>` header.
+fn bearer(head: &str) -> Option<String> {
+    let value = header(head, "authorization")?;
+    let rest = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))?;
+    Some(rest.trim().to_string())
+}
+
+fn header(head: &str, name: &str) -> Option<String> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<(String, String)>> {
     let mut raw = Vec::new();
     let mut buffer = [0u8; 4096];
     let (head, mut body) = loop {
@@ -165,7 +275,12 @@ fn decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-async fn reply(stream: &mut TcpStream, status: u16, kind: &str, body: &str) -> Result<()> {
+async fn reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    kind: &str,
+    body: &str,
+) -> Result<()> {
     let head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {kind}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         phrase(status),
@@ -179,7 +294,7 @@ async fn reply(stream: &mut TcpStream, status: u16, kind: &str, body: &str) -> R
 
 /// Every POST answers with a redirect to `GET /`, so a reload never repeats
 /// the action and the page keeps no state of its own.
-async fn redirect(stream: &mut TcpStream) -> Result<()> {
+async fn redirect<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
     let head =
         "HTTP/1.1 303 See Other\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(head.as_bytes()).await?;
@@ -191,6 +306,8 @@ fn phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         303 => "See Other",
+        400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         503 => "Service Unavailable",
         _ => "OK",
@@ -210,5 +327,14 @@ mod tests {
         );
         assert_eq!(field("text=a%20b%21", "text").as_deref(), Some("a b!"));
         assert_eq!(field("cols=120", "rows"), None);
+    }
+
+    #[test]
+    fn reads_bearer_and_headers() {
+        let head = "GET /ws HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k";
+        assert_eq!(bearer(head).as_deref(), Some("abc"));
+        assert_eq!(header(head, "upgrade").as_deref(), Some("websocket"));
+        assert!(is_upgrade(head, "/ws"));
+        assert!(!is_upgrade(head, "/"));
     }
 }
