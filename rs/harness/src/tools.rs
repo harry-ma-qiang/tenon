@@ -1,4 +1,4 @@
-use crate::bus::{Answer, Bus, Gate};
+use crate::bus::{Answer, Bus, Gate, McpCall};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,7 @@ pub struct Tools {
     seq: Mutex<u64>,
     gated: Mutex<BTreeSet<String>>,
     gate: Mutex<Option<Arc<dyn Gate>>>,
+    mcp: Mutex<Option<Arc<dyn McpCall>>>,
 }
 
 impl Tools {
@@ -67,7 +68,14 @@ impl Tools {
             seq: Mutex::new(0),
             gated: Mutex::new(BTreeSet::new()),
             gate: Mutex::new(None),
+            mcp: Mutex::new(None),
         }
+    }
+
+    /// Where a bridged tool (target service `mcp`) is forwarded. Set once when
+    /// the MCP manager is wired; a `None` dispatcher means no server is mounted.
+    pub fn set_mcp(&self, mcp: Arc<dyn McpCall>) {
+        *self.mcp.lock().expect("tools lock") = Some(mcp);
     }
 
     /// The profile's `gated_tools` and the gate that answers for them. An
@@ -194,10 +202,17 @@ impl Tools {
             Ok(_) | Err(_) => request,
         };
         let arguments = request.get("arguments").cloned().unwrap_or(json!({}));
-        let outcome = self
-            .bus
-            .svc(&row.service, &row.method, vec![arguments])
-            .await;
+        let outcome = if row.service == "mcp" {
+            let dispatcher = self.mcp.lock().expect("tools lock").clone();
+            match dispatcher {
+                Some(mcp) => mcp.call(&row.method, arguments).await,
+                None => Err("no mcp server mounted".to_string()),
+            }
+        } else {
+            self.bus
+                .svc(&row.service, &row.method, vec![arguments])
+                .await
+        };
         let (ok, value) = match outcome {
             Ok(value) => (true, value),
             Err(error) => (false, json!(error)),
