@@ -88,7 +88,7 @@ async fn serve_http_renders_the_page_prompts_and_answers_an_approval() {
     fixture.start();
     fixture.ready(Duration::from_secs(120)).await;
 
-    let mut child = fixture.spawn(&["serve", "--http", "127.0.0.1:0"]);
+    let mut child = fixture.spawn(&["serve", "--http", "127.0.0.1:0", "--public"]);
     let address = read_address(&mut child).await;
 
     // a. the page renders the tree
