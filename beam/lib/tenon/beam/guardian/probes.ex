@@ -11,15 +11,33 @@ defmodule Tenon.Beam.Guardian.Probes do
   `probe_timeout` is a wedge and fails under its own name. Extra probes are executables
   under `<home>/probes/`; base is what checks their sha256 against its own config and
   passes the approved paths in, so nothing here decides what may run.
+
+  `@catalog` is the single documented list of the runtime health probes: one
+  place they are named and described. The offline `tenon doctor` (Rust,
+  `rs/base/src/doctor.rs`) mirrors this list by name and adds the install-only
+  probes the guardian has no running base to check.
   """
 
   require Logger
 
-  @core [:base, :env, :tree, :worker, :harness, :budgets, :violations]
+  @catalog [
+    {:base, "base itself answers status"},
+    {:env, "the env is alive (health ok)"},
+    {:tree, "the env's kernel root fiber is active"},
+    {:worker, "the env's worker answers ping when base expects one"},
+    {:harness, "the env's harness loop answers ping when base expects one"},
+    {:budgets, "no budget on the env has halted it"},
+    {:violations, "no hard-rule violation in the env's recent log"}
+  ]
+  @core Enum.map(@catalog, &elem(&1, 0))
   @violations ["violation", "budget.exceeded"]
   @tail 200
 
   @type failure :: {String.t(), term()}
+
+  @doc "The documented probe catalog: {name, semantics}. `core/0` is its names."
+  @spec catalog() :: [{atom(), String.t()}]
+  def catalog, do: @catalog
 
   @spec core() :: [atom()]
   def core, do: @core
