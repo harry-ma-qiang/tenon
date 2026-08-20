@@ -31,7 +31,7 @@ defmodule Tenon.Beam.GuardianTest do
     Base.answer(base, {"svc", "worker"}, {:ok, "pong"})
     Base.answer(base, {"svc", "loop"}, {:ok, "pong"})
     Base.answer(base, "status", {:ok, %{"nodes" => [env_row()]}})
-    Base.answer(base, "events.tail", {:ok, %{"events" => []}})
+    Base.answer(base, "log.query", {:ok, %{"events" => []}})
     Base.answer(base, "reset", {:ok, %{"ok" => true}})
   end
 
@@ -124,11 +124,11 @@ defmodule Tenon.Beam.GuardianTest do
 
   test "violations: a violation row in the log fails, once", %{base: base, ctx: ctx} do
     rows = %{"events" => [%{"id" => 7, "kind" => "budget.exceeded"}]}
-    Base.answer(base, "events.tail", {:ok, rows})
+    Base.answer(base, "log.query", {:ok, rows})
     watch(ctx, %{failures: 99})
     assert_receive {:tenon_guardian, :failed, names}, 5_000
     assert "violations" in names
-    Base.answer(base, "events.tail", {:ok, %{"events" => []}})
+    Base.answer(base, "log.query", {:ok, %{"events" => []}})
     assert_receive {:tenon_guardian, :up}, 5_000
   end
 
