@@ -67,7 +67,9 @@ async fn connection(stream: UnixStream, id: u64, cmds: Cmds, opts: Opts) {
 async fn dispatch(body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer {
     let peer = &conn.peer;
     let method = frame::method(body).unwrap_or_default();
-    let env = text_or(body, "env", &opts.root_env);
+    // RFC 8d.2 default-deny scope guard, in one place for every method: a scoped
+    // caller is confined to its bound env and refused every barebone-only method.
+    let env = facaderpc::enforce_scope(method, conn, body, &opts.root_env)?;
     match method {
         "node.register" => register(body, peer, cmds).await,
         "health" | "tree" | "reload" => forward(method, &env, cmds, opts).await,
@@ -114,6 +116,9 @@ async fn dispatch(body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer
         "config.patch" => {
             let patch = object(body, "patch");
             let target = text_or(body, "target", "env");
+            if conn.is_scoped() && target != "env" {
+                return Err("not_permitted_when_scoped".to_string());
+            }
             ask(cmds, |reply| Cmd::ConfigPatch {
                 env,
                 target,
