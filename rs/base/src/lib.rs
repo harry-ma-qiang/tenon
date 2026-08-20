@@ -1,4 +1,6 @@
 pub mod approvals;
+#[cfg(feature = "http")]
+pub mod auth;
 pub mod base;
 pub mod bench;
 pub mod blob;
@@ -35,6 +37,8 @@ pub mod release;
 pub mod rpc;
 pub mod run;
 pub mod runtime;
+#[cfg(feature = "http")]
+pub mod secret;
 pub mod server;
 pub mod service;
 pub mod signals;
@@ -42,11 +46,15 @@ pub mod snap;
 pub mod spawn;
 pub mod state;
 pub mod timer;
+#[cfg(feature = "http")]
+pub mod tls;
 pub mod token;
 pub mod tui;
 pub mod ui;
 pub mod upgrade;
 pub mod worker;
+#[cfg(feature = "http")]
+pub mod ws;
 
 use crate::client::Client;
 use crate::config::Config;

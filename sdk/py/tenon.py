@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import socket
@@ -56,12 +57,113 @@ def _connect_gateway(address):
     raise TenonError("bad TENON_GATEWAY address: %r" % (address,))
 
 
+# The WebSocket gateway transport (RFC P4.4): one JSON plugin frame per WS text
+# message, no length prefix. Lets a browser extension register as a plugin over
+# `ws:` without a python side-server. Client frames are masked per RFC 6455.
+class _WsClient:
+    def __init__(self, address):
+        host, port = address[len("ws:"):].rsplit(":", 1)
+        self._sock = socket.create_connection((host, int(port)))
+        self._buf = b""
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "GET /ws HTTP/1.1\r\nHost: %s:%s\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n" % (host, port, key)
+        )
+        self._sock.sendall(request.encode("ascii"))
+        self._await_upgrade()
+
+    def _await_upgrade(self):
+        while b"\r\n\r\n" not in self._buf:
+            data = self._sock.recv(4096)
+            if not data:
+                raise Disconnected("ws handshake closed")
+            self._buf += data
+        head, _, rest = self._buf.partition(b"\r\n\r\n")
+        if b"101" not in head.split(b"\r\n", 1)[0]:
+            raise TenonError("ws upgrade failed: %r" % (head[:80],))
+        self._buf = rest
+
+    def send_text(self, payload):
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        self._sock.sendall(_ws_header(0x81, len(payload)) + mask + masked)
+
+    def recv_text(self):
+        while True:
+            frame = self._decode()
+            if frame is None:
+                data = self._sock.recv(4096)
+                if not data:
+                    return None
+                self._buf += data
+                continue
+            op, payload = frame
+            if op == 0x1:
+                return payload
+            if op == 0x8:
+                return None
+            if op == 0x9:
+                self._pong(payload)
+
+    def _pong(self, payload):
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        self._sock.sendall(_ws_header(0x8A, len(payload)) + mask + masked)
+
+    def _decode(self):
+        buf = self._buf
+        if len(buf) < 2:
+            return None
+        op = buf[0] & 0x0F
+        masked = (buf[1] & 0x80) != 0
+        length = buf[1] & 0x7F
+        offset = 2
+        if length == 126:
+            if len(buf) < 4:
+                return None
+            length = struct.unpack(">H", buf[2:4])[0]
+            offset = 4
+        elif length == 127:
+            if len(buf) < 10:
+                return None
+            length = struct.unpack(">Q", buf[2:10])[0]
+            offset = 10
+        need = offset + (4 if masked else 0) + length
+        if len(buf) < need:
+            return None
+        start = offset + (4 if masked else 0)
+        payload = buf[start:start + length]
+        if masked:
+            key = buf[offset:offset + 4]
+            payload = bytes(byte ^ key[i % 4] for i, byte in enumerate(payload))
+        self._buf = buf[need:]
+        return op, payload
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def _ws_header(first, length):
+    if length < 126:
+        return bytes([first, 0x80 | length])
+    if length < 65536:
+        return bytes([first, 0x80 | 126]) + struct.pack(">H", length)
+    return bytes([first, 0x80 | 127]) + struct.pack(">Q", length)
+
+
 def _default_wires():
     address = os.environ.get("TENON_GATEWAY")
     if not address:
-        return os.fdopen(WIRE_IN_FD, "rb", 0), os.fdopen(WIRE_OUT_FD, "wb", 0)
+        return os.fdopen(WIRE_IN_FD, "rb", 0), os.fdopen(WIRE_OUT_FD, "wb", 0), None
+    if address.startswith("ws:"):
+        return None, None, _WsClient(address)
     sock = _connect_gateway(address)
-    return sock.makefile("rb", buffering=0), sock.makefile("wb", buffering=0)
+    return sock.makefile("rb", buffering=0), sock.makefile("wb", buffering=0), None
 
 
 class Plugin:
@@ -70,11 +172,12 @@ class Plugin:
         self.max_frame = _env_int("TENON_MAX_FRAME", DEFAULT_MAX_FRAME)
         self.deadline_ms = _env_int("TENON_KERNEL_DEADLINE", DEFAULT_DEADLINE_MS)
         self.config = {}
-        default_in, default_out = (None, None)
+        default_in, default_out, default_ws = (None, None, None)
         if wire_in is None or wire_out is None:
-            default_in, default_out = _default_wires()
+            default_in, default_out, default_ws = _default_wires()
         self._in = wire_in if wire_in is not None else default_in
         self._out = wire_out if wire_out is not None else default_out
+        self._ws = default_ws
         self._hooks = {}
         self._services = {}
         self._replies = {}
@@ -164,6 +267,9 @@ class Plugin:
         body = json.dumps(frame).encode("utf-8")
         if len(body) > self.max_frame:
             raise FrameTooLarge(len(body), self.max_frame)
+        if self._ws is not None:
+            self._ws.send_text(body)
+            return
         self._out.write(struct.pack(">I", len(body)) + body)
 
     def _readn(self, size):
@@ -176,6 +282,11 @@ class Plugin:
         return buf
 
     def _read(self):
+        if self._ws is not None:
+            body = self._ws.recv_text()
+            if body is None:
+                return None
+            return json.loads(body.decode("utf-8"))
         head = self._readn(4)
         if head is None:
             return None

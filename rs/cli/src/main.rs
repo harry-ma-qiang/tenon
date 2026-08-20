@@ -51,7 +51,7 @@ enum Command {
         #[arg(long, value_name = "TEXT")]
         note: Option<String>,
     },
-    /// Serve the built-in ASCII UI as a localhost web page
+    /// Serve the built-in ASCII UI (and the WebSocket carrier) as a localhost page
     #[cfg(feature = "http")]
     Serve {
         /// The address to bind, loopback only
@@ -59,6 +59,21 @@ enum Command {
         http: String,
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
+        /// Terminate TLS with rustls; without --cert/--key a dev self-signed cert is minted
+        #[arg(long)]
+        https: bool,
+        /// PEM certificate chain for --https
+        #[arg(long, value_name = "PEM")]
+        cert: Option<std::path::PathBuf>,
+        /// PEM private key for --https
+        #[arg(long, value_name = "PEM")]
+        key: Option<std::path::PathBuf>,
+        /// Bearer token every request must carry; also read from TENON_AUTH_TOKEN
+        #[arg(long, value_name = "TOKEN")]
+        auth_token: Option<String>,
+        /// Skip the bearer check for this serve surface (ingress is P4.5)
+        #[arg(long)]
+        public: bool,
     },
     /// Stop every environment, then the guardian, then the base
     Stop {
@@ -274,7 +289,23 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
         Command::Approvals { status } => tenon_base::approvals(home, Some(status)).await,
         Command::Approve { id, deny, note } => tenon_base::approve(home, id, deny, note).await,
         #[cfg(feature = "http")]
-        Command::Serve { http, env } => tenon_base::http::serve(home, env, http).await,
+        Command::Serve {
+            http,
+            env,
+            https,
+            cert,
+            key,
+            auth_token,
+            public,
+        } => {
+            let config = tenon_base::http::ServeConfig {
+                https,
+                cert,
+                key,
+                auth: tenon_base::auth::Auth::resolve(auth_token, public),
+            };
+            tenon_base::http::serve(home, env, http, config).await
+        }
         Command::Stop { all } => {
             let code = tenon_base::rpc(home.clone(), "stop", json!({})).await?;
             if all {

@@ -7,10 +7,12 @@ defmodule Tenon.Beam.Gateway.Server do
 
   require Logger
 
+  alias Tenon.Beam.Gateway.WebSocket
+
   @spec start_link(map(), String.t()) :: {:ok, pid()} | {:error, term()}
   def start_link(ctx, address) do
     with {:ok, listen} <- listen(address) do
-      GenServer.start_link(__MODULE__, {ctx, listen, address})
+      GenServer.start_link(__MODULE__, {ctx, listen, address, mode(address)})
     end
   end
 
@@ -18,10 +20,10 @@ defmodule Tenon.Beam.Gateway.Server do
   def stop(pid), do: GenServer.stop(pid, :normal)
 
   @impl GenServer
-  def init({ctx, listen, address}) do
+  def init({ctx, listen, address, mode}) do
     Process.flag(:trap_exit, true)
     Logger.info("tenon gateway: listening on #{address}")
-    acceptor = spawn_link(fn -> accept_loop(ctx, listen, self()) end)
+    acceptor = spawn_link(fn -> accept_loop(ctx, listen, self(), mode) end)
     {:ok, %{listen: listen, address: address, acceptor: acceptor, fibers: %{}}}
   end
 
@@ -71,37 +73,58 @@ defmodule Tenon.Beam.Gateway.Server do
     ])
   end
 
-  defp listen("tcp:" <> host_port) do
+  defp listen("tcp:" <> host_port), do: listen_tcp(host_port, {:packet, 4})
+
+  # The WebSocket carrier owns raw bytes and does its own framing, so the listen
+  # socket carries no `{packet, 4}`; the bridge re-frames onto the kernel's pair.
+  defp listen("ws:" <> host_port), do: listen_tcp(host_port, {:packet, 0})
+
+  defp listen(address), do: {:error, {:bad_address, address}}
+
+  defp listen_tcp(host_port, packet) do
     with [host, port_s] <- String.split(host_port, ":"),
          {port, ""} <- Integer.parse(port_s),
          {:ok, ip} <- :inet.parse_address(String.to_charlist(host)) do
-      :gen_tcp.listen(port, [:binary, {:packet, 4}, {:ip, ip}, active: false, reuseaddr: true])
+      :gen_tcp.listen(port, [:binary, packet, {:ip, ip}, active: false, reuseaddr: true])
     else
       _other -> {:error, {:bad_address, host_port}}
     end
   end
 
-  defp listen(address), do: {:error, {:bad_address, address}}
+  defp mode("ws:" <> _rest), do: :ws
+  defp mode(_address), do: :raw
 
-  defp accept_loop(ctx, listen, gateway) do
+  defp accept_loop(ctx, listen, gateway, mode) do
     case :gen_tcp.accept(listen) do
       {:ok, socket} ->
-        claim(socket, ctx, gateway)
-        accept_loop(ctx, listen, gateway)
+        claim(socket, ctx, gateway, mode)
+        accept_loop(ctx, listen, gateway, mode)
 
       {:error, :closed} ->
         :ok
 
       {:error, reason} ->
         Logger.error("tenon gateway: accept failed: #{inspect(reason)}")
-        accept_loop(ctx, listen, gateway)
+        accept_loop(ctx, listen, gateway, mode)
     end
   end
 
-  defp claim(socket, ctx, gateway) do
+  defp claim(socket, ctx, gateway, :ws) do
+    pid = spawn(fn -> serve_ws(ctx, gateway) end)
+    :ok = :gen_tcp.controlling_process(socket, pid)
+    send(pid, {:socket, socket})
+  end
+
+  defp claim(socket, ctx, gateway, :raw) do
     pid = spawn(fn -> register(ctx, gateway) end)
     :ok = :gen_tcp.controlling_process(socket, pid)
     send(pid, {:socket, socket})
+  end
+
+  defp serve_ws(ctx, gateway) do
+    receive do
+      {:socket, socket} -> WebSocket.serve(socket, ctx, gateway)
+    end
   end
 
   defp register(ctx, gateway) do
