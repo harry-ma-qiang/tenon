@@ -2090,3 +2090,54 @@ base `tenon.base:647207`.
 Plus small edits: `config.rs` ingress block, sandbox `Spec.ingress_ports` + `Instance::ingress_addr`
 (oci/landlock), `instance.rs`/`http.rs`/`server.rs`/`rpc.rs`/`cmds.rs`/`base.rs`/`lib.rs` wiring, and
 the `tenon ingress` CLI command.
+
+## P4.4 security — 5 defects fixed: env isolation on every carrier + tag leaks (2026-08-20)
+
+RFC 8d.2 env isolation is "the single most important P4 invariant". Adversarial tests
+(`ws_scope_adversarial.rs`, `serve_authz_adversarial.rs`, `secrets_leak_adversarial.rs`,
+`beam/test/gateway_ws_adversarial_test.exs`) found five real holes. All fixed, all four suites green,
+full P4 regression + gates re-run clean. Three code commits + this note.
+
+1. **WS carrier was unscoped (CRITICAL).** `ws.rs::bridge` opened a fresh UDS connection to base's
+   front door and never bound it, so any browser client with only the shared bearer token rode in as
+   an unscoped host-wide caller. Fix: `serve` is env-bound by default — the bridge calls
+   `auth.scope{env, token}` (token from `run/rt-<env>.token`) synchronously before forwarding any
+   client frame, so every RPC rides the `Conn::scoped_env` gate. `serve --admin` opts out (barebone
+   cross-env carrier).
+2. **`secret.get` grant was meaningless over WS (CRITICAL).** `conn.bound_scope()` was `None` for WS,
+   so grants never applied. Fixed for free by #1: a WS caller is now scoped, so `secret.get` grant-
+   checks its bound env and a not-granted env is `not_granted`.
+3. **Dispatch-level scope gap (HIGH).** Only `query./bus./kv./blob./timer.` consulted the scope;
+   `config.get`, `session.*`, `svc`, etc. routed off a raw `env` field with no check, for any caller.
+   Fix: one default-deny guard, `facaderpc::enforce_scope`, called by `server::dispatch` for **every**
+   method. Env-safe methods force env == bound (else `cross_env_denied`); barebone-only methods
+   (`stop`, `kill`, `reset`, `runtime.*`, `upgrade.*`, `secret.set/list`, base `config.patch`) are
+   `not_permitted_when_scoped`; classification defaults to barebone-only, so a new method is
+   scoped-by-default-deny. kv writes confine to the caller's env instead of refusing; kv reads refuse.
+4. **Secret leak via tags (HIGH).** `SecretGuard::scan` only walked `payload`; a value in `tags` sailed
+   through mask and block. Fix: `scan_envelope` scans payload **and** tags (keys + values), block
+   checked across both before any masking, still short-circuiting on an empty rule set.
+5. **Split-payload across envelopes (MEDIUM, documented).** Substring scanning has no cross-envelope
+   memory, so a value split over two durable envelopes is not caught. Documented as a known limit in
+   `rs/README.md` (fix is producer-side scrub, never guard-side reassembly); the committed test now
+   pins the limitation instead of asserting the impossible.
+
+### Where the single guard lives
+
+`rs/base/src/facaderpc.rs::enforce_scope` (+ `Policy` classifier). One call site:
+`rs/base/src/server.rs::dispatch`, replacing the old raw `text_or(body,"env",root)`. WS binding:
+`rs/base/src/ws.rs::bridge` (`Bind::Scoped|Admin`) + `http.rs` (reads the runtime token, `--admin`
+via `ServeConfig`). Tags scan: `rs/bus/src/secret.rs::scan_envelope`, called from
+`rs/bus/src/hub.rs::guard`. One env-agnostic tweak in `rs/bus/src/filter.rs`: a scoped subscriber
+sees its own env's reserved namespaces (its `session/**` log) but never another env's or host-level.
+
+### Gates
+
+Four committed adversarial suites green (`ws_scope_adversarial` 8, `serve_authz_adversarial` 6,
+`secrets_leak_adversarial` 4, beam `gateway_ws_adversarial` 6). Regression green: `bus_gate`,
+`bus_adversarial`, `query_gate`, `serve_https_gate`, `ws_gate`, `secrets_gate`, `ingress_gate`,
+`boot`, harness `loop_test`, beam `guardian_test` + full `mix test` (51). WS/scope suites run 3×, no
+flakiness. `cargo build --release` (feature off + `--features http`), `clippy --all-targets
+--all-features -D warnings`, `fmt --check`, `mix compile --warnings-as-errors`, `mix format
+--check-formatted`, `mix credo --strict` all clean. `podman ps -a --filter label=tenon.home` shows
+only the live demo base `tenon.base:647207`.
