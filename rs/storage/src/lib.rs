@@ -25,9 +25,9 @@ pub use schema::VERSION;
 pub use upgrades::{Benchmark, Upgrade};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One host state file, one writer. Every table of RFC section 9 lives here;
 /// readers (G, the CLI) open their own read-only connection to the same file.
@@ -76,6 +76,13 @@ impl Store {
             .pragma_query_value(None, "page_count", |row| row.get(0))?)
     }
 
+    /// A live-consistent snapshot of this file into `dest`, WAL and all: SQLite
+    /// runs the copy inside one read transaction, so the result is coherent even
+    /// while base is writing. `dest` must not exist.
+    pub fn backup_into(&self, dest: &Path) -> Result<()> {
+        vacuum_into_conn(&self.conn, dest)
+    }
+
     pub fn pragma(&self, name: &str) -> Result<String> {
         let value = self
             .conn
@@ -86,6 +93,31 @@ impl Store {
             other => format!("{other:?}"),
         })
     }
+}
+
+/// A snapshot of the state file at `src` written to `dest`, taken through a
+/// fresh read-only connection so it works while another process (base) holds the
+/// write handle. `VACUUM INTO` reads under one transaction that sees every
+/// committed WAL frame, so the copy is coherent under load. `dest` must not
+/// exist; any stale sibling is removed first.
+pub fn backup_file(src: &Path, dest: &Path) -> Result<()> {
+    let conn = Connection::open_with_flags(
+        src,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open state file {}", src.display()))?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    vacuum_into_conn(&conn, dest)
+}
+
+fn vacuum_into_conn(conn: &Connection, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        std::fs::remove_file(dest).with_context(|| format!("clear stale {}", dest.display()))?;
+    }
+    let target = dest.display().to_string().replace('\'', "''");
+    conn.execute_batch(&format!("VACUUM INTO '{target}'"))
+        .with_context(|| format!("vacuum into {}", dest.display()))?;
+    Ok(())
 }
 
 pub fn now() -> i64 {

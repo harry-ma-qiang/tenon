@@ -874,6 +874,44 @@ resolvable by name; the **LKG manifest** is what makes a rollback verifiable.
   list, needs no running base, and exits non-zero when the verification fails — which
   makes it usable as a check in a script.
 
+## `tenon backup <dir>` and `tenon restore <dir>` (P4.6)
+
+Where `rollback` rewinds a home to the last promotion base itself pinned, `backup` takes a
+copy of the whole durable host state out of the home entirely, and `restore` puts one back —
+into the same home or a fresh one. Both are local operations: they need the home layout, not
+a running base.
+
+```
+tenon backup  /mnt/off-host/tenon-2026-08-20     # a directory, written fresh
+tenon restore /mnt/off-host/tenon-2026-08-20     # into ~/.tenon (or --home DIR)
+```
+
+- **What is copied.** Every SQLite state file — the barebone's `state.sqlite` and each
+  `state-<env>.sqlite` — plus `config.yml`, the whole of `profiles/`, and `lkg/manifest.json`.
+- **What is not.** `erts/` (the release, re-extractable from the payload or a release dir),
+  `run/` (sockets, pids, tokens — meaningless off the host), and `derived/` (the rebuildable
+  warm query segments of RFC section 5). None of it is state; all of it comes back on the
+  next boot.
+- **The state files are snapshotted, not copied.** Each one is read through a fresh read-only
+  connection and written with `VACUUM INTO`, which runs inside one read transaction that sees
+  every committed WAL frame. So a backup taken while base is *running and writing* is still a
+  coherent, defragmented snapshot — no torn pages, no half-applied WAL, no need to stop base
+  first. `config.yml` and `profiles/` are plain byte copies (base holds no write lock on
+  them). Backup therefore works against a live base or a stopped home; restore requires the
+  home to be down.
+- **`backup.json` is the manifest.** Written into `<dir>` beside the copies: the tenon
+  version, the timestamp, the env list, and one row per file — its path within the backup,
+  its sha256 and its byte length.
+- **`restore` refuses two things.** A running base (it reads `run/base.ready`; restoring
+  `state.sqlite` under its writer would corrupt the very thing being rescued — the same rule
+  `rollback` follows), and any file whose bytes no longer hash to what `backup.json` recorded
+  (it names every mismatch and restores nothing). Before it replaces anything it snapshots the
+  home's current `state.sqlite`, `state-<env>.sqlite`, `config.yml`, `profiles/` and `lkg/`
+  into `<home>/.restore-bak-<ts>`, so a restore is itself undoable. It then puts the state
+  files, `config.yml`, a clean `profiles/` and the LKG manifest back and prints what it
+  restored. The first good boot afterwards re-promotes the LKG, refilling `lkg/` from the
+  restored state.
+
 ## `tenon check kernel` (P3.7)
 
 The kernel is L1 in RFC section 10: agents may replace `tenon.erl` in their own environment,
@@ -1352,6 +1390,8 @@ call, so nothing escapes the boundary by being listed.
 | `tenon upgrade status <id>` / `tenon upgrade list [--env NAME]` | what one proposal did, phase by phase; or every proposal and every benchmark row |
 | `tenon check kernel [--beam PATH] [--release-dir DIR]` | run the kernel contract suite that ships inside the beam release against a `tenon.beam` — the one the release ships, or a candidate. Prints the JSON report and exits non-zero when a point failed. Needs no running base |
 | `tenon rollback [--force]` | restore the LKG config, profiles and state copy. Verifies every pinned hash first and refuses with what differs; `--force` overrides. Refuses while base is running |
+| `tenon backup <dir>` | snapshot every durable host file into `<dir>`: each SQLite state file (barebone + per env) via `VACUUM INTO`, so it is coherent even under a live base, plus `config.yml`, `profiles/` and `lkg/manifest.json`, and a checksummed `backup.json`. `erts/`, `run/` and `derived/` are excluded. Needs no running base |
+| `tenon restore <dir>` | verify a backup against its `backup.json` (naming any file whose sha256 moved) and put the state files, config, profiles and LKG manifest back. Snapshots the pre-restore state to `<home>/.restore-bak-<ts>` first. Refuses over a running base and on any mismatch |
 | `tenon sandbox reap [--all]` | remove stale sandbox containers for this home; works whether or not base is running. Without `--all`, only containers whose `tenon.base` pid is confirmed dead go; with it, every container for this home goes regardless of liveness. A human-facing counterpart to the boot-time reap, for a home nobody is about to `start` again soon |
 | `tenon run "task" [--env NAME] [--timeout SECONDS]` | one task for that env's agent: create a session, prompt it, stream the answer, exit 0 if the turn ended ok |
 | `tenon harness [--env NAME]` | the agent process of one env. Base starts one per env; run by hand only against a live gateway |
