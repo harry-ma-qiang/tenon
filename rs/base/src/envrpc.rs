@@ -8,11 +8,6 @@ use std::time::Duration;
 use tenon_storage::{Retention, Store};
 use tokio::sync::oneshot;
 
-/// The tail an `episodes.tail`/`tool_results.tail` without an `n` answers with,
-/// and the ceiling any of them is clamped to.
-const TAIL: i64 = 200;
-const TAIL_MAX: i64 = 5_000;
-
 type Answer = Result<Value, String>;
 
 impl Base {
@@ -37,7 +32,7 @@ impl Base {
     }
 
     /// An env-scoped fact belongs in that env's own log, which is what
-    /// `events.tail{env}`, `tenon run` and the UI's event tail read. Before
+    /// `log.query{env}`, `tenon run` and the UI's event tail read. Before
     /// the env has a state file it falls back to the barebone's log.
     pub fn emit_env(&mut self, env: &str, kind: &str, data: Value) {
         let has_store = self
@@ -53,8 +48,10 @@ impl Base {
         }
     }
 
-    /// `env: "base"` reads the barebone's own log instead of an env's: boot,
-    /// LKG, probe and sandbox facts are base-wide and belong to no env.
+    /// The internal window reader behind `log.query`: the newest events of one
+    /// env's log after `after`. `env: "base"` reads the barebone's own log
+    /// instead of an env's — boot, LKG, probe and sandbox facts are base-wide
+    /// and belong to no env. No longer its own RPC; `log.query` is the surface.
     pub fn events_tail(&self, env: &str, after: i64, limit: i64) -> Answer {
         let store = match env {
             "base" => &self.store,
@@ -87,10 +84,10 @@ impl Base {
     }
 
     /// `log.query{env, session?, after?, limit?}`: the typed session-log reader
-    /// (RFC section 3). It is `events.tail` plus an optional `session` narrowing,
-    /// folded in one place so `session.history`, the UI and the CLI share one
-    /// path into the env's log without any of them touching sqlite or a topic
-    /// glob. The answer shape matches `events.tail` so it is a drop-in.
+    /// (RFC section 3). It is the log window plus an optional `session`
+    /// narrowing, folded in one place so `session.history`, the UI and the CLI
+    /// share one path into the env's log without any of them touching sqlite or
+    /// a topic glob.
     pub fn log_query(&self, env: &str, after: i64, limit: i64, session: Option<&str>) -> Answer {
         let tail = self.events_tail(env, after, limit)?;
         let Some(session) = session else {
@@ -220,7 +217,7 @@ impl Base {
         }))
     }
 
-    fn store_of(&self, env: &str) -> Result<&Store, String> {
+    pub(crate) fn store_of(&self, env: &str) -> Result<&Store, String> {
         let Some(node) = self.nodes.get(env) else {
             return Err(format!("unknown env {env}"));
         };
@@ -235,9 +232,7 @@ impl Base {
     pub fn records(&mut self, env: &str, method: &str, params: &Value) -> Answer {
         match method {
             "episodes.append" => self.episodes_append(env, params),
-            "episodes.tail" => self.episodes_tail(env, params),
             "tool_results.append" => self.tool_result_append(env, params),
-            "tool_results.tail" => self.tool_results_tail(env, params),
             "blobs.put" => self.blobs_put(env, params),
             "blobs.get" => self.blobs_get(env, params),
             "state.retain" => self.state_retain(env),
@@ -280,15 +275,6 @@ impl Base {
         Ok(json!({"id": id, "state_hash": hash, "step": row.step}))
     }
 
-    fn episodes_tail(&self, env: &str, params: &Value) -> Answer {
-        let rows = self
-            .store_of(env)?
-            .episodes_tail(limit(params))
-            .map_err(|error| error.to_string())?;
-        let rows: Vec<Value> = rows.iter().filter_map(value).collect();
-        Ok(json!({"env": env, "count": rows.len(), "episodes": rows}))
-    }
-
     fn tool_result_append(&mut self, env: &str, params: &Value) -> Answer {
         let store = self.store_of(env)?;
         let row: ToolResult = parse(params)?;
@@ -306,15 +292,6 @@ impl Base {
             )
             .map_err(|error| error.to_string())?;
         Ok(json!({"id": id}))
-    }
-
-    fn tool_results_tail(&self, env: &str, params: &Value) -> Answer {
-        let rows = self
-            .store_of(env)?
-            .tool_results_tail(limit(params))
-            .map_err(|error| error.to_string())?;
-        let rows: Vec<Value> = rows.iter().filter_map(value).collect();
-        Ok(json!({"env": env, "count": rows.len(), "tool_results": rows}))
     }
 
     fn blobs_put(&mut self, env: &str, params: &Value) -> Answer {
@@ -406,13 +383,13 @@ impl Base {
             } => {
                 let _ = reply.send(self.events_append(&env, &kind, &data));
             }
-            Cmd::EventsTail {
+            Cmd::Query {
                 env,
-                after,
-                limit,
+                method,
+                params,
                 reply,
             } => {
-                let _ = reply.send(self.events_tail(&env, after, limit));
+                let _ = reply.send(self.query(&env, &method, &params));
             }
             Cmd::LogQuery {
                 env,
@@ -459,15 +436,6 @@ impl Base {
     }
 }
 
-fn limit(params: &Value) -> i64 {
-    params
-        .get("n")
-        .or_else(|| params.get("limit"))
-        .and_then(Value::as_i64)
-        .unwrap_or(TAIL)
-        .clamp(1, TAIL_MAX)
-}
-
 fn empty_object() -> Value {
     json!({})
 }
@@ -503,10 +471,6 @@ struct ToolResult {
     duration_ms: i64,
     #[serde(default)]
     blob_hash: Option<String>,
-}
-
-fn value<T: serde::Serialize>(row: &T) -> Option<Value> {
-    serde_json::to_value(row).ok()
 }
 
 /// The state a step started from, in 16 hex chars: the workspace at that

@@ -64,15 +64,18 @@ pub enum Cmd {
         data: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    EventsTail {
+    /// The `query` facade (RFC section 5): typed `query.text/scan/vector` over
+    /// the per-env event log, index and derived FTS table. The env is already
+    /// resolved through the 8d.2 authorizer before this reaches the actor.
+    Query {
         env: String,
-        after: i64,
-        limit: i64,
+        method: String,
+        params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     /// `log.query`: the typed read over an env's session log (RFC section 3).
-    /// The same rows `events.tail` answers with, optionally narrowed to one
-    /// `session`; no SQL is exposed, only this shape.
+    /// The newest rows of one env's log, optionally narrowed to one `session`;
+    /// no SQL is exposed, only this shape.
     LogQuery {
         env: String,
         after: i64,

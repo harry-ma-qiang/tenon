@@ -30,6 +30,7 @@ pub mod params;
 pub mod peer;
 pub mod privilege;
 pub mod probes;
+pub mod query;
 pub mod release;
 pub mod rpc;
 pub mod run;

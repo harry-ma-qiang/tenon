@@ -49,7 +49,7 @@ impl Base {
             | Cmd::HarnessReady { .. }
             | Cmd::HarnessExit { .. }
             | Cmd::EventsAppend { .. }
-            | Cmd::EventsTail { .. }
+            | Cmd::Query { .. }
             | Cmd::LogQuery { .. }
             | Cmd::Records { .. }
             | Cmd::ConfigGet { .. }

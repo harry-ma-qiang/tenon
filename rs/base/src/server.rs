@@ -86,24 +86,20 @@ async fn dispatch(body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer
             })
             .await
         }
-        "events.tail" => {
-            let after = i64_or(body, "after", 0);
-            let limit = i64_or(body, "limit", 500);
-            ask(cmds, |reply| Cmd::EventsTail {
+        "query.text" | "query.scan" | "query.vector" => {
+            let requested = opt_text(body, "env");
+            let env = conn.scoped_env(requested.as_deref())?;
+            let params = body.clone();
+            let method = method.to_string();
+            ask(cmds, |reply| Cmd::Query {
                 env,
-                after,
-                limit,
+                method,
+                params,
                 reply,
             })
             .await
         }
-        "episodes.append"
-        | "episodes.tail"
-        | "tool_results.append"
-        | "tool_results.tail"
-        | "blobs.put"
-        | "blobs.get"
-        | "state.retain" => {
+        "episodes.append" | "tool_results.append" | "blobs.put" | "blobs.get" | "state.retain" => {
             let params = body.clone();
             let method = method.to_string();
             ask(cmds, |reply| Cmd::Records {
