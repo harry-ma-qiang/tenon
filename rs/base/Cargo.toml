@@ -24,6 +24,20 @@ tenon-bus = { path = "../bus" }
 tenon-sandbox = { path = "../sandbox" }
 tenon-storage = { path = "../storage" }
 tenon-ui = { path = "../ui" }
+futures-util = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 [features]
-http = []
+http = [
+  "dep:futures-util",
+  "dep:rcgen",
+  "dep:rustls",
+  "dep:rustls-pemfile",
+  "dep:tokio-rustls",
+  "dep:tokio-tungstenite",
+  "tenon-bus/http",
+]

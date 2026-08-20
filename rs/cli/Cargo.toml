@@ -27,6 +27,8 @@ http = ["tenon-base/http"]
 base64.workspace = true
 sha2.workspace = true
 libc.workspace = true
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 tenon-bus = { path = "../bus" }
 tenon-storage = { path = "../storage" }
 tenon-test-support = { path = "../test-support", features = ["node"] }
