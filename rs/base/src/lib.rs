@@ -1,6 +1,7 @@
 pub mod approvals;
 #[cfg(feature = "http")]
 pub mod auth;
+pub mod backup;
 pub mod base;
 pub mod bench;
 pub mod blob;
@@ -314,6 +315,26 @@ pub async fn approve(
 pub async fn rollback(home: Option<PathBuf>, force: bool) -> Result<i32> {
     let home = Home::resolve(home)?;
     let result = manifest::rollback(&home, force)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(0)
+}
+
+/// `tenon backup <dir>`: a consistent copy of every durable host file into
+/// `<dir>`. Works against a live base (the SQLite snapshot path is WAL-safe) or
+/// a stopped home; needs no running base, only the home layout.
+pub fn backup(home: Option<PathBuf>, dir: PathBuf) -> Result<i32> {
+    let home = Home::resolve(home)?;
+    let result = backup::run(&home, &dir)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(0)
+}
+
+/// `tenon restore <dir>`: verify the backup against its own `backup.json`, then
+/// put the state files, config, profiles and LKG manifest back. Refuses over a
+/// running base and on any checksum mismatch.
+pub fn restore(home: Option<PathBuf>, dir: PathBuf) -> Result<i32> {
+    let home = Home::resolve(home)?;
+    let result = backup::restore(&home, &dir)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(0)
 }

@@ -112,6 +112,16 @@ enum Command {
         #[arg(long)]
         print: bool,
     },
+    /// Snapshot every durable host file (state, config, profiles, LKG manifest) into a directory
+    Backup {
+        /// The directory to write the backup and its backup.json into
+        dir: PathBuf,
+    },
+    /// Verify a backup against its backup.json and restore it into this home
+    Restore {
+        /// The backup directory produced by `tenon backup`
+        dir: PathBuf,
+    },
     /// Restore the last known good config, profiles and state copy
     Rollback {
         /// Restore even though the LKG manifest does not match what is on disk
@@ -345,6 +355,8 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             true => tenon_base::lkg_status(home),
             false => tenon_base::rpc(home, "status", json!({})).await,
         },
+        Command::Backup { dir } => tenon_base::backup(home, dir),
+        Command::Restore { dir } => tenon_base::restore(home, dir),
         Command::Rollback { force } => tenon_base::rollback(home, force).await,
         Command::Upgrade { command } => match command {
             UpgradeCommand::Propose {
