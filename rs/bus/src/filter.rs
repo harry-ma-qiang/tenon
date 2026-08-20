@@ -1,6 +1,19 @@
 use crate::envelope::{Envelope, Level};
 use std::collections::BTreeMap;
 
+/// RFC section 2's reserved topic namespaces: base-internal traffic a scoped
+/// plugin never sees over the bus, no matter how wide its glob. Only an
+/// unscoped base/barebone caller reads these.
+pub const RESERVED_NAMESPACES: &[&str] = &[
+    "session", "internal", "base", "budget", "approval", "guardian", "upgrade", "worker",
+];
+
+/// True when a topic's first segment is a reserved base-internal namespace.
+pub fn is_reserved(topic: &str) -> bool {
+    let head = topic.split('/').next().unwrap_or(topic);
+    RESERVED_NAMESPACES.contains(&head)
+}
+
 /// The server-side subscription filter of RFC section 3: topic globs, a level
 /// set, and the env/session/tags a subscriber narrows to. Every field is
 /// conjunctive; an empty list means "no constraint on this axis".
@@ -11,6 +24,10 @@ pub struct Filter {
     pub env: Option<String>,
     pub session: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// RFC 8d.2: this subscriber is bound to an env (a plugin, not base). A
+    /// bound subscriber never receives reserved base-internal namespaces,
+    /// whatever its glob. Set once by the authorizer, not by the topic pattern.
+    pub scoped: bool,
 }
 
 impl Filter {
@@ -23,11 +40,15 @@ impl Filter {
     pub fn scoped_to(env: &str) -> Self {
         Filter {
             env: Some(env.to_string()),
+            scoped: true,
             ..Filter::default()
         }
     }
 
     pub fn matches(&self, envelope: &Envelope) -> bool {
+        if self.scoped && is_reserved(&envelope.topic) {
+            return false;
+        }
         if !self.topics.is_empty() && !self.topics.iter().any(|p| glob(p, &envelope.topic)) {
             return false;
         }

@@ -31,10 +31,17 @@ pub struct KvFacade {
     store: Arc<Mutex<Store>>,
     hub: Arc<Hub>,
     revision: AtomicI64,
+    reserved: AtomicI64,
     ephemeral: RwLock<HashMap<(String, String), Cell>>,
     leases: RwLock<HashMap<String, Lease>>,
     lease_seq: AtomicI64,
 }
+
+/// How far ahead the revision high-water is persisted each time the counter
+/// crosses the reserved ceiling: one durable write per block, not per bump, so
+/// ephemeral bumps stay cheap while a `kill -9` loses at most a block of unused
+/// revisions (a gap, never a rewind — the counter stays monotonic).
+const REV_BLOCK: i64 = 256;
 
 /// A key change as `watch`/the change envelope carries it.
 pub struct Change {
@@ -46,11 +53,18 @@ pub struct Change {
 
 impl KvFacade {
     pub fn new(store: Arc<Mutex<Store>>, hub: Arc<Hub>) -> Arc<KvFacade> {
-        let start = store.lock().expect("kv store").kv_max_rev().unwrap_or(0);
+        let start = {
+            let store = store.lock().expect("kv store");
+            store
+                .kv_max_rev()
+                .unwrap_or(0)
+                .max(store.kv_rev_hwm().unwrap_or(0))
+        };
         let facade = Arc::new(KvFacade {
             store,
             hub,
             revision: AtomicI64::new(start),
+            reserved: AtomicI64::new(start),
             ephemeral: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
             lease_seq: AtomicI64::new(0),
@@ -63,8 +77,18 @@ impl KvFacade {
         self.revision.load(Ordering::Relaxed)
     }
 
+    /// Every revision bump — durable, ephemeral or delete — advances one global
+    /// counter and, when it crosses the reserved ceiling, persists a new
+    /// high-water block. Restart then seeds from that ceiling, so no revision an
+    /// ephemeral write consumed is ever reissued (RFC section 3's monotonicity).
     fn next_rev(&self) -> i64 {
-        self.revision.fetch_add(1, Ordering::Relaxed) + 1
+        let rev = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        if rev > self.reserved.load(Ordering::Relaxed) {
+            let ceiling = rev + REV_BLOCK;
+            let _ = self.store.lock().expect("kv store").kv_set_rev_hwm(ceiling);
+            self.reserved.fetch_max(ceiling, Ordering::Relaxed);
+        }
+        rev
     }
 
     pub fn get(&self, env: &str, key: &str) -> Option<(Vec<u8>, i64)> {

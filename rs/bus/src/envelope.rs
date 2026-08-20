@@ -114,6 +114,17 @@ impl Envelope {
         }
     }
 
+    /// RFC section 2: `ttl_s` is an expiry for delivery and storage. An
+    /// envelope is expired once `ts + ttl_s` seconds have passed; a `None` ttl
+    /// never expires (its lifetime is the table retention policy). Both `ts` and
+    /// `now` are epoch milliseconds.
+    pub fn is_expired(&self, now: i64) -> bool {
+        match self.ttl_s {
+            Some(ttl) => self.ts.saturating_add((ttl as i64).saturating_mul(1000)) <= now,
+            None => false,
+        }
+    }
+
     /// The latest-only compaction key: the `key` tag when present, else the
     /// topic. A status/metrics producer sets `key` to the thing whose newest
     /// value is all a subscriber wants.

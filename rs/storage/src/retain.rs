@@ -92,6 +92,14 @@ impl Store {
              and sha256 not in (select blob_hash from tool_results where blob_hash is not null)",
             params![now() - policy.blob_grace_ms.max(0)],
         )?;
+        // RFC section 2: a `ttl_s` on a durable envelope is an expiry for storage
+        // too, so a vacuum drops any envelope past `ts + ttl_s`.
+        self.conn.execute(
+            "delete from envelopes
+             where json_extract(body, '$.ttl_s') is not null
+               and ts + json_extract(body, '$.ttl_s') * 1000 <= ?1",
+            params![now()],
+        )?;
         self.incremental_vacuum(0)?;
         Ok(out)
     }

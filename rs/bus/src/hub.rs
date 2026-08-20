@@ -133,6 +133,9 @@ impl Hub {
     }
 
     fn fan_out(&self, msg: Arc<Published>) {
+        if msg.envelope.is_expired(crate::envelope::now_ms()) {
+            return;
+        }
         let subs = self.subs.load();
         let mut dead = false;
         for sub in subs.iter() {
@@ -188,8 +191,12 @@ impl Hub {
         }
         if let (Some(after), Some(durable)) = (opts.since_offset, self.durable.as_ref()) {
             if let Ok(rows) = durable.since(after, REPLAY_MAX) {
+                let now = crate::envelope::now_ms();
                 for (offset, envelope) in rows {
                     if offset > ceiling {
+                        continue;
+                    }
+                    if envelope.is_expired(now) {
                         continue;
                     }
                     if filter.matches(&envelope) {

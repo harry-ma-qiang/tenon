@@ -120,6 +120,31 @@ impl Store {
             .flatten();
         Ok(rev.unwrap_or(0))
     }
+
+    /// The persisted high-water revision: the ceiling the facade reserved before
+    /// a crash, so the counter never goes backwards on restart even when the
+    /// revisions past `max(rev)` were spent by ephemeral writes that never
+    /// reached this table.
+    pub fn kv_rev_hwm(&self) -> Result<i64> {
+        let hwm: Option<i64> = self
+            .conn
+            .query_row("select v from kv_meta where k = 'rev_hwm'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(hwm.unwrap_or(0))
+    }
+
+    /// Raise the persisted high-water revision. Never lowers it, so a stale
+    /// racing writer cannot rewind the ceiling.
+    pub fn kv_set_rev_hwm(&self, hwm: i64) -> Result<()> {
+        self.conn.execute(
+            "insert into kv_meta (k, v) values ('rev_hwm', ?1)
+             on conflict(k) do update set v = excluded.v where excluded.v > kv_meta.v",
+            params![hwm],
+        )?;
+        Ok(())
+    }
 }
 
 /// `%` and `_` are `LIKE` wildcards; a prefix that contains one must match it
