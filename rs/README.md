@@ -1092,13 +1092,16 @@ a unix gateway; under a `tcp:` gateway (krun) the switch refuses with that reaso
 ## The built-in ASCII UI (P3.5)
 
 `rs/ui` is the pure renderer (its own README covers the layout); base is what fills its model
-and carries it. One model builder, `base/src/ui.rs`, reads four frames off the front door —
-`status` for the tree and the budget line, `session.history` for the transcript, `events.tail`
-for the tail, `approval.list` for the queue — and two carriers use it.
+and carries it. One model builder, `base/src/ui.rs`, folds a live `bus.subscribe` stream (`ingest`, topics
+`session/**`+`base/**`) into the transcript and the event tail, and reads two frames off the front
+door on each refresh — `status` for the tree and the budget line, `approval.list` for the queue
+(RFC 8 UI-on-subscribe: the transcript and tail are never re-polled). A mid-session attach backfills
+once via `log.query`. Two carriers use it.
 
 **Terminal.** `tenon attach --ui` puts stdin in raw mode with a `termios` guard that restores
 it whatever ends the loop, reads keys on one blocking thread and redraws on three things: an
-event from `subscribe`, a key, and a 400 ms tick that also re-probes the terminal size. Keys are
+envelope from `bus.subscribe` (folded into the model), a key, and a 400 ms tick that also re-probes
+the terminal size. Keys are
 `p` (type a line, then `session.prompt` — creating the session on first use), `a` (approve the
 first pending row after `y`/`n`), `r` (rollback: `reset` after `y`), `0`-`9` (fold or unfold that
 transcript item) and `q`. Nothing is buffered on the host: every action is a frame.
@@ -1191,7 +1194,7 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `kill{reason?}` / `resume{reason?}` | CLI, plugins | the kill switch over the socket: halt every harness and refuse every prompt, or let them back |
 | `stop` | CLI | graceful shutdown of everything, base included |
 | `status` | CLI | the snapshot plus one `tree` request per registered node |
-| `subscribe{env}` | CLI | this connection starts receiving `{"t":"event",...}` frames; `env` keeps only that env's events plus the base-wide ones |
+| `log.query{env,session?,after?,limit?}` | harness, CLI, UI | the typed session-log reader (RFC section 3): `events.tail` plus an optional `session` narrowing, one path into an env's log with no sqlite or glob exposed |
 | `bus.publish{envelope}` | any | publish one envelope; a durable one answers `{offset}` after its group-commit batch is persisted, a non-durable one after memory fan-out |
 | `bus.subscribe{topics?,levels?,env?,session?,since_offset?,coalesce_ms?,latest_only?}` | any | stream matching envelopes to this connection as `{"t":"ev",...}` frames; `since_offset` replays the durable log first (reconnect) |
 | `kv.get/set/del/cas/incr/expire/lease/keep_alive/range{...}` | any | the etcd-lite facade, env-scoped; `set{durable?,ttl_ms?,lease_id?}`, a global monotonic `rev`/`revision` |
@@ -1217,8 +1220,11 @@ or `null` for the guardian.
 ## The plumbing: bus, kv, blob, timer (P4.0)
 
 RFC P4 gives every component one message fabric and one state facade, with SQLite demoted to
-an implementation detail behind them. P4.0 lands the facades and the timer; the legacy record
-RPCs above stay until P4.1 migrates their producers.
+an implementation detail behind them. P4.0 lands the facades and the timer; P4.1 migrates the
+producers and the UI onto them (see "The facade migration" above) — the session log now fans out
+through the hub once, the UI runs on `bus.subscribe`, and `log.query` is the typed session-log
+reader. The per-env record RPCs (`episodes.*`, `tool_results.*`, `blobs.*`, `state.retain`) stay,
+since the P3.4 storage model and its retention are per-env.
 
 - **`rs/bus`** (its own crate, see `rs/bus/README.md`): the `Envelope` of RFC section 2 and the
   `Hub` — lock-free publish over an `ArcSwap` subscriber snapshot, per-subscriber rings
@@ -1247,10 +1253,54 @@ call is a capability bounded to the caller's env: a connection that has bound it
 are refused `cross_env_denied`. base/barebone/CLI callers are unscoped and may target any env. This
 extends P3's "children cannot touch parents" from the record RPCs to the facades.
 
-**The session bridge (temporary, P4.0 only).** So `bus.subscribe` sees real traffic before its
-producers are migrated, every `events.append` ALSO publishes a durable, model-visible
-`session/<kind>` envelope on the bus (`facaderpc::bridge_session`, called from one place in
-`events_append`). P4.1 removes this duplication when the harness emits through the fabric directly.
+## The facade migration (P4.1)
+
+P4.0 stood the fabric up beside the P3 record RPCs and double-wrote the session log to it (the
+"session bridge"). P4.1 收口: producers publish once, readers read through the facade, the UI runs on
+`bus.subscribe`, and base's own parallel subscriber list is gone.
+
+**Publish once.** The durable truth of the session log stays where P3 put it — the per-env `events`
+table, `log = truth` (RFC section 1) — so retention, per-env isolation and byte-identical replay are
+untouched. What changed is the fan-out: base's single producer path (`emit`, `emit_env`,
+`events_append`) now calls `Base::publish_event` once, which emits a non-durable `session/<kind>`
+envelope for an env (or `base/<kind>` for the barebone) onto the hub. That one call replaced **both**
+the P4.0 durable session bridge (`facaderpc::bridge_session`, a second persisted copy in the
+`envelopes` table) **and** base's own `subs`/`subscribe` fan-out. `model_visible` is deliberately
+left off the live envelope: it implies `durable`, which would re-persist to the `envelopes` table and
+re-create the very duplication being deleted — the session-log law is already satisfied by the
+`events`-table write.
+
+**Read through the facade.** `log.query{env, session?, after?, limit?}` is the typed reader over an
+env's log (RFC section 3): `events.tail` plus an optional `session` narrowing, one path that
+`session.history`, the UI backfill and the CLI share without touching sqlite or a topic glob. Its
+answer shape is `events.tail`'s, so it is a drop-in. `session.history` and `session.resume` are
+unchanged and remain byte-identical — a golden test (`harness/tests/loop_test.rs`) pins the kind
+sequence and the resume fold for a fake-model session.
+
+**UI on subscribe (RFC 8).** `tenon attach --ui` and `tenon serve` build the `UiModel` from a
+`bus.subscribe` stream (`Ui::ingest`, topics `session/**`+`base/**`, `coalesce_ms=16`) plus a
+one-shot `status` for the node tree and `approval.list` for the queue — the transcript and the event
+tail are never re-polled. An attach mid-session backfills once via `log.query`, then the live stream
+carries it forward (`since` pulls the delta). `tenon run` and plain `tenon attach` also stream from
+`bus.subscribe` (the `t:"ev"` frame carries `{kind, data, at}` mirror fields so the readers did not
+have to learn the envelope shape). The `status` RPC stays for the one-shot `tenon status`.
+
+**Deleted.** The old `subscribe` RPC, `Cmd::Subscribe`, base's `subs` map and `wanted()`, and
+`bridge_session`. `exit_on_detach` and `status.attached` now count the connections that hold a
+`bus.subscribe` (the `attached` set, decremented on `Gone`). **Kept as-is** (the per-env storage
+model and its retention gate depend on them): `events.tail`, `episodes.*`, `tool_results.*`,
+`blobs.*`, `state.retain`, and the approvals decision path `approval.request/answer`.
+
+**ControlLease.** The multi-terminal takeover convention is a lease-backed kv key `/ctl/<env>`: the
+holder may send input, other attached terminals render read-only, an idle holder auto-releases
+(`kv.lease` ttl), explicit takeover overwrites. P4.1 documents the key and wires the read path; the
+full co-display takeover is left minimal.
+
+**Elixir bridge.** The guardian and the node `Link` forward their own events to base's bus as
+envelopes over the Link socket (`bus.publish`): `guardian/pass|failed|reset` and node lifecycle, plus
+a Logger handler that turns Elixir Logger events into `log/<node>` envelopes (level-mapped,
+loop-guarded). The guardian's `violations` probe still reads `events.tail` (kept), so the P3.5b reset
+gate is unchanged.
 
 ## What base does when something dies
 
