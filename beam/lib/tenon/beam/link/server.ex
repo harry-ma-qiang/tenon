@@ -8,6 +8,7 @@ defmodule Tenon.Beam.Link.Server do
 
   require Logger
 
+  alias Tenon.Beam.Bus
   alias Tenon.Beam.Frame
   alias Tenon.Beam.Link.Handlers
 
@@ -35,6 +36,11 @@ defmodule Tenon.Beam.Link.Server do
     GenServer.call(pid, {:request, method, params, limit}, limit + 1_000)
   catch
     :exit, reason -> {:error, reason}
+  end
+
+  def service(pid, :publish, [envelope]) do
+    GenServer.cast(pid, {:publish, envelope})
+    :ok
   end
 
   def service(_pid, method, _args), do: {:error, {:unknown_method, method}}
@@ -67,6 +73,8 @@ defmodule Tenon.Beam.Link.Server do
       "token" => System.get_env("TENON_NODE_TOKEN", "")
     })
 
+    lifecycle = %{"event" => "register", "role" => state.role, "pid" => os_pid()}
+    publish(state, Bus.envelope("guardian/node", "info", state.env, lifecycle))
     {:reply, :ok, state}
   end
 
@@ -81,6 +89,12 @@ defmodule Tenon.Beam.Link.Server do
     send_frame(state, frame)
     timer = Process.send_after(self(), {:expire, id}, timeout)
     {:noreply, %{state | next: id + 1, pending: Map.put(state.pending, id, {from, timer})}}
+  end
+
+  @impl GenServer
+  def handle_cast({:publish, envelope}, state) do
+    publish(state, envelope)
+    {:noreply, state}
   end
 
   @impl GenServer
@@ -196,6 +210,16 @@ defmodule Tenon.Beam.Link.Server do
     end)
 
     System.stop(0)
+  end
+
+  # Fire-and-forget publish to base's bus. A failed send is base going away,
+  # which the socket close already handles; a publish must never crash the node.
+  defp publish(state, envelope) do
+    send_frame(state, Bus.frame(envelope))
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
   end
 
   defp send_frame(state, frame), do: :gen_tcp.send(state.socket, Frame.encode(frame))

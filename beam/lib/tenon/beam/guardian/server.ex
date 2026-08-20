@@ -5,6 +5,7 @@ defmodule Tenon.Beam.Guardian.Server do
 
   require Logger
 
+  alias Tenon.Beam.Bus
   alias Tenon.Beam.Guardian.Probes
   alias Tenon.Beam.Link.Handlers
 
@@ -49,6 +50,7 @@ defmodule Tenon.Beam.Guardian.Server do
 
   defp score(state, []) do
     tell(state, {:tenon_guardian, :up})
+    publish(state, "guardian/pass", "info", %{"target" => state.target, "strikes" => 0})
     %{state | strikes: 0}
   end
 
@@ -58,14 +60,28 @@ defmodule Tenon.Beam.Guardian.Server do
     Logger.warning("tenon guardian: #{state.target} failed #{Enum.join(names, ",")} (#{strikes})")
     tell(state, {:tenon_guardian, :failed, names})
     tell(state, {:tenon_guardian, :strike, strikes})
+
+    publish(state, "guardian/failed", "warn", %{
+      "target" => state.target,
+      "probes" => names,
+      "strikes" => strikes
+    })
+
     if strikes >= state.limit, do: reset(state, names), else: %{state | strikes: strikes}
   end
 
   defp reset(state, names) do
     Logger.error("tenon guardian: resetting #{state.target} after #{state.limit} failures")
     tell(state, {:tenon_guardian, :reset})
+    publish(state, "guardian/reset", "error", %{"target" => state.target, "probes" => names})
     call(state, "reset", %{"env" => state.target, "probes" => names})
     %{state | strikes: 0}
+  end
+
+  defp publish(state, topic, level, payload) do
+    :tenon.svc(state.ctx, :link, :publish, [Bus.envelope(topic, level, state.target, payload)])
+  catch
+    _kind, _reason -> :ok
   end
 
   defp call(state, method, params) do
