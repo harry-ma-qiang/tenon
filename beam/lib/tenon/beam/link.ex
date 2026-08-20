@@ -8,7 +8,10 @@ defmodule Tenon.Beam.Link do
   connection closes the node stops: that is how `kill -9` of base takes every node down.
   """
 
+  alias Tenon.Beam.Boot
+  alias Tenon.Beam.Link.Handlers
   alias Tenon.Beam.Link.Server
+  alias Tenon.Beam.LogBridge
 
   @spec inject() :: []
   def inject, do: []
@@ -18,10 +21,23 @@ defmodule Tenon.Beam.Link do
     case Server.start_link(ctx, config) do
       {:ok, pid} ->
         :tenon.provide(ctx, :link, fn method, args -> Server.service(pid, method, args) end)
-        {:ok, fn -> Server.stop(pid) end}
+        {:ok, mount(pid, to_string(Handlers.opt(config, :env, "root")))}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # The Logger bridge is a live-node concern only: a test that mounts the Link
+  # directly must not install a global logger handler in its own VM.
+  defp mount(pid, node) do
+    if Boot.node?() do
+      LogBridge.attach(fn envelope -> Server.service(pid, :publish, [envelope]) end, node)
+    end
+
+    fn ->
+      LogBridge.detach(node)
+      Server.stop(pid)
     end
   end
 
