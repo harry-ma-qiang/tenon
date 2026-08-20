@@ -2016,3 +2016,77 @@ lock). The stripped release binary is *not* literally byte-identical, though: it
 difference in one region — rustc's crate-metadata/symbol hash, which the four gated `pub mod http-*`
 declarations feed even when cfg-stripped. Same size, one localized region, metadata not code.
 Reported honestly rather than claimed away.
+
+## P4.5 result — app platform: ingress, `/app/<name>` proxy, kv lease routes (2026-08-20)
+
+RFC 8c's ingress, feature-gated under `http` (it extends serve). An app running **inside** a sandbox
+publishes an HTTP service and `serve` proxies `/app/<name>/*` to it. No new process, no new dependency,
+one authorizer, one kv registry.
+
+### Registration and the env-from-connection rule
+
+An in-sandbox app has one path to base — the gateway's `link` service — so it calls
+`svc link.request ["ingress.register", {name, port, public?}]`. Base takes the caller's env from the
+**node connection that carried the frame** (`Base::env_of_peer`), never from the app, which is the
+single most important safety property: a child can never register into a parent (8d). It validates
+name shape, host-global uniqueness (`@ingress` kv namespace, unique across the whole env tree),
+per-env/host quota, and that the `port` was actually published for that env's sandbox, then writes
+`/ingress/<name> -> {env, addr, public, port, lease}` as a **lease-backed** ephemeral kv key.
+`ingress.list`/`resolve`/`unregister` and `tenon ingress` round it out; list/resolve run off
+`facades.kv` in `server.rs`, register/unregister go through the actor (they need env-from-peer + the
+instance).
+
+### Port mapping — the crux
+
+oci has no path from host to a container port unless it is published at `run` time, and podman 4.9
+refuses host port `0`. So each agent env's sandbox publishes a fixed span `[18080, 18080+max_per_env)`
+up front: base reserves a free `127.0.0.1` host port per container port and maps it
+(`OciInstance::ingress_addr`); landlock/none share the host netns so the addr is
+`127.0.0.1:<container-port>`. `TENON_INGRESS_PORTS` tells the app which ports it may bind. Empty span
+= the whole non-`http` build and the guardian, so their spawn line is byte-identical.
+
+### Liveness — base renews, the app does not
+
+RFC 8c says "the app keeps the lease alive", but an in-sandbox app has no timer in the SDK's
+single-threaded loop, and an HTTP probe is the one liveness signal that stays reliable through a
+rootless-podman port forwarder (a bare `connect` is *accepted* by the forwarder even when the app
+behind it is dead — verified empirically before choosing the design). So base runs one liveness loop
+(`ingress.probe_ms`) that HTTP-probes each route and renews the lease; two failed probes drop the
+route at once, the lease TTL is the backstop. The demo app is therefore just "register then serve".
+
+### Routing
+
+`serve` resolves `/app/<name>` through base, strips the prefix, stamps `X-Tenon-App`/`X-Tenon-Env`
+(dropping any the client set), replaces `Host`, never forwards `Authorization`, and streams the
+response. WS upgrade passes through on the same path (`copy_bidirectional` after a header-rewritten
+handshake). Auth is the single authorizer with the route's `public` flag; no live lease = 404,
+unreachable app = 502; body-size and connection caps from config.
+
+### Tests (gate green)
+
+`cli/tests/ingress_gate.rs` boots oci, launches a ~30-line stdlib python app inside the sandbox that
+registers `hello-app` via `link` and serves `/hello` + `/echo`, then asserts through
+`serve --https --auth-token`: token → `hi from root`, `/echo` echoes the `X-Tenon-*` headers, no
+token → 401, a second (child) env is refused the owned name (`owned by env root`), and `kill -9` of
+the app expires the route → 404/502. Passes in ~13 s here.
+
+### Gates
+
+`cargo build --release` (feature off) + `--release --features http` + `cargo clippy --all-targets
+--all-features -D warnings` + `cargo fmt --check` all clean. Required suites green run individually:
+`bus_gate` (6), `bus_adversarial` (11), `query_gate` (2), `serve_https_gate` (1), `ws_gate` (2),
+`secrets_gate` (2), `serve_authz_adversarial` (6), sandbox conformance (17), base lib (27), plus the
+new `ingress_gate` (1). `podman ps -a --filter label=tenon.home` afterwards shows only the live demo
+base `tenon.base:647207`.
+
+### New files
+
+| File | lines |
+|---|---:|
+| `base/src/ingress.rs` (registry, env-from-peer, liveness) | ~300 |
+| `base/src/proxy.rs` (`/app` HTTP + WS proxy) | ~122 |
+| `cli/tests/ingress_gate.rs` (+ inline app.py) | ~260 |
+
+Plus small edits: `config.rs` ingress block, sandbox `Spec.ingress_ports` + `Instance::ingress_addr`
+(oci/landlock), `instance.rs`/`http.rs`/`server.rs`/`rpc.rs`/`cmds.rs`/`base.rs`/`lib.rs` wiring, and
+the `tenon ingress` CLI command.
