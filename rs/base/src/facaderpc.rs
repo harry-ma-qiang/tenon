@@ -100,7 +100,7 @@ pub async fn bus_publish(conn: &Conn, facades: &Facades, body: &Value) -> Answer
 /// the client disconnects (its cancel fires) or the ring closes.
 pub fn bus_subscribe(conn: &Conn, facades: &Facades, body: &Value) -> Answer {
     let scoped = conn.scoped_opt(req_env(body).as_deref())?;
-    let filter = filter_from(body, scoped);
+    let filter = filter_from(body, scoped, conn.bound().is_some());
     let opts = SubOpts {
         since_offset: body.get("since_offset").and_then(Value::as_i64),
         coalesce_ms: body.get("coalesce_ms").and_then(Value::as_u64),
@@ -119,7 +119,7 @@ pub fn bus_subscribe(conn: &Conn, facades: &Facades, body: &Value) -> Answer {
     Ok(json!({"ok": true, "offset": offset}))
 }
 
-fn filter_from(body: &Value, env: Option<String>) -> Filter {
+fn filter_from(body: &Value, env: Option<String>, scoped: bool) -> Filter {
     let topics = body
         .get("topics")
         .and_then(Value::as_array)
@@ -145,6 +145,7 @@ fn filter_from(body: &Value, env: Option<String>) -> Filter {
         levels,
         env,
         session: str_of(body, "session").map(str::to_string),
+        scoped,
         ..Filter::default()
     }
 }

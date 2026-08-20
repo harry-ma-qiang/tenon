@@ -1889,3 +1889,11 @@ accumulate across CI runs.
     `<home>/upgrades/<id>/`. The alternative — symlinking every entry but the one `ebin` —
     saves a second and a few tens of megabytes and makes `RELEASE_ROOT` resolution depend on
     how the release script resolves its own path. A rare operation buys simplicity here.
+67. **P4.0 adversarial hardening (4 defects).** `ttl_s` now expires an envelope for live
+    fan-out, durable replay and the vacuum; an env-bound (`scoped`) subscriber never receives the
+    reserved base-internal namespaces (`session/ internal/ base/ budget/ approval/ guardian/
+    upgrade/ worker/`) whatever its glob, so a firehose `**` cannot see base traffic; the kv
+    global revision persists a high-water block (`kv_meta.rev_hwm`) so it stays monotonic across
+    a restart even for revisions spent by ephemeral writes; and `blob.open` past end-of-blob and
+    `blob.get`/`blob.stat` of an unknown hash return clean errors (offsets within the blob still
+    clamp).

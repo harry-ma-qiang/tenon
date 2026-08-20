@@ -1791,3 +1791,5 @@ P4.0 — `after_ms` and `every_ms` only; cron is documented as later. (4) `kv.wa
 segment-aligned globs (`kv/<prefix>**`), which suits the path-like keys (`/timers/`, `/ctl/`).
 (5) The tracing layer is installed process-wide with `try_init`, a no-op if a subscriber already
 exists.
+
+P4.0 adversarial: 4 defects fixed — ttl_s enforcement (bus fan-out/replay/vacuum), env-scope firehose (scoped subscribers exclude reserved namespaces), kv revision monotonic across restart (kv_meta.rev_hwm high-water), blob unknown-hash/out-of-range errors.

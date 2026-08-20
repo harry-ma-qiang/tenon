@@ -74,9 +74,11 @@ impl Store {
             .conn
             .blob_open(MAIN_DB, "blobs", "bytes", rowid, true)?;
         let size = blob.size() as i64;
-        let start = offset.clamp(0, size);
-        let want = len.max(0).min(size - start) as usize;
-        blob.seek(SeekFrom::Start(start as u64))?;
+        if offset < 0 || len < 0 || offset > size {
+            bail!("blob range out of bounds: offset {offset} len {len} size {size}");
+        }
+        let want = len.min(size - offset) as usize;
+        blob.seek(SeekFrom::Start(offset as u64))?;
         let mut out = vec![0u8; want];
         let mut done = 0usize;
         while done < want {
