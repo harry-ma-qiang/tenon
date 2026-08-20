@@ -55,6 +55,8 @@ pub struct Hub {
     durable: Option<Arc<dyn Durable>>,
     writer: Mutex<Option<mpsc::UnboundedSender<Job>>>,
     max_offset: AtomicU64,
+    #[cfg(feature = "http")]
+    guard: crate::secret::SecretGuard,
 }
 
 impl Hub {
@@ -65,6 +67,8 @@ impl Hub {
             durable: None,
             writer: Mutex::new(None),
             max_offset: AtomicU64::new(0),
+            #[cfg(feature = "http")]
+            guard: crate::secret::SecretGuard::new(),
         })
     }
 
@@ -79,6 +83,8 @@ impl Hub {
             durable: Some(durable),
             writer: Mutex::new(None),
             max_offset: AtomicU64::new(head),
+            #[cfg(feature = "http")]
+            guard: crate::secret::SecretGuard::new(),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         *hub.writer.lock().expect("writer lock") = Some(tx);
@@ -91,6 +97,54 @@ impl Hub {
         self.max_offset.load(Ordering::Relaxed)
     }
 
+    /// Install the current secret set (RFC 8d.4). Base is the only caller; the
+    /// hub then scrubs every payload it fans out or persists.
+    #[cfg(feature = "http")]
+    pub fn set_secrets(&self, rules: Vec<crate::secret::Rule>) {
+        self.guard.set(rules);
+    }
+
+    /// The single scrub any producer that writes its own durable copy (base's
+    /// event-log append) calls before that write, so the state file never holds
+    /// a raw secret value. `Err(name)` means a `block` secret matched.
+    #[cfg(feature = "http")]
+    pub fn scrub(&self, payload: &mut serde_json::Value) -> Result<(), String> {
+        self.guard.scan(payload)
+    }
+
+    /// Runs the leak guard over an envelope's payload. On a `block` match it fans
+    /// out a `guardian/violation` event (value-free) and reports the error; on
+    /// `mask` the payload is rewritten in place and the envelope proceeds.
+    #[cfg(feature = "http")]
+    fn guard(&self, envelope: &mut Envelope) -> Result<(), String> {
+        if self.guard.is_empty() {
+            return Ok(());
+        }
+        match self.guard.scan(&mut envelope.payload) {
+            Ok(()) => Ok(()),
+            Err(name) => {
+                self.emit_violation(&name, &envelope.topic, envelope.env.clone());
+                Err(format!(
+                    "secret {name} blocked from topic {}",
+                    envelope.topic
+                ))
+            }
+        }
+    }
+
+    #[cfg(feature = "http")]
+    fn emit_violation(&self, name: &str, topic: &str, env: Option<String>) {
+        let mut violation = Envelope::new(
+            "guardian/violation",
+            crate::envelope::Level::Error,
+            serde_json::json!({"secret": name, "topic": topic, "action": "block"}),
+        );
+        violation.env = env;
+        violation.src = "base".to_string();
+        violation.normalize();
+        self.fan_out(Published::new(violation, 0));
+    }
+
     fn writer_tx(&self) -> Option<mpsc::UnboundedSender<Job>> {
         self.writer.lock().expect("writer lock").clone()
     }
@@ -100,6 +154,10 @@ impl Hub {
     /// does not learn the offset.
     pub fn emit(&self, mut envelope: Envelope) {
         envelope.normalize();
+        #[cfg(feature = "http")]
+        if self.guard(&mut envelope).is_err() {
+            return;
+        }
         if envelope.durable {
             if let Some(tx) = self.writer_tx() {
                 let _ = tx.send(Job {
@@ -117,6 +175,8 @@ impl Hub {
     /// resolves to 0.
     pub async fn publish(&self, mut envelope: Envelope) -> Result<u64, String> {
         envelope.normalize();
+        #[cfg(feature = "http")]
+        self.guard(&mut envelope)?;
         if envelope.durable {
             if let Some(tx) = self.writer_tx() {
                 let (reply, wait) = oneshot::channel();

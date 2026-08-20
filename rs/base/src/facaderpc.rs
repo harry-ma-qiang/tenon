@@ -36,6 +36,13 @@ impl Conn {
         self.scope.lock().expect("scope").clone()
     }
 
+    /// The env this connection is scoped to (RFC 8d.2), for the secrets facade's
+    /// grant check. Gated to the http feature so the default binary is unchanged.
+    #[cfg(feature = "http")]
+    pub fn bound_scope(&self) -> Option<String> {
+        self.bound()
+    }
+
     /// The optional-env resolution: a scoped caller can never name another env;
     /// an unscoped caller keeps whatever it named (`None` = every env, for a
     /// firehose subscribe).

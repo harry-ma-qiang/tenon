@@ -574,6 +574,21 @@ impl Base {
     }
 
     pub fn emit(&mut self, kind: &str, env: Option<&str>, data: Value) {
+        // The leak scrub is the http feature's; with it off this reduces to the
+        // exact original append + fan-out, so the default binary is unchanged.
+        #[cfg(feature = "http")]
+        let data = {
+            let mut data = data;
+            if let Some(hub) = &self.hub {
+                if hub.scrub(&mut data).is_err() {
+                    // A `block` secret: never reaches the state file. The hub
+                    // emits the violation when publish_event fans it out.
+                    self.publish_event(kind, env, &data);
+                    return;
+                }
+            }
+            data
+        };
         if self.store.append(kind, env, &data).is_err() {
             return;
         }

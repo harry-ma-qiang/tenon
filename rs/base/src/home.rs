@@ -35,6 +35,11 @@ impl Home {
         self.root.join("config.yml")
     }
 
+    #[cfg(feature = "http")]
+    pub fn secrets_file(&self) -> PathBuf {
+        self.root.join("secrets.yml")
+    }
+
     pub fn state_file(&self) -> PathBuf {
         self.root.join("state.sqlite")
     }
