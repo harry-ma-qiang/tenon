@@ -2254,3 +2254,58 @@ into a fresh home + `tenon start` there replays the session (`session.history` r
 gone. `cargo build --release` (feature off + `--features http`), `clippy --all-targets
 --all-features -D warnings`, `fmt --check` all clean; full `cargo test --features http` green twice.
 `podman ps -a --filter label=tenon.home` shows only the live demo base `tenon.base:647207`.
+
+## P4.8 result — `tenon doctor` + one shared probe list; P4 final (2026-08-20)
+
+The last P4 phase: a one-shot install diagnostic and the convergence of the guardian's probe list
+into one documented catalog, plus the P4 review. P4 is complete (P4.3 warm segments deliberately
+deferred to P5 — the query facade is the stable seam, the engine is P5 memory's).
+
+1. **Shared probe list (names + semantics, one place).** A truly shared code list is impractical
+   across the language boundary — the guardian's seven probes are Elixir frames to a *running* base
+   (runtime health, driving auto-reset), doctor is a Rust *offline* one-shot. So the convergence is
+   the names and semantics: `@catalog` in `beam/lib/tenon/beam/guardian/probes.ex` is now the single
+   documented list (`Probes.catalog/0`; `core/0` its names in run order), and `rs/base/src/doctor.rs`
+   mirrors it by name and adds the install-only probes. Behavior-preserving: `@core` is derived from
+   `@catalog`, `guardian_test` (13) and `guardian_gate` (live reset) both green, the guardian loop is
+   untouched.
+2. **`tenon doctor [--home DIR]` (`rs/base/src/doctor.rs`, ~220 lines + 3 unit tests).** Seven
+   install probes, each a name + pure check -> ok/warn/fail + detail: `release` (TENON_RELEASE_DIR or
+   an extracted erts + tenon version), `python3`, `container` (podman/docker), `sandbox`
+   (`detect()` + the krun-unavailable reason verbatim), `serve_port` (127.0.0.1:8791 bindable),
+   `state_integrity` (`integrity_check` over state.sqlite + every state-<env>.sqlite, the same check
+   base runs at boot), `config` (parses config.yml without writing one). Prints one line per probe,
+   exits non-zero if any *failed* (a warn never fails). Needs no running base and writes nothing into
+   the home. CLI: a `Doctor` subcommand + a two-line dispatch (`cli/src/main.rs`).
+3. **Docs + review.** `rs/README.md` gains a `tenon doctor` section, a Commands-table row, a note in
+   the guardian-probes section pointing at the shared catalog, and deviation 70. `REVIEW-P4.md`
+   (root) mirrors REVIEW-P3: the P4.0-4.8 plan table, test inventory, the security review (5 defects
+   + the default-deny scope guard), live e2e on the single-file binary, and a perf section.
+
+### e2e (single-file http binary, embedded payload, real deepseek-v4-flash, fresh /tmp/tenon-qa-p4)
+
+doctor 6ok/1warn before start and 7ok after; start 1.47 s to ready; bus/kv/timer smoke over raw UDS
+frames (kv.set rev1, bus envelope delivered, after_ms timer fired); `run` pong 1142 ms + a bash tool
+turn 2026 ms; MCP stdio server (initialize/tools/list 12/tools-call bash -> mcp-roundtrip-ok);
+webhook POST no-token 401 / token 200; backup under a live base -> restore into a fresh home ->
+restart replays 23 session events. ingress + MCP-client + the full P4 gate set confirmed via their
+gates (all green, see below).
+
+### Perf (this box, some figures under a concurrent second-agent build)
+
+bus fan-out 282,141 msg/s; publish->subscriber p50 1.04 us / p99 1.32 us (budget p99 < 1 ms). query
+at 1M events: text p50 402 us / p99 477 us (< 10 ms), scan p50 68.8 ms / p99 70 ms (< 100 ms). Cold
+start ~1.47 s; idle RSS ~305-310 MB (two beam.smp); UI latency <= one 16 ms coalesce frame.
+
+### Gates
+
+Beam: `mix compile --warnings-as-errors`, `mix format --check-formatted`, `mix credo --strict` (386
+mods/funs), `mix test` 51/0. Rust: `cargo build --release` (feature off + `--features http`),
+`clippy --all-targets --all-features -D warnings`, `fmt --check` all clean; unit 101/0 (base 30
+incl. 3 doctor); integration green individually — `guardian_gate`, `ingress_gate`, `mcp_gate` (2),
+`bus_gate` (6), `query_gate` (2), `ws_gate` (2), `secrets_gate` (2), `backup_gate`, `webhook_gate`,
+`trigger_gate` (2), `serve_https_gate`, `serve_authz_adversarial` (6), `ws_scope_adversarial` (8),
+`secrets_leak_adversarial` (4), and `adversarial` 20/20 in isolation. The full parallel run reproduced
+the documented pre-existing adversarial timing flake (2 crash tests) only while a second agent's
+release build saturated the CPU; clean in isolation. The P4.6 fixture race did not recur. `podman ps
+-a --filter label=tenon.home` shows only the live demo base `tenon.base:647207`.
