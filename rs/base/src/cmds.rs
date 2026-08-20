@@ -176,6 +176,19 @@ impl Base {
                     .unwrap_or(false);
                 let _ = reply.send(ok);
             }
+            #[cfg(feature = "http")]
+            Cmd::IngressRegister {
+                peer,
+                name,
+                port,
+                public,
+                approved,
+                reply,
+            } => self.ingress_register(peer, name, port, public, approved, reply),
+            #[cfg(feature = "http")]
+            Cmd::IngressUnregister { peer, name, reply } => {
+                self.ingress_unregister(peer, name, reply)
+            }
         }
     }
 }

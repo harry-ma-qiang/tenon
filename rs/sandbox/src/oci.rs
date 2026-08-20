@@ -1,5 +1,6 @@
 use crate::{proc, Endpoint, ExecOutcome, Instance, Sandbox, Spec};
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,8 @@ pub struct OciInstance {
     cli: &'static str,
     destroyed: AtomicBool,
     gateway: Option<String>,
+    /// container ingress port -> the host `127.0.0.1:<port>` it is published on.
+    ingress: HashMap<u16, String>,
 }
 
 pub fn probe() -> Result<Box<dyn Sandbox>, String> {
@@ -100,6 +103,22 @@ impl Sandbox for Oci {
                 args.push(format!("{name}={value}"));
             }
         }
+        // RFC 8c ingress (P4.5): publish each container-side app port on a free
+        // 127.0.0.1 host port. podman 4.x refuses host port 0, so a free port is
+        // chosen on the host first; the small window until the engine binds it is
+        // the same race every ephemeral-port scheme has.
+        let mut ingress: HashMap<u16, String> = HashMap::new();
+        for cport in &spec.ingress_ports {
+            let host_port = free_host_port()?;
+            args.push("-p".to_string());
+            args.push(format!("127.0.0.1:{host_port}:{cport}"));
+            ingress.insert(*cport, format!("127.0.0.1:{host_port}"));
+        }
+        if !spec.ingress_ports.is_empty() {
+            let csv: Vec<String> = spec.ingress_ports.iter().map(u16::to_string).collect();
+            args.push("-e".to_string());
+            args.push(format!("TENON_INGRESS_PORTS={}", csv.join(",")));
+        }
         args.push(image.to_string());
         args.push("sleep".to_string());
         args.push("infinity".to_string());
@@ -119,6 +138,7 @@ impl Sandbox for Oci {
             cli: self.cli,
             destroyed: AtomicBool::new(false),
             gateway: spec.gateway.clone(),
+            ingress,
         }))
     }
 
@@ -177,6 +197,12 @@ impl Oci {
             Err(_) => true,
         }
     }
+}
+
+fn free_host_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("reserve a free host port for ingress")?;
+    Ok(listener.local_addr()?.port())
 }
 
 fn container_name(env: &str, home_hash: &str) -> String {
@@ -245,6 +271,10 @@ impl Instance for OciInstance {
             outcome.timed_out = true;
         }
         Ok(outcome)
+    }
+
+    fn ingress_addr(&self, container_port: u16) -> Option<String> {
+        self.ingress.get(&container_port).cloned()
     }
 
     fn destroy(&self) -> Result<()> {

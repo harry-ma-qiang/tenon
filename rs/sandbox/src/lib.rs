@@ -45,6 +45,13 @@ pub struct Spec {
     /// `<images>/<image>/rootfs`. Only krun reads it; oci pulls by reference
     /// and landlock has no root of its own.
     pub images: Option<PathBuf>,
+    /// The container-side TCP ports (RFC 8c ingress, P4.5) an app inside this
+    /// instance may bind and register through `ingress.register`. oci publishes
+    /// each to a free host port on 127.0.0.1; landlock shares the host network
+    /// so the same port is reachable directly. Empty (the default, and the whole
+    /// non-`http` build) publishes nothing, so the spawn line is unchanged.
+    #[serde(default)]
+    pub ingress_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -84,6 +91,15 @@ pub trait Instance: Send + Sync {
     /// worker and it can only happen once the gateway is listening.
     fn start_worker(&self, _env: &str, _gateway: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    /// The host-reachable `host:port` an app that bound `container_port` inside
+    /// this instance is reachable at (RFC 8c ingress, P4.5), or `None` when that
+    /// port was never published for this instance. oci maps it to the free host
+    /// port it published; landlock and none run in the host network namespace so
+    /// the answer is `127.0.0.1:<container_port>` for a published port.
+    fn ingress_addr(&self, _container_port: u16) -> Option<String> {
+        None
     }
 }
 
@@ -199,6 +215,7 @@ mod tests {
             home_hash: "deadbeef0000".to_string(),
             base_pid: std::process::id() as i32,
             images: None,
+            ingress_ports: Vec::new(),
         }
     }
 

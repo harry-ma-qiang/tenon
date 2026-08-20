@@ -52,6 +52,10 @@ pub struct Base {
     /// `bus.subscribe` reads — the P4.0 session bridge and base's own subscriber
     /// list both collapsed into it in P4.1.
     pub hub: Option<std::sync::Arc<tenon_bus::Hub>>,
+    /// The kv facade, when the facades are wired: the ingress route registry
+    /// (RFC 8c, P4.5) lives in it as lease-backed keys under `@ingress`. Set only
+    /// in the `http` build; `None` everywhere else.
+    pub kv: Option<std::sync::Arc<crate::kv::KvFacade>>,
 }
 
 impl Base {
@@ -87,6 +91,7 @@ impl Base {
             privilege: crate::privilege::Plan::Off,
             draining: BTreeMap::new(),
             hub: None,
+            kv: None,
         }
     }
 

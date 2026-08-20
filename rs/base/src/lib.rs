@@ -22,6 +22,8 @@ pub mod hash;
 pub mod home;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+pub mod ingress;
 pub mod instance;
 pub mod integrity;
 pub mod kv;
@@ -144,6 +146,11 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         cmds.clone(),
     );
     state.hub = Some(facades.hub.clone());
+    #[cfg(feature = "http")]
+    {
+        state.kv = Some(facades.kv.clone());
+        ingress::spawn_liveness(facades.kv.clone(), config.ingress.probe_ms);
+    }
     tokio::spawn(server::serve(
         listener,
         cmds.clone(),

@@ -277,6 +277,24 @@ pub enum Cmd {
         token: String,
         reply: oneshot::Sender<bool>,
     },
+    /// `ingress.register` (RFC 8c, P4.5): an app inside a sandbox claims an
+    /// `/app/<name>` route. The env is taken from `peer` (the node that carried
+    /// the call), never from the app, so a child cannot register into a parent.
+    #[cfg(feature = "http")]
+    IngressRegister {
+        peer: u64,
+        name: String,
+        port: i64,
+        public: bool,
+        approved: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    #[cfg(feature = "http")]
+    IngressUnregister {
+        peer: u64,
+        name: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 pub struct NodeView {

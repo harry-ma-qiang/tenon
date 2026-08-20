@@ -27,6 +27,7 @@ pub struct LandlockInstance {
     workspace: PathBuf,
     gateway_dir: Option<PathBuf>,
     binary: String,
+    ingress_ports: Vec<u16>,
 }
 
 pub fn probe() -> Result<Box<dyn Sandbox>, String> {
@@ -54,6 +55,7 @@ impl Sandbox for Landlock {
             workspace: spec.workspace.clone(),
             gateway_dir,
             binary: crate::host_binary(spec),
+            ingress_ports: spec.ingress_ports.clone(),
         }))
     }
 }
@@ -109,6 +111,12 @@ impl Instance for LandlockInstance {
             });
         }
         proc::run(command, timeout)
+    }
+
+    fn ingress_addr(&self, container_port: u16) -> Option<String> {
+        self.ingress_ports
+            .contains(&container_port)
+            .then(|| format!("127.0.0.1:{container_port}"))
     }
 
     fn destroy(&self) -> Result<()> {
