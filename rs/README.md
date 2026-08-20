@@ -563,7 +563,7 @@ harness                         base                       state-<env>.sqlite
             --> blobs.put ---------> blobs (sha256)          (only when > 4 KB)
             --> tool_results.append -> tool_results (event N, hash)
   step done --> episodes.append ---> episodes (state_hash, action, score, cost)
-  reader    <-- episodes.tail{n} / blobs.get{hash,offset?,len?} / state.retain
+  reader    <-- query.scan{source} / query.text{q} / log.query / blobs.get / state.retain
 ```
 
 ## The environment tree (`runtime.spawn`)
@@ -1173,11 +1173,8 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `plugin{env,op,plugin_id?,spec?}` | harness, CLI | forwarded to that env's node: `list`, `mount` (a `{module}` or `{cmd,args,env}` spec), `unmount`, `restart`. The fiber's id travels as `plugin_id` because `id` is the frame's own correlation id |
 | `session.create{env}` / `session.prompt{env,session_id,text}` (both refused while that env is halted or the kill switch is on) / `session.status` / `session.history` / `session.resume` | CLI | forwarded to that env's harness as `svc{name: "loop"}`; how `tenon run` drives the agent |
 | `events.append{env,kind,data}` | harness | one row in `state-<env>.sqlite`'s `events`, fanned out to every subscriber as an `{"t":"event","scope":"env"}` frame. Base is that file's only writer |
-| `events.tail{env,after?,limit?}` | harness, CLI | that env's session log from `after` on; `env: "base"` reads the barebone's own log (boot, LKG, probes, sandbox) instead |
 | `episodes.append{env,session_id,step,action,verifier_score?,cost,user_event?,state_hash?}` | harness | one `episodes` row; the state hash is computed here from the newest snapshot ref and `user_event` unless one is given |
-| `episodes.tail{env,n?}` | CLI, plugins | the newest `n` episodes (default 200, capped at 5000), oldest first |
 | `tool_results.append{env,event_id,name,status,duration_ms,blob_hash?}` | harness | one `tool_results` row against a `tool/result` event |
-| `tool_results.tail{env,n?}` | CLI, plugins | the newest `n` tool result rows |
 | `blobs.put{env,data}` | harness | store base64 `data`; answers `{hash, size}`, deduplicated by content |
 | `blobs.get{env,hash,offset?,len?}` | harness, CLI | the blob as base64; with `offset`/`len` it is an incremental window read |
 | `state.retain{env}` | CLI, plugins | run the `retention:` policy against that env's file; answers `{removed, left}` and emits `state.retain` |
@@ -1194,7 +1191,10 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `kill{reason?}` / `resume{reason?}` | CLI, plugins | the kill switch over the socket: halt every harness and refuse every prompt, or let them back |
 | `stop` | CLI | graceful shutdown of everything, base included |
 | `status` | CLI | the snapshot plus one `tree` request per registered node |
-| `log.query{env,session?,after?,limit?}` | harness, CLI, UI | the typed session-log reader (RFC section 3): `events.tail` plus an optional `session` narrowing, one path into an env's log with no sqlite or glob exposed |
+| `log.query{env,session?,after?,limit?}` | harness, CLI, UI | the typed session-log reader (RFC section 3): the newest rows of an env's log plus an optional `session` narrowing, one path into an env's log with no sqlite or glob exposed. `env: "base"` reads the barebone's own log (boot, LKG, probes, sandbox) instead |
+| `query.text{env,q,filter?,topk?}` | CLI, plugins, guardian | FTS5 over the text payload fields of an env's durable event log; ranked hits with a highlighted `snippet` and the source event `ref`. `filter{topics?,session?,level?,since?,until?}`. Env-scoped through the single 8d.2 authorizer |
+| `query.scan{env,source?,filter?,aggregate?,limit?}` | CLI, plugins | typed numeric/aggregate scan over `events`/`episodes`/`tool_results`: with no `aggregate` the newest `rows`, with `aggregate{op:count\|sum\|avg,field?,group_by?}` grouped `groups`. Field names resolve against a per-source allowlist; SQL is parameterised and never exposed |
+| `query.vector{env,...}` | — | stub: answers `{unsupported:true, reason}` — the engine and embeddings are P5 memory |
 | `bus.publish{envelope}` | any | publish one envelope; a durable one answers `{offset}` after its group-commit batch is persisted, a non-durable one after memory fan-out |
 | `bus.subscribe{topics?,levels?,env?,session?,since_offset?,coalesce_ms?,latest_only?}` | any | stream matching envelopes to this connection as `{"t":"ev",...}` frames; `since_offset` replays the durable log first (reconnect) |
 | `kv.get/set/del/cas/incr/expire/lease/keep_alive/range{...}` | any | the etcd-lite facade, env-scoped; `set{durable?,ttl_ms?,lease_id?}`, a global monotonic `rev`/`revision` |
@@ -1288,8 +1288,10 @@ have to learn the envelope shape). The `status` RPC stays for the one-shot `teno
 **Deleted.** The old `subscribe` RPC, `Cmd::Subscribe`, base's `subs` map and `wanted()`, and
 `bridge_session`. `exit_on_detach` and `status.attached` now count the connections that hold a
 `bus.subscribe` (the `attached` set, decremented on `Gone`). **Kept as-is** (the per-env storage
-model and its retention gate depend on them): `events.tail`, `episodes.*`, `tool_results.*`,
-`blobs.*`, `state.retain`, and the approvals decision path `approval.request/answer`.
+model and its retention gate depend on them): the `.append` write paths `events.append`,
+`episodes.append`, `tool_results.append`, `blobs.*`, `state.retain`, and the approvals decision
+path `approval.request/answer`. The **read** RPCs `events.tail`/`episodes.tail`/`tool_results.tail`
+were folded into `query`/`log.query` and deleted in P4.2 (below).
 
 **ControlLease.** The multi-terminal takeover convention is a lease-backed kv key `/ctl/<env>`: the
 holder may send input, other attached terminals render read-only, an idle holder auto-releases
@@ -1299,8 +1301,52 @@ full co-display takeover is left minimal.
 **Elixir bridge.** The guardian and the node `Link` forward their own events to base's bus as
 envelopes over the Link socket (`bus.publish`): `guardian/pass|failed|reset` and node lifecycle, plus
 a Logger handler that turns Elixir Logger events into `log/<node>` envelopes (level-mapped,
-loop-guarded). The guardian's `violations` probe still reads `events.tail` (kept), so the P3.5b reset
-gate is unchanged.
+loop-guarded). The guardian's `violations` probe reads the session log through `log.query` (P4.2
+repointed it off the deleted `events.tail`), so the P3.5b reset gate is unchanged.
+
+## The query facade (P4.2)
+
+RFC section 5's hot layer: a typed `query` facade over the durable event log in each env's state
+file, whose speed does not degrade as volume grows and which never exposes SQL. Three methods, all
+env-scoped through the one 8d.2 authorizer (`Conn::scoped_env`), so a scoped caller queries only its
+own env and base/barebone is unscoped.
+
+- **`query.text{q, filter, topk}`** — FTS5 over the text payload fields of the log (`data.text`,
+  `data.message.content`, tool `name`/`arguments`), ranked by bm25, returning a highlighted
+  `snippet` and the source event `ref`. The FTS5 table is a **derived, disposable read model**, not
+  schema: `query_ensure_index` builds `events_fts` on first use and walks new events into it
+  incrementally off the `events` table; a `QUERY_INDEX_VERSION` bump drops and rebuilds it from the
+  log (DSH pattern — log = truth, indexes = derivations). `filter{topics?, session?, level?, since?,
+  until?}` narrows before ranking.
+- **`query.scan{source?, filter?, aggregate?, limit?}`** — typed scan over `events`, `episodes` or
+  `tool_results`. With no `aggregate` it returns the newest `rows` of the source (this is what
+  replaced `episodes.tail`/`tool_results.tail`); with `aggregate{op: count|sum|avg, field?,
+  group_by?}` it returns grouped `groups`. Field and group-by names resolve against a per-source
+  allowlist (`episodes` cost/verifier_score/step, `tool_results` status/duration_ms/name, event
+  kind/session/at) so no caller text ever reaches the SQL, which is parameterised throughout.
+- **`query.vector{...}`** — a stub answering `{unsupported: true, reason}`; the engine and embeddings
+  are P5 memory.
+
+Composite hot-window indexes come up with the derived index: `events(kind, at)` and
+`events(json_extract(data,'$.session'), id)` for the `(topic, ts)` and `(session, seq)` access the
+RFC names, plus `created_at` indexes on `episodes`/`tool_results` for the scan window. The warm
+compactor (Parquet/Tantivy segments) is P4.3.
+
+`query` is served by base over each env's `Store` (base is that file's single writer, so the derived
+index is built on base's own connection). It routes through the actor as `Cmd::Query` after the
+authorizer has resolved the env, the same shape `log.query` uses.
+
+**The P4.2 收口.** The read RPC families `episodes.tail`, `tool_results.tail` and `events.tail`, plus
+their now-dead storage helpers (`Store::episodes_tail`/`tool_results_tail`) and the `TAIL`/`value()`
+plumbing in `envrpc`, were deleted; their readers now speak `query.scan`/`log.query`. The harness's
+`BaseLog::tail` and the guardian `violations` probe were repointed to `log.query`;
+`session.history`/`resume` stay byte-identical (the harness golden `loop_test` asserts it).
+
+LoC delta (`git diff --numstat`, `rs/base` + `rs/storage` **src** only): +605 added / −101 deleted,
+net **+504** — the query hot layer is net-new plumbing (`storage/query.rs` 454, `base/query.rs` 90,
+matching the RFC's ~0.5k estimate), which dominates the ~101 lines the read-RPC fold removed; the
+fold portion alone is net-negative. Perf at 1M synthetic events (release, `#[ignore]`): text
+p50≈0.45 ms / p99≈0.48 ms (budget < 10 ms), scan p50≈70 ms / p99≈70 ms (budget < 100 ms).
 
 ## What base does when something dies
 
@@ -1447,12 +1493,12 @@ the day-one pragmas including `auto_vacuum=INCREMENTAL`.
 
 `cli/tests/storage_gate.rs` (1, skipped without oci or a release) is the P3.4 gate: one
 `tenon run` against a fake model whose scripted `bash` prints 20 000 characters, then four
-assertions on what the loop recorded. `episodes.tail` shows one episode per step — step 1
-with the `bash` action, step 2 with `"respond"`, both with the step's token cost and a
-16-char state hash; the `tool_results` row for the call carries a `blob_hash`, `blobs.get`
-returns the whole 20 KB and `blobs.get{offset, len}` the same bytes as a window, while the
-`tool/result` event carries only the cut view; `session.history` matches a fold over
-`events.tail` row for row; and after 100 recorded steps and a dozen real worker packs,
+assertions on what the loop recorded. `query.scan{source:"episodes"}` shows one episode per
+step — step 1 with the `bash` action, step 2 with `"respond"`, both with the step's token
+cost and a 16-char state hash; the `tool_results` row for the call carries a `blob_hash`,
+`blobs.get` returns the whole 20 KB and `blobs.get{offset, len}` the same bytes as a window,
+while the `tool/result` event carries only the cut view; `session.history` matches a fold
+over `log.query` row for row; and after 100 recorded steps and a dozen real worker packs,
 `state.retain` leaves exactly the pack steps the test computes from the policy itself, the
 last 50 events, no blob whose tool result was pruned, and all 102 episodes. 17 s here.
 `cli/tests/boot.rs` (8)
