@@ -144,7 +144,7 @@ pub fn enforce_scope(
 }
 
 fn policy(method: &str) -> Policy {
-    if ["bus.", "kv.", "blob.", "timer.", "query."]
+    if ["bus.", "kv.", "blob.", "timer.", "query.", "trigger."]
         .iter()
         .any(|prefix| method.starts_with(prefix))
     {
@@ -413,6 +413,21 @@ pub fn blob(conn: &Conn, facades: &Facades, method: &str, body: &Value) -> Answe
             Ok(json!({"hash": hash, "offset": offset, "len": bytes.len(), "data": b64(&bytes)}))
         }
         "blob.stat" => blob.stat(&text_or(body, "hash", "")),
+        other => Err(format!("unknown_method:{other}")),
+    }
+}
+
+/// `trigger.set/list/del`: a scoped caller is confined to its own env (the
+/// resolved env is its bound one); an unscoped base/CLI caller may name any env
+/// and its triggers are `admin` (cross-env prompt allowed). RFC P4.7.
+pub fn trigger(conn: &Conn, facades: &Facades, method: &str, body: &Value) -> Answer {
+    let env = conn.scoped_env(req_env(body).as_deref())?;
+    let trigger = &facades.trigger;
+    match method {
+        "trigger.set" => trigger.set(&env, !conn.is_scoped(), body),
+        "trigger.list" => Ok(trigger.list(&env)),
+        // `trigger_id`, not `id`: the wire frame's own `id` is the correlation key.
+        "trigger.del" => Ok(trigger.del(&env, &text_or(body, "trigger_id", ""))),
         other => Err(format!("unknown_method:{other}")),
     }
 }

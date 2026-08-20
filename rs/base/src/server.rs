@@ -310,7 +310,7 @@ async fn secret(method: &str, body: &Value, conn: &Conn, opts: &Opts) -> Answer 
 }
 
 fn is_facade(method: &str) -> bool {
-    ["bus.", "kv.", "blob.", "timer."]
+    ["bus.", "kv.", "blob.", "timer.", "trigger."]
         .iter()
         .any(|prefix| method.starts_with(prefix))
 }
@@ -334,6 +334,7 @@ async fn facade(method: &str, body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opt
         method if method.starts_with("kv.") => facaderpc::kv(conn, facades, method, body),
         method if method.starts_with("blob.") => facaderpc::blob(conn, facades, method, body),
         method if method.starts_with("timer.") => facaderpc::timer(conn, facades, method, body),
+        method if method.starts_with("trigger.") => facaderpc::trigger(conn, facades, method, body),
         other => Err(format!("unknown_method:{other}")),
     }
 }

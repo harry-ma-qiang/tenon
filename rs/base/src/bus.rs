@@ -1,7 +1,9 @@
 use crate::blob::BlobFacade;
+use crate::config::Config;
 use crate::home::Home;
 use crate::kv::KvFacade;
 use crate::timer::TimerService;
+use crate::trigger::{TriggerConfig, TriggerService};
 use std::sync::{Arc, Mutex};
 use tenon_bus::{Durable, Envelope, Hub};
 use tenon_storage::{EnvelopeRow, Store};
@@ -80,6 +82,7 @@ pub struct Facades {
     pub kv: Arc<KvFacade>,
     pub blob: Arc<BlobFacade>,
     pub timer: Arc<TimerService>,
+    pub trigger: Arc<TriggerService>,
     #[cfg(feature = "http")]
     pub secrets: Arc<crate::secret::Secrets>,
 }
@@ -89,12 +92,23 @@ impl Facades {
     /// expiry tick, the blob facade and the timer wheel (which reloads its
     /// persisted timers from kv). The tracing layer is installed process-wide so
     /// `info!` in any Rust component becomes an envelope.
-    pub fn build(home: &Home) -> anyhow::Result<Facades> {
+    pub fn build(home: &Home, config: &Config) -> anyhow::Result<Facades> {
         let store = Arc::new(Mutex::new(Store::open(&home.state_file())?));
         let hub = Hub::with_durable(Arc::new(StoreDurable::new(store.clone())));
         let kv = KvFacade::new(store.clone(), hub.clone());
         let blob = Arc::new(BlobFacade::new(store));
         let timer = TimerService::new(kv.clone(), hub.clone());
+        let trigger = TriggerService::new(
+            kv.clone(),
+            hub.clone(),
+            home.sock(),
+            TriggerConfig {
+                hop_cap: config.triggers.hop_cap,
+                calls_per_min: config.triggers.calls_per_min,
+                http_retries: config.triggers.http_retries,
+                gated_actions: config.triggers.gated_actions.clone(),
+            },
+        );
         install_layer(&hub);
         #[cfg(feature = "http")]
         let secrets = crate::secret::Secrets::new(home.secrets_file(), hub.clone());
@@ -103,6 +117,7 @@ impl Facades {
             kv,
             blob,
             timer,
+            trigger,
             #[cfg(feature = "http")]
             secrets,
         })
