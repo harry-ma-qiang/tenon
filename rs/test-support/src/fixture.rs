@@ -2,6 +2,7 @@ use crate::procs::{alive, kill, pids_by_home, pids_by_sock};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tenon_base::client::Client;
@@ -9,6 +10,14 @@ use tenon_base::client::Client;
 /// Every fixture that boots a base takes this before it starts, so two homes
 /// never race over the container engine or the machine's memory.
 static LOCK: Mutex<()> = Mutex::new(());
+
+/// A process-wide sequence so two fixtures never share a home, even when two
+/// tests in one binary pass the same name (several files run two base-booting
+/// tests under one `NAME`). Identical homes meant two `tenon start`s racing the
+/// same lock and ready file — the "already running (pid 0)" flake — and two
+/// sandbox containers colliding on one home hash. A unique home per fixture
+/// removes the shared resource entirely.
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
 const LOGS: [&str; 5] = ["base", "guardian", "root", "root.1", "harness-root"];
 
@@ -90,8 +99,12 @@ impl Fixture {
         let guard = spec
             .lock
             .then(|| LOCK.lock().unwrap_or_else(|error| error.into_inner()));
-        let home =
-            std::env::temp_dir().join(format!("tenon-it-{}-{}", std::process::id(), spec.name));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "tenon-it-{}-{}-{seq}",
+            std::process::id(),
+            spec.name
+        ));
         let _ = std::fs::remove_dir_all(&home);
         match spec.harness {
             Some(_) => std::fs::create_dir_all(home.join("profiles/root")).expect("home"),
