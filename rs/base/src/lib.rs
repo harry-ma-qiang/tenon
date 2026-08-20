@@ -13,6 +13,7 @@ pub mod check;
 pub mod client;
 pub mod cmds;
 pub mod config;
+pub mod doctor;
 pub mod drive;
 pub mod envfiber;
 pub mod envrpc;

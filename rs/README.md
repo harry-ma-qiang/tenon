@@ -939,6 +939,12 @@ RFC section 5.2's watch, as a fixed set of probes in the guardian node plus the 
 base approved. The guardian owns no process and performs no reset: every probe is a frame
 to base, and the verdict it can act on is one more frame, `reset{env, probes}`.
 
+The probe **names and semantics live in one documented list**, `@catalog` in
+`beam/lib/tenon/beam/guardian/probes.ex` (`Probes.catalog/0`; `core/0` is its names in run
+order). The guardian runs that list on its live loop; `tenon doctor` (below) mirrors it by
+name and adds the install-only probes the guardian has no running base to check. One list,
+two consumers — the guardian's periodic auto-reset loop and doctor's one-shot offline pass.
+
 | Probe | What it asks | Fails when |
 |---|---|---|
 | `base` | `status` | base does not answer; the row it answers with is what the next three read |
@@ -979,6 +985,30 @@ Anything else is a `probes.rejected` event naming the file and the reason (`sha2
 the config says Y`, `is not executable`, `does not exist`, `no sha256 in the config`), and
 the guardian never learns about it. Humans edit base's config; agents cannot, without a
 gated `config.patch{target: "base"}`. Accepted probes are one `probes.loaded` event.
+
+## `tenon doctor` (P4.8)
+
+`tenon doctor [--home DIR]` is the one-shot, human-triggered diagnostic — the offline half
+of the shared probe catalog above. It does **not** replace the guardian's live loop and it
+does **not** need a running base: it opens the home, runs each install probe once, prints a
+readable `ok`/`warn`/`fail` line per probe, and exits non-zero if any probe **failed** (a
+`warn` never fails the run). Where the guardian's seven probes are runtime health
+(`base/env/tree/worker/harness/budgets/violations`, checked by frames to a live base), the
+seven doctor probes are install-time facts, checked directly:
+
+| Probe | Ok when | Warn / Fail |
+|---|---|---|
+| `release` | `TENON_RELEASE_DIR` or an extracted `erts/<tag>/bin/tenon_beam` is present; prints the tenon version | **warn** if only the embedded payload exists (it unpacks on first `start`); **fail** if a named `TENON_RELEASE_DIR` holds no `bin/tenon_beam` |
+| `python3` | `python3` is on `PATH` | **warn** if absent (python plugins and MCP servers need it) |
+| `container` | `podman` or `docker` is on `PATH` | **warn** if neither (the oci backend is unavailable) |
+| `sandbox` | `tenon_sandbox::detect()` picks an isolating backend; the line names it and why each earlier one was skipped (the krun reason on a KVM-less box) | **warn** if only `none` is available (no isolation) |
+| `serve_port` | `127.0.0.1:8791` (serve's default `--http`) is bindable | **warn** if a serve already holds it |
+| `state_integrity` | `state.sqlite` and every `state-<env>.sqlite` pass `integrity_check` — the same check base runs at boot | **fail** on any corrupt file; a fresh home with no state files is `ok` |
+| `config` | `config.yml` parses as a `Config` (or is absent, so defaults apply) | **fail** on a malformed `config.yml` |
+
+Doctor never writes into the home it inspects — a missing `config.yml` is reported, not
+scaffolded. The module is `rs/base/src/doctor.rs`; adding a probe there and adding one to
+`@catalog` are the two halves of keeping the catalog in step.
 
 ## The runtime contract (P3.5)
 
@@ -1389,6 +1419,7 @@ call, so nothing escapes the boundary by being listed.
 | `tenon upgrade propose <target> --artifact JSON [--env NAME] [--notes TEXT]` | drive the change protocol by hand: the same frame the model-facing `upgrade` tool sends. Prints `{id, tier, status}` |
 | `tenon upgrade status <id>` / `tenon upgrade list [--env NAME]` | what one proposal did, phase by phase; or every proposal and every benchmark row |
 | `tenon check kernel [--beam PATH] [--release-dir DIR]` | run the kernel contract suite that ships inside the beam release against a `tenon.beam` — the one the release ships, or a candidate. Prints the JSON report and exits non-zero when a point failed. Needs no running base |
+| `tenon doctor` | one-shot install diagnostic (P4.8): toolchain (release/erts, python3, podman/docker), sandbox backends (`detect()` + why krun is unavailable here), serve port free, state-file `integrity_check`, config validity. Prints one `ok`/`warn`/`fail` line per probe and exits non-zero if any failed. Needs no running base and writes nothing into the home |
 | `tenon rollback [--force]` | restore the LKG config, profiles and state copy. Verifies every pinned hash first and refuses with what differs; `--force` overrides. Refuses while base is running |
 | `tenon backup <dir>` | snapshot every durable host file into `<dir>`: each SQLite state file (barebone + per env) via `VACUUM INTO`, so it is coherent even under a live base, plus `config.yml`, `profiles/` and `lkg/manifest.json`, and a checksummed `backup.json`. `erts/`, `run/` and `derived/` are excluded. Needs no running base |
 | `tenon restore <dir>` | verify a backup against its `backup.json` (naming any file whose sha256 moved) and put the state files, config, profiles and LKG manifest back. Snapshots the pre-restore state to `<home>/.restore-bak-<ts>` first. Refuses over a running base and on any mismatch |
@@ -2281,3 +2312,13 @@ so the proxy then `404`/`502`s.
     `[18080, 18080+max_per_env)` up front (base reserves a free host port per container port and
     maps it). An app binds one of `TENON_INGRESS_PORTS`; a name with no live lease 404s. The whole
     non-`http` build and the guardian publish nothing, so their spawn line is byte-identical.
+70. **P4.8 `tenon doctor` and the guardian do not share one code path, only one named list.**
+    The RFC's ideal is "one shared probe list (name + pure check -> ok/fail+detail), both consume
+    it". A truly shared code list is impractical across the language boundary — the guardian's
+    seven probes are Elixir frames to a live base (runtime health, driving auto-reset), doctor is a
+    Rust offline one-shot that needs no base — so the convergence is the **names and semantics**:
+    `@catalog` in `beam/lib/tenon/beam/guardian/probes.ex` is the single documented list of the
+    runtime probes (`Probes.catalog/0`, `core/0` its names), and `rs/base/src/doctor.rs` mirrors it
+    by name in its doc and adds the install-only probes the guardian has no reason to run. The
+    guardian's live loop is unchanged (its suite stays green); doctor is a small, standalone,
+    write-nothing module. Adding a probe to one is the cue to add it to the other.

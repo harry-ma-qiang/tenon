@@ -122,6 +122,8 @@ enum Command {
         /// The backup directory produced by `tenon backup`
         dir: PathBuf,
     },
+    /// Diagnose the install: toolchain, sandbox backends, ports, state integrity
+    Doctor,
     /// Restore the last known good config, profiles and state copy
     Rollback {
         /// Restore even though the LKG manifest does not match what is on disk
@@ -355,6 +357,7 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
             true => tenon_base::lkg_status(home),
             false => tenon_base::rpc(home, "status", json!({})).await,
         },
+        Command::Doctor => tenon_base::doctor::run(home),
         Command::Backup { dir } => tenon_base::backup(home, dir),
         Command::Restore { dir } => tenon_base::restore(home, dir),
         Command::Rollback { force } => tenon_base::rollback(home, force).await,
