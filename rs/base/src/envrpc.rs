@@ -30,29 +30,9 @@ impl Base {
         let event = store
             .append(kind, Some(env), data)
             .map_err(|error| error.to_string())?;
-        let (kind, data) = (kind.to_string(), data.clone());
-        let frame = json!({
-            "t": "event",
-            "id": event.id,
-            "at": event.at,
-            "kind": event.kind,
-            "env": event.env,
-            "scope": "env",
-            "data": event.data,
-        });
-        for (peer, filter) in self.subs.values() {
-            if filter.is_none() || filter.as_deref() == Some(env) {
-                peer.send(frame.clone());
-            }
-        }
         let answer = json!({"id": event.id, "at": event.at});
-        self.account(env, &kind, &data);
-        // P4.0 session bridge (deleted in P4.1): every appended event is also a
-        // durable `session/<kind>` envelope on the bus, so nothing regresses
-        // while producers still write the old log path.
-        if let Some(hub) = &self.hub {
-            crate::facaderpc::bridge_session(hub, env, &kind, &data);
-        }
+        self.account(env, kind, data);
+        self.publish_event(kind, Some(env), data);
         Ok(answer)
     }
 
@@ -104,6 +84,27 @@ impl Base {
                 }))
                 .collect::<Vec<Value>>(),
         }))
+    }
+
+    /// `log.query{env, session?, after?, limit?}`: the typed session-log reader
+    /// (RFC section 3). It is `events.tail` plus an optional `session` narrowing,
+    /// folded in one place so `session.history`, the UI and the CLI share one
+    /// path into the env's log without any of them touching sqlite or a topic
+    /// glob. The answer shape matches `events.tail` so it is a drop-in.
+    pub fn log_query(&self, env: &str, after: i64, limit: i64, session: Option<&str>) -> Answer {
+        let tail = self.events_tail(env, after, limit)?;
+        let Some(session) = session else {
+            return Ok(tail);
+        };
+        let events: Vec<Value> = tail
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| crate::params::str_of(&event["data"], "session") == Some(session))
+            .collect();
+        Ok(json!({"env": env, "count": events.len(), "session": session, "events": events}))
     }
 
     pub fn config_get(&self, env: &str) -> Answer {
@@ -412,6 +413,15 @@ impl Base {
                 reply,
             } => {
                 let _ = reply.send(self.events_tail(&env, after, limit));
+            }
+            Cmd::LogQuery {
+                env,
+                after,
+                limit,
+                session,
+                reply,
+            } => {
+                let _ = reply.send(self.log_query(&env, after, limit, session.as_deref()));
             }
             Cmd::Records {
                 env,

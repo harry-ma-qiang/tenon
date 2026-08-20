@@ -29,7 +29,10 @@ pub struct Base {
     pub sandbox: Arc<dyn Sandbox>,
     pub exit_on_detach: bool,
     pub nodes: BTreeMap<String, Node>,
-    pub subs: BTreeMap<u64, (Peer, Option<String>)>,
+    /// The connections that hold a live `bus.subscribe` (the UI, `tenon run`,
+    /// `tenon attach`). Only their departure counts toward `exit_on_detach`, and
+    /// their number is the `attached` figure `status` reports.
+    pub attached: std::collections::BTreeSet<u64>,
     pub exits: mpsc::UnboundedSender<Exit>,
     pub cmds: mpsc::UnboundedSender<Cmd>,
     pub generation: u64,
@@ -43,18 +46,12 @@ pub struct Base {
     /// The node a blue/green switch has replaced, held between the swap and
     /// the drain so the old process is stopped after the front door moved.
     pub draining: BTreeMap<String, Drained>,
-    /// The message hub, when the facades are wired. The session bridge (P4.0,
-    /// removed in P4.1) publishes every appended event here as a durable
-    /// `session/<kind>` envelope so `bus.subscribe` sees real traffic.
+    /// The message hub, when the facades are wired. Every event base or a
+    /// producer records is published here once (RFC 8: `session/<kind>` for an
+    /// env, `base/<kind>` for the barebone), which is the single fan-out
+    /// `bus.subscribe` reads — the P4.0 session bridge and base's own subscriber
+    /// list both collapsed into it in P4.1.
     pub hub: Option<std::sync::Arc<tenon_bus::Hub>>,
-}
-
-fn wanted(filter: Option<&str>, env: Option<&str>) -> bool {
-    match (filter, env) {
-        (None, _) => true,
-        (Some(_), None) => true,
-        (Some(filter), Some(env)) => filter == env,
-    }
 }
 
 impl Base {
@@ -77,7 +74,7 @@ impl Base {
             sandbox,
             exit_on_detach,
             nodes: BTreeMap::new(),
-            subs: BTreeMap::new(),
+            attached: std::collections::BTreeSet::new(),
             exits,
             cmds,
             generation: 0,
@@ -561,8 +558,8 @@ impl Base {
     }
 
     pub(crate) async fn on_gone(&mut self, peer: u64) {
-        let was = self.subs.remove(&peer).is_some();
-        if was && self.subs.is_empty() && self.exit_on_detach {
+        let was = self.attached.remove(&peer);
+        if was && self.attached.is_empty() && self.exit_on_detach {
             self.emit("base.detach", None, json!({"exit_on_detach": true}));
             self.stop().await;
         }
@@ -577,21 +574,34 @@ impl Base {
     }
 
     pub fn emit(&mut self, kind: &str, env: Option<&str>, data: Value) {
-        let Ok(event) = self.store.append(kind, env, &data) else {
+        if self.store.append(kind, env, &data).is_err() {
+            return;
+        }
+        self.publish_event(kind, env, &data);
+    }
+
+    /// The single bus fan-out for every event base or a producer records: a
+    /// `session/<kind>` topic for an env (so a subscriber can range one env's log
+    /// or `session.history`), a `base/<kind>` topic for the barebone. Non-durable
+    /// — the durable truth is the state file the caller already wrote to (log =
+    /// truth, RFC section 1); the bus is the live delivery on top. `session` and
+    /// `step` are lifted out of the payload so a subscriber can filter on them.
+    pub fn publish_event(&self, kind: &str, env: Option<&str>, data: &Value) {
+        let Some(hub) = &self.hub else {
             return;
         };
-        let frame = json!({
-            "t": "event",
-            "id": event.id,
-            "at": event.at,
-            "kind": event.kind,
-            "env": event.env,
-            "data": event.data,
-        });
-        for (peer, filter) in self.subs.values() {
-            if wanted(filter.as_deref(), event.env.as_deref()) {
-                peer.send(frame.clone());
-            }
-        }
+        let topic = match env {
+            Some(_) => format!("session/{kind}"),
+            None => format!("base/{kind}"),
+        };
+        let mut envelope = tenon_bus::Envelope::new(topic, tenon_bus::Level::Info, data.clone());
+        envelope.env = env.map(str::to_string);
+        envelope.src = "base".to_string();
+        envelope.session = data
+            .get("session")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        envelope.step = data.get("step").and_then(Value::as_i64);
+        hub.emit(envelope);
     }
 }

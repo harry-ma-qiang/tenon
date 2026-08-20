@@ -158,7 +158,7 @@ impl Base {
             release: self.release.clone(),
             pid: std::process::id(),
             exit_on_detach: self.exit_on_detach,
-            attached: self.subs.len(),
+            attached: self.attached.len(),
             nodes: self
                 .nodes
                 .iter()
