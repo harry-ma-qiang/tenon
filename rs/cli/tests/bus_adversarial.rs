@@ -533,10 +533,9 @@ async fn kv_lease_expiry_fires_one_delete_and_keep_alive_prevents_it() {
 /// promise survives a restart: a durable write, then a non-durable
 /// (ephemeral) write that consumes a higher revision number, then restart,
 /// then a fresh durable write must get a revision higher than anything
-/// issued before the restart. `KvFacade::new` seeds its counter from
-/// `kv_max_rev()` over the durable `kv` table only (rs/base/src/kv.rs), so a
-/// revision consumed by an ephemeral write is forgotten on restart and can be
-/// reissued to a different key — this is expected to fail.
+/// issued before the restart. `KvFacade` persists a high-water block (256
+/// revisions at a time, `rs/base/src/kv.rs` `REV_BLOCK`/`kv_rev_hwm`) so a
+/// revision an ephemeral write consumed is never reissued after a restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kv_revision_stays_monotonic_across_a_restart() {
     let Some(fixture) = fixture("adv-kv-rev") else {
@@ -565,17 +564,11 @@ async fn kv_revision_stays_monotonic_across_a_restart() {
         .as_i64()
         .unwrap();
     assert!(ephemeral_rev > durable_rev, "setup: revision must advance");
-    println!("DIAG durable_rev={durable_rev} ephemeral_rev={ephemeral_rev}");
     drop(c);
 
     restart(&fixture);
 
     let mut c2 = client(&fixture).await;
-    let after_restart_durable_get = c2
-        .call("kv.get", json!({"key": "/rev/durable"}))
-        .await
-        .expect("get durable after restart");
-    println!("DIAG after_restart_durable_get={after_restart_durable_get}");
     let post_restart_rev = c2
         .call(
             "kv.set",
@@ -585,7 +578,6 @@ async fn kv_revision_stays_monotonic_across_a_restart() {
         .expect("post-restart set")["rev"]
         .as_i64()
         .unwrap();
-    println!("DIAG post_restart_rev={post_restart_rev}");
 
     assert!(
         post_restart_rev > ephemeral_rev,
@@ -734,12 +726,8 @@ async fn timer_set_rejects_bad_input_cleanly_and_the_server_survives() {
 }
 
 /// `blob.open` on an offset/len past the end of a stored blob and
-/// `blob.get`/`blob.stat` of an unknown hash. The unknown-hash cases must
-/// error cleanly (they do). The out-of-range window is documented in this
-/// adversarial suite's brief as expected to "error cleanly"; the storage
-/// layer instead clamps offset/len into range and returns an empty read, so
-/// this assertion is expected to fail — see rs/storage/src/blobs.rs
-/// `open_blob`.
+/// `blob.get`/`blob.stat` of an unknown hash must all error cleanly, never
+/// silently clamp into range (rs/storage/src/blobs.rs `open_blob`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blob_open_out_of_range_errors_and_unknown_hash_errors() {
     let Some(fixture) = fixture("adv-blob-oob") else {
@@ -777,8 +765,7 @@ async fn blob_open_out_of_range_errors_and_unknown_hash_errors() {
     assert!(
         out_of_range.is_err(),
         "blob.open with an offset past the blob's end should error cleanly, \
-         but it returned {out_of_range:?} (open_blob clamps offset/len \
-         instead of erroring, see rs/storage/src/blobs.rs)"
+         but it returned {out_of_range:?}"
     );
 }
 
