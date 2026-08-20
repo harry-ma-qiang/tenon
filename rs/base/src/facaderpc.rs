@@ -49,9 +49,10 @@ impl Conn {
         }
     }
 
-    /// The concrete-env resolution for kv/blob/timer, which always act inside one
-    /// env: the bound env for a scoped caller, else the named or root env.
-    fn scoped_env(&self, requested: Option<&str>) -> Result<String, String> {
+    /// The concrete-env resolution for kv/blob/timer/query, which always act
+    /// inside one env: the bound env for a scoped caller, else the named or root
+    /// env. This is the single 8d.2 authorizer for every env-scoped facade.
+    pub fn scoped_env(&self, requested: Option<&str>) -> Result<String, String> {
         Ok(self
             .scoped_opt(requested)?
             .unwrap_or_else(|| self.root_env.clone()))

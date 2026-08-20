@@ -1783,6 +1783,7 @@ dependencies = [
  "tenon-bus",
  "tenon-harness",
  "tenon-sandbox",
+ "tenon-storage",
  "tenon-test-support",
  "tenon-worker",
  "tokio",

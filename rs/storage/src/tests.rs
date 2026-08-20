@@ -117,9 +117,16 @@ fn tool_results_point_at_their_event_and_blob() {
     assert_eq!(rows[0].duration_ms, 42);
     assert_eq!(rows[1].status, "error");
     assert!(rows[1].blob_hash.is_none());
-    let tail = store.tool_results_tail(1).unwrap();
-    assert_eq!(tail.len(), 1);
-    assert_eq!(tail[0].name, "grep");
+    let scan = store
+        .query_scan(
+            crate::Source::ToolResults,
+            &crate::QueryFilter::default(),
+            None,
+            1,
+        )
+        .unwrap();
+    assert_eq!(scan["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(scan["rows"][0]["name"], "grep");
     assert_eq!(store.tool_result_count().unwrap(), 2);
 }
 
@@ -169,11 +176,19 @@ fn episodes_are_one_row_per_step_queryable_by_session() {
     assert_eq!(mine[2].action[0]["name"], "bash");
     assert_eq!(mine[2].cost["total"], 18);
     assert_eq!(mine[0].verifier_score, Some(1.0));
-    let tail = store.episodes_tail(2).unwrap();
+    let scan = store
+        .query_scan(
+            crate::Source::Episodes,
+            &crate::QueryFilter::default(),
+            None,
+            2,
+        )
+        .unwrap();
+    let tail = scan["rows"].as_array().unwrap();
     assert_eq!(tail.len(), 2);
-    assert_eq!(tail[1].session_id, "s2");
-    assert_eq!(tail[1].action, json!("respond"));
-    assert!(tail[1].verifier_score.is_none());
+    assert_eq!(tail[1]["session_id"], "s2");
+    assert_eq!(tail[1]["action"], json!("respond"));
+    assert!(tail[1]["verifier_score"].is_null());
     assert_eq!(store.episode_count().unwrap(), 4);
 }
 
