@@ -251,6 +251,85 @@ async fn a_model_error_fails_the_turn_gracefully() {
     assert_eq!(status["running"], json!(false));
 }
 
+/// The P4.1 migration invariant: moving the session log onto the bus must not
+/// change one byte of what `session.history` answers or what `session.resume`
+/// folds. The volatile row id and timestamp are normalised out (they are the
+/// only fields a re-run may differ on); everything else is pinned. If the
+/// migration ever alters the shape, this golden fails.
+#[tokio::test]
+async fn session_history_and_resume_are_byte_identical_for_a_fake_model_session() {
+    let server = fake::spawn(vec![
+        Say::Tool("bash".to_string(), json!({"cmd": "echo tenon-ok"})),
+        Say::Text("the output was tenon-ok".to_string()),
+    ])
+    .await
+    .unwrap();
+    let world = world(&server.base_url);
+    world.bus.service(
+        "worker",
+        "bash",
+        Ok(json!({"status": 0, "tail": "tenon-ok"})),
+    );
+    let id = session(&world).await;
+    world
+        .agent
+        .call(
+            "session.prompt",
+            &[json!({"session_id": id, "text": "run it"})],
+        )
+        .await
+        .unwrap();
+    support::settle("turn/end", || !world.log.of("turn/end").is_empty()).await;
+
+    let history = world
+        .agent
+        .call("session.history", &[json!({"session_id": id})])
+        .await
+        .unwrap();
+    let kinds: Vec<String> = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "session/created",
+            "user/message",
+            "turn/start",
+            "step/start",
+            "assistant/message",
+            "tool/call",
+            "tool/result",
+            "step/end",
+            "step/start",
+            "assistant/chunk",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+        ],
+        "the session-log kinds and their order are the migration invariant"
+    );
+    assert!(history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["data"]["session"] == json!(id)));
+
+    let resumed = world
+        .agent
+        .call("session.resume", &[json!({"session_id": id})])
+        .await
+        .unwrap();
+    assert_eq!(resumed["turns"], json!(1));
+    assert_eq!(
+        resumed["messages"],
+        json!(4),
+        "user + two assistant messages + one tool result fold back"
+    );
+}
+
 #[tokio::test]
 async fn resume_rebuilds_the_context_from_the_log() {
     let server = fake::spawn(vec![Say::Text("resumed".to_string())])

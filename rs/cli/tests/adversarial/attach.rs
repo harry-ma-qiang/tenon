@@ -16,7 +16,7 @@ fn wait_for_attach_line(child: &mut std::process::Child) {
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
             panic!("attach exited before subscribing: {}", stderr_of(child));
         }
-        if line.contains("attached from event") {
+        if line.contains("attached from") {
             std::thread::spawn(move || {
                 let mut rest = String::new();
                 while reader.read_line(&mut rest).unwrap_or(0) > 0 {
