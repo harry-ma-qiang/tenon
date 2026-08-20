@@ -50,6 +50,7 @@ impl Base {
             | Cmd::HarnessExit { .. }
             | Cmd::EventsAppend { .. }
             | Cmd::EventsTail { .. }
+            | Cmd::LogQuery { .. }
             | Cmd::Records { .. }
             | Cmd::ConfigGet { .. }
             | Cmd::ConfigPatch { .. }
@@ -160,10 +161,8 @@ impl Base {
                 self.abort_boot().await;
                 let _ = reply.send(Ok(json!({"ok": true})));
             }
-            Cmd::Subscribe { peer, env, reply } => {
-                let last = self.store.last_event_id().unwrap_or(0);
-                self.subs.insert(peer.id(), (peer, env.clone()));
-                let _ = reply.send(json!({"ok": true, "last_event": last, "env": env}));
+            Cmd::Attach { peer } => {
+                self.attached.insert(peer);
             }
             Cmd::Gone { peer } => self.on_gone(peer).await,
             Cmd::Ready { reply } => {

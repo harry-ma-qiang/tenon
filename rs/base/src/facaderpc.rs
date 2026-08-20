@@ -4,7 +4,7 @@ use crate::peer::Peer;
 use crate::rpc::Cmd;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
-use tenon_bus::{Envelope, Filter, Hub, Level, Published, SubOpts, Subscription};
+use tenon_bus::{Envelope, Filter, Level, Published, SubOpts, Subscription};
 use tokio::sync::{mpsc, oneshot, watch};
 
 type Answer = Result<Value, String>;
@@ -177,8 +177,32 @@ fn ev_frame(msg: &Published) -> Value {
     if let Some(object) = frame.as_object_mut() {
         object.insert("t".to_string(), json!("ev"));
         object.insert("offset".to_string(), json!(msg.offset));
+        add_compat(object, &msg.envelope.topic, msg.envelope.ts, msg.offset);
     }
     frame
+}
+
+/// The session log rides the bus (RFC 8: `session/<kind>` topics), but the CLI
+/// readers and the UI grew up on the `{kind, data, at, id}` event shape. These
+/// mirror fields let a `bus.subscribe` frame stand in for the old event frame
+/// without every consumer learning the envelope shape: `kind` is the topic with
+/// its reserved namespace segment stripped, `data` is the payload.
+pub fn add_compat(object: &mut serde_json::Map<String, Value>, topic: &str, ts: i64, offset: u64) {
+    let payload = object.get("payload").cloned().unwrap_or(Value::Null);
+    object.insert("kind".to_string(), json!(compat_kind(topic)));
+    object.insert("data".to_string(), payload);
+    object.insert("at".to_string(), json!(ts));
+    object.insert("id".to_string(), json!(offset));
+}
+
+/// The event `kind` a `session/<kind>` or `base/<kind>` topic carries: the topic
+/// with its leading reserved namespace removed. `user/message` survives its own
+/// slash because only the first segment is dropped.
+pub fn compat_kind(topic: &str) -> String {
+    match topic.split_once('/') {
+        Some((ns, rest)) if tenon_bus::is_reserved(ns) => rest.to_string(),
+        _ => topic.to_string(),
+    }
 }
 
 /// `kv.*`: every RFC section 3 kv verb, env-scoped. `kv.watch` is the streaming
@@ -255,6 +279,7 @@ fn snapshot_frame(envelope: &Envelope) -> Value {
     if let Some(object) = frame.as_object_mut() {
         object.insert("t".to_string(), json!("ev"));
         object.insert("snapshot".to_string(), json!(true));
+        add_compat(object, &envelope.topic, envelope.ts, 0);
     }
     frame
 }
@@ -292,16 +317,6 @@ pub fn timer(conn: &Conn, facades: &Facades, method: &str, body: &Value) -> Answ
         "timer.del" => Ok(timer.del(&env, &text_or(body, "timer_id", ""))),
         other => Err(format!("unknown_method:{other}")),
     }
-}
-
-/// A publish helper the session bridge uses: a durable, model-visible envelope
-/// on `session/<kind>`. One code path so P4.1 can delete the duplication.
-pub fn bridge_session(hub: &Arc<Hub>, env: &str, kind: &str, data: &Value) {
-    let mut envelope = Envelope::new(format!("session/{kind}"), Level::Info, data.clone());
-    envelope.env = Some(env.to_string());
-    envelope.src = "harness".to_string();
-    envelope.model_visible = true;
-    hub.emit(envelope);
 }
 
 fn value_of(body: &Value) -> Vec<u8> {

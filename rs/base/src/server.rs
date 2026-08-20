@@ -239,9 +239,21 @@ async fn dispatch(body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer
         "sandbox.destroy" => ask(cmds, |reply| Cmd::SandboxDestroy { env, reply }).await,
         "stop" => ask(cmds, |reply| Cmd::Stop { reply }).await,
         "status" => status(cmds, opts).await,
-        "subscribe" => subscribe(peer, body, cmds).await,
         "auth.scope" => facaderpc::scope(conn, body, cmds).await,
-        method if is_facade(method) => facade(method, body, conn, opts).await,
+        "log.query" => {
+            let after = i64_or(body, "after", 0);
+            let limit = i64_or(body, "limit", 500);
+            let session = opt_text(body, "session");
+            ask(cmds, |reply| Cmd::LogQuery {
+                env,
+                after,
+                limit,
+                session,
+                reply,
+            })
+            .await
+        }
+        method if is_facade(method) => facade(method, body, conn, cmds, opts).await,
         other => Err(format!("unknown_method:{other}")),
     }
 }
@@ -253,14 +265,21 @@ fn is_facade(method: &str) -> bool {
 }
 
 /// Routes the four facade families to their handlers, which need the shared
-/// hub/kv/blob/timer and the per-connection scope, not the actor.
-async fn facade(method: &str, body: &Value, conn: &Conn, opts: &Opts) -> Answer {
+/// hub/kv/blob/timer and the per-connection scope, not the actor. A streaming
+/// subscribe marks the connection attached (RFC 8 UI-on-subscribe): its
+/// departure is what `exit_on_detach` waits for.
+async fn facade(method: &str, body: &Value, conn: &Conn, cmds: &Cmds, opts: &Opts) -> Answer {
     let Some(facades) = opts.facades.as_ref() else {
         return Err("facades_unavailable".to_string());
     };
     match method {
         "bus.publish" => facaderpc::bus_publish(conn, facades, body).await,
-        "bus.subscribe" => facaderpc::bus_subscribe(conn, facades, body),
+        "bus.subscribe" => {
+            let _ = cmds.send(Cmd::Attach {
+                peer: conn.peer.id(),
+            });
+            facaderpc::bus_subscribe(conn, facades, body)
+        }
         method if method.starts_with("kv.") => facaderpc::kv(conn, facades, method, body),
         method if method.starts_with("blob.") => facaderpc::blob(conn, facades, method, body),
         method if method.starts_with("timer.") => facaderpc::timer(conn, facades, method, body),
@@ -394,17 +413,6 @@ async fn node_json(node: &NodeView, opts: &Opts) -> Value {
         "budget": node.budget,
         "tree": tree,
     })
-}
-
-async fn subscribe(peer: &Peer, body: &Value, cmds: &Cmds) -> Answer {
-    let (tx, rx) = oneshot::channel();
-    cmds.send(Cmd::Subscribe {
-        peer: peer.clone(),
-        env: opt_text(body, "env"),
-        reply: tx,
-    })
-    .map_err(|_| "base_gone".to_string())?;
-    rx.await.map_err(|_| "base_gone".to_string())
 }
 
 async fn peer_of(env: &str, cmds: &Cmds) -> Result<Peer, String> {

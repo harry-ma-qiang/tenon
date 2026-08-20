@@ -70,6 +70,16 @@ pub enum Cmd {
         limit: i64,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// `log.query`: the typed read over an env's session log (RFC section 3).
+    /// The same rows `events.tail` answers with, optionally narrowed to one
+    /// `session`; no SQL is exposed, only this shape.
+    LogQuery {
+        env: String,
+        after: i64,
+        limit: i64,
+        session: Option<String>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// The P3.4 tables behind one variant rather than seven: `episodes.*`,
     /// `tool_results.*`, `blobs.*` and `state.retain` are all "one env's state
     /// file, one accessor, one JSON answer", and spelling each of them as its
@@ -246,10 +256,10 @@ pub enum Cmd {
     AbortBoot {
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    Subscribe {
-        peer: Peer,
-        env: Option<String>,
-        reply: oneshot::Sender<Value>,
+    /// A connection opened a `bus.subscribe`, so it counts as attached for
+    /// `exit_on_detach` and the `status` figure. Its departure arrives as `Gone`.
+    Attach {
+        peer: u64,
     },
     Gone {
         peer: u64,

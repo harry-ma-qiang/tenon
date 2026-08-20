@@ -13,7 +13,7 @@ pub mod layer;
 pub mod ring;
 
 pub use envelope::{now_ms, ulid, Envelope, Level};
-pub use filter::{glob, Filter};
+pub use filter::{glob, is_reserved, Filter};
 pub use hub::{Durable, Hub, SubOpts};
 pub use layer::BusLayer;
 pub use ring::{Published, Ring, Subscription};
