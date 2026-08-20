@@ -51,9 +51,12 @@ async fn the_loop_records_episodes_tool_results_and_blobs_and_retention_bounds_t
     let (ok, out, err) = fixture.run(&["run", "spew some x", "--timeout", "120"]);
     assert!(ok, "tenon run failed: {out}{err}\n{}", fixture.log());
     let episodes = fixture
-        .rpc("episodes.tail", json!({"env": "root", "n": 50}))
+        .rpc(
+            "query.scan",
+            json!({"env": "root", "source": "episodes", "n": 50}),
+        )
         .await
-        .expect("episodes.tail")["episodes"]
+        .expect("query.scan episodes")["rows"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -77,9 +80,12 @@ async fn the_loop_records_episodes_tool_results_and_blobs_and_retention_bounds_t
 
     // b. the 20 KB tool output is a blob the tool_results row points at
     let rows = fixture
-        .rpc("tool_results.tail", json!({"env": "root", "n": 10}))
+        .rpc(
+            "query.scan",
+            json!({"env": "root", "source": "tool_results", "n": 10}),
+        )
         .await
-        .expect("tool_results.tail")["tool_results"]
+        .expect("query.scan tool_results")["rows"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -278,9 +284,12 @@ async fn the_loop_records_episodes_tool_results_and_blobs_and_retention_bounds_t
         "blobs are unbounded: {retained}"
     );
     let episodes = fixture
-        .rpc("episodes.tail", json!({"env": "root", "n": 500}))
+        .rpc(
+            "query.scan",
+            json!({"env": "root", "source": "episodes", "n": 500}),
+        )
         .await
-        .expect("episodes.tail");
+        .expect("query.scan episodes");
     assert_eq!(
         episodes["count"].as_i64().unwrap_or(0),
         102,

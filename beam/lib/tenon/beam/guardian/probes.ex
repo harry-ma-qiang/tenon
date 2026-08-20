@@ -78,7 +78,7 @@ defmodule Tenon.Beam.Guardian.Probes do
   end
 
   defp probe(:violations, state) do
-    case call(state, "events.tail", %{"after" => state.after, "limit" => @tail}) do
+    case call(state, "log.query", %{"after" => state.after, "limit" => @tail}) do
       {:ok, %{"events" => events}} -> violations(events, state)
       other -> {{:error, other}, state}
     end

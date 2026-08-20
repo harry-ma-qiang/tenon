@@ -47,17 +47,6 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn episodes_tail(&self, limit: i64) -> Result<Vec<Episode>> {
-        let mut stmt = self.conn.prepare(
-            "select id, session_id, step, state_hash, action, verifier_score, cost, created_at
-             from episodes order by id desc limit ?1",
-        )?;
-        let rows = stmt.query_map(params![limit.max(1)], episode)?;
-        let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.reverse();
-        Ok(rows)
-    }
-
     pub fn episodes_of_session(&self, session_id: &str, limit: i64) -> Result<Vec<Episode>> {
         let mut stmt = self.conn.prepare(
             "select id, session_id, step, state_hash, action, verifier_score, cost, created_at
