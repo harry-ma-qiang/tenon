@@ -1266,6 +1266,74 @@ schemas; the `query` facade serves the platform's own log and memory, not an app
 `config.yml` `ingress:` block: `max_per_env` (4), `max_total` (32), `lease_ttl_ms` (15000),
 `probe_ms` (1000), `body_limit` (1 MiB), `max_connections` (64).
 
+## Triggers, inbound webhook and the MCP bridge (P4.7)
+
+RFC P4.7's automation seam: a rule that fires an action when a bus envelope matches, an inbound
+webhook that turns an HTTP POST into an envelope, and an MCP bridge both directions. All of it reuses
+P4's boundary — one authorizer, the env-scope guard, one hop/budget guard — so the new surface is
+large but its security code stays the P4.4 code (RFC 8d).
+
+**The hop guard (RFC 8d.3, `Envelope.hop`).** The envelope grows one closed field, `hop` (default 0).
+A source envelope is 0; an action-produced one is its source's `hop + 1`; the trigger plugin drops an
+action whose result would exceed `triggers.hop_cap` (default 4). A `publish -> trigger -> publish`
+cycle therefore fires at most `hop_cap` times and stops — the loop/amplification guard, tested by
+`trigger_gate.rs`.
+
+**Triggers (`base/src/trigger.rs`, in the default binary).** `trigger.set{trigger_id?, filter{topics
+glob, tags?}, action, ttl?}` stores a rule in durable kv under `/triggers/<id>` (per env, so it
+survives a restart and is reloaded on boot); `trigger.list` and `trigger.del{trigger_id}` read and
+remove. One hub subscription in base watches every envelope; a rule fires only on **its own env's**
+envelopes (RFC 8d.2 — a rule stored under env E never sees another env's traffic), and each action
+runs on its own spawned task so the bus is never blocked. Three actions:
+- `publish{topic, payload_template}` — emit a new envelope with `hop+1`. Templating is minimal: a
+  `null` template copies the source payload; `${payload.<key>}`, `${topic}`, `${env}`, `${session}`
+  substitute inside any string; a bare `${payload}` string copies the whole payload.
+- `http_post{url, headers?}` — an outbound webhook off the actor thread, POSTing the source envelope
+  as JSON, with bounded retry+backoff (`triggers.http_retries`, default 3) and a per-trigger rate
+  budget (`triggers.calls_per_min`, default 60). **Egress policy is undefined and backend-owned here**
+  (RFC non-goal): the destination host is not filtered.
+- `prompt{env?, text_template}` — wake an agent by creating a session on the env's harness and
+  prompting it. The target defaults to the trigger's own env; a cross-env prompt requires an **admin**
+  trigger (one created by an unscoped base/barebone caller), so a scoped env's trigger can never wake
+  another env's agent.
+
+Sensitive actions can be listed in `triggers.gated_actions` (`http_post`, `prompt`); a gated action
+raises `approval.request` and only fires when a human approves. `trigger.set/list/del` are env-safe
+in the scope guard: a scoped caller is confined to its own env, an unscoped base/CLI caller may name
+any env and its triggers are admin.
+
+**Inbound webhook (`POST /hook/<topic>` on serve, feature `http`).** The single bearer authorizer
+runs first (no/wrong token is 401); then the body is published as an envelope on `hook/<topic>`,
+scoped to serve's env, non-durable unless `?durable=1`. A JSON body becomes the payload, anything else
+becomes `{body}`. Bodies over `triggers.webhook_body_limit` (default 65536) are a 413. This is the one
+door that lets an outside system (CI, a SaaS callback) drop an event onto the bus, where a trigger can
+act on it.
+
+**MCP bridge, both directions (a plugin/adapter, never a facade).**
+- *Client (`harness/src/mcp.rs`).* `mcp.mount{name, cmd|url, args?, env?}` spawns or connects an MCP
+  server (stdio or streamable-HTTP JSON-RPC 2.0), runs `initialize` + `tools/list`, and registers
+  each tool into **our** tools bus under single authority as `mcp/<server>/<tool>`. A bridged
+  `tools/call` is forwarded to the server, but only **after** the harness `tools/pre-execute`
+  waterfall, the gate and the budget have run — so guard/approval/budget apply to a bridged tool
+  exactly as to a native one (`mcp_gate.rs`: a guard hook denies the echo tool). `mcp.list`,
+  `mcp.unmount`.
+- *Server (`base/src/mcp.rs`).* Tenon exposes an env's tools bus over MCP so Claude Code or another
+  MCP client can run bash and edit files in the sandbox. Two transports: stdio (`tenon mcp
+  [--env NAME]`) and streamable HTTP on serve (`POST /mcp`, behind the single bearer authorizer).
+  `initialize`/`tools/list`/`tools/call` route through that env's tools bus (`svc tools.execute`), so
+  a call is env-scoped by construction and a gated tool goes through approvals. `tools/list` mirrors
+  the env's live catalog; when the harness is down it answers an empty list rather than an error.
+
+`config.yml` `triggers:` block: `hop_cap` (4), `calls_per_min` (60), `webhook_body_limit` (65536),
+`http_retries` (3), `gated_actions` (`[]`).
+
+**Deviations.** (1) The RFC path `/triggers/<env>/<id>` is realised as kv key `/triggers/<id>` under
+the already-env-scoped kv, which is the same addressing. (2) The streamable-HTTP MCP transport is a
+plain single request/response POST — no SSE server-push — which is enough for `tools/list` and
+`tools/call`; the stdio transport is the fully exercised one. (3) The MCP-server `tools/list` exposes
+the env's whole tools-bus catalog rather than a hand-picked subset; the tools bus still gates every
+call, so nothing escapes the boundary by being listed.
+
 ## Commands
 
 | Command | What |
@@ -1274,7 +1342,7 @@ schemas; the `query` facade serves the platform's own log and memory, not an app
 | `tenon attach [--env NAME] [--ui]` | print the status document, then stream the event log until Ctrl-C. `--ui` renders the built-in ASCII UI instead (raw mode, keys `p a r 0-9 q`) |
 | `tenon approvals [--status STATUS]` | the approval queue, one line per row: `id status env kind reason`. `pending` by default, `all` for the history |
 | `tenon approve <id> [--deny] [--note TEXT]` | answer one pending approval; whatever call is blocked on it resumes or fails with the reason |
-| `tenon serve --http ADDR [--env NAME] [--https [--cert PEM --key PEM]] [--auth-token TOKEN] [--public]` | the same UI as a localhost web page, plus the `/ws` WebSocket carrier (cargo feature `http`, off by default). `--https` terminates TLS (rustls; a dev self-signed cert with a printed SHA-256 when no `--cert`/`--key`); every request needs the bearer token (`--auth-token` or `TENON_AUTH_TOKEN`) unless `--public` |
+| `tenon serve --http ADDR [--env NAME] [--https [--cert PEM --key PEM]] [--auth-token TOKEN] [--public]` | the same UI as a localhost web page, plus the `/ws` WebSocket carrier, the `POST /hook/<topic>` inbound webhook and the `POST /mcp` MCP server (cargo feature `http`, off by default). `--https` terminates TLS (rustls; a dev self-signed cert with a printed SHA-256 when no `--cert`/`--key`); every request needs the bearer token (`--auth-token` or `TENON_AUTH_TOKEN`) unless `--public` |
 | `tenon ingress [--env NAME]` | the `/app/<name>` routes base is serving (RFC 8c, cargo feature `http`): `{count, routes: [{name, env, addr, public}]}`, every env or one named env |
 | `tenon stop [--all]` | stop every env, then G, then base; `--all` also reaps this home's dead-base sandbox leftovers afterward |
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
@@ -1288,6 +1356,7 @@ schemas; the `query` facade serves the platform's own log and memory, not an app
 | `tenon run "task" [--env NAME] [--timeout SECONDS]` | one task for that env's agent: create a session, prompt it, stream the answer, exit 0 if the turn ended ok |
 | `tenon harness [--env NAME]` | the agent process of one env. Base starts one per env; run by hand only against a live gateway |
 | `tenon worker [--workspace DIR]` | the in-sandbox tool process. Speaks the wire on `TENON_GATEWAY` when it is set, fd 3/4 otherwise. `--workspace` defaults to `$TENON_WORKSPACE`, then `/workspace`, then the working directory |
+| `tenon mcp [--env NAME]` | expose that env's tools bus as an MCP server over stdio (newline-delimited JSON-RPC 2.0): `initialize`, `tools/list`, `tools/call` routed through the tools bus (env-scoped, gated tools -> approvals). Lets an MCP client such as Claude Code use Tenon as a sandboxed executor (RFC P4.7) |
 
 `--exit-on-detach` stops everything when the last **subscriber** disconnects. `status` and
 `stop` connect without subscribing, so only `attach` holds the door open.
@@ -1357,6 +1426,7 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `kv.watch{prefix,since_rev?}` | any | a since_rev snapshot then a live `kv/<key>` subscription over the bus |
 | `blob.put{data}` / `blob.get/open/stat{hash}` | any | content-addressed blobs over the existing `blobs` table; `open{offset,len}` is the paged window |
 | `timer.set{topic,after_ms\|every_ms,payload?,timer_id?,ttl_s?}` / `timer.list` / `timer.del{timer_id}` | any | a timer stored in durable kv under `/timers/`; the wheel fires it as an envelope and it survives a restart. The timer's id travels as `timer_id` because `id` is the frame's own correlation key |
+| `trigger.set{trigger_id?,filter{topics,tags?},action,ttl?}` / `trigger.list` / `trigger.del{trigger_id}` | any | a durable kv-stored rule (RFC P4.7); on a matching bus envelope of its own env it runs `action`: `publish`, `http_post` (retry+budget) or `prompt{env?}`. The `hop` counter caps loops; env-scoped like the other facades |
 | `auth.scope{env,token}` | plugin | bind this connection to `env` after checking `run/rt-<env>.token`; every later facade call is then pinned to that env (RFC 8d.2) |
 
 Requests to a node are answered outside the supervisor actor, so a `health` probe never

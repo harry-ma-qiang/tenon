@@ -2141,3 +2141,53 @@ flakiness. `cargo build --release` (feature off + `--features http`), `clippy --
 --all-features -D warnings`, `fmt --check`, `mix compile --warnings-as-errors`, `mix format
 --check-formatted`, `mix credo --strict` all clean. `podman ps -a --filter label=tenon.home` shows
 only the live demo base `tenon.base:647207`.
+
+## P4.7 result — triggers, inbound webhook, MCP bridge both directions (2026-08-20)
+
+The automation seam of RFC P4.7, all reusing the P4 boundary (one authorizer, the 8d.2 scope guard,
+one hop/budget guard), so the new surface is large but its security code is the P4.4 code.
+
+1. **Triggers (`base/src/trigger.rs`, default binary).** `trigger.set{trigger_id?, filter{topics
+   glob, tags?}, action, ttl?}` -> durable kv `/triggers/<id>` (per env, reloaded on boot);
+   `trigger.list`, `trigger.del{trigger_id}`. One hub subscription (`Filter::all`) watches every
+   envelope; a rule fires only on **its own env's** envelopes (a rule under env E never sees E'), each
+   action on a spawned task so the bus never blocks. Actions: `publish{topic, payload_template}`
+   (minimal templating — `null` copies payload, `${payload.k}`/`${topic}`/`${env}`/`${session}`
+   substitute, `${payload}` copies whole), `http_post{url, headers?}` (retry+backoff, per-trigger
+   `calls_per_min` budget, egress undefined/backend-owned per RFC), `prompt{env?, text_template}`
+   (session.create+prompt on the harness; cross-env prompt requires an admin trigger created by an
+   unscoped caller). `gated_actions` -> `approval.request`.
+2. **Hop guard (`Envelope.hop`, RFC 8d.3).** One new closed field, default 0; an action-produced
+   envelope is `source.hop+1`; the trigger drops an action whose result would exceed
+   `triggers.hop_cap` (4). A publish->trigger->publish cycle fires at most hop_cap times and stops.
+3. **Inbound webhook (`POST /hook/<topic>` on serve, feature http).** Single bearer authorizer first
+   (401), then publish the body on `hook/<topic>` scoped to serve's env, non-durable unless
+   `?durable=1`; over `webhook_body_limit` (65536) is 413.
+4. **MCP bridge, plugin/adapter not facade.** *Client* (`harness/src/mcp.rs`): `mcp.mount{name,
+   cmd|url}` spawns/connects an MCP server (stdio or HTTP JSON-RPC 2.0), `tools/list` registered into
+   OUR tools bus as `mcp/<server>/<tool>` under single authority, `tools/call` forwarded **after** the
+   pre-execute waterfall/gate/budget (so guard/approval/budget apply); `mcp.list`, `mcp.unmount`. A new
+   `McpCall` trait on the tools bus routes `service=="mcp"` rows to the manager without a kernel round
+   trip. *Server* (`base/src/mcp.rs`): `tenon mcp [--env]` stdio + serve `POST /mcp` expose the env's
+   tools bus over MCP; `tools/call` routes through `svc tools.execute`, env-scoped by construction,
+   gated tools -> approvals.
+
+### Files + LoC (new/changed)
+
+New: `base/src/trigger.rs` (455), `base/src/mcp.rs` (156), `harness/src/mcp.rs` (325),
+`cli/tests/{trigger_gate,webhook_gate,mcp_gate}.rs` (257/122/259). Changed: `bus/src/envelope.rs`
+(+hop), `base/src/{bus,facaderpc,server,http,config,lib}.rs`, `harness/src/{bus,tools,lib}.rs`,
+`cli/src/main.rs` (+`mcp` subcommand), `base/Cargo.toml` (+reqwest), workspace `Cargo.toml`
+(+tokio io-std).
+
+### Gates
+
+New gates green: `trigger_gate` (relay + http_post retry + hop-cap loop bound + env scope; prompt
+wakes an agent on oci), `webhook_gate` (token->publish, no-token 401, oversized 413), `mcp_gate`
+(client: mount a stdlib python MCP echo server, callable through the model loop, denied by a
+pre-execute guard hook; server: `tenon mcp` stdio initialize/tools/list + `tools/call bash` in the
+oci sandbox). Regression green: `bus_gate` (11), `bus_adversarial` (6), `secrets_leak_adversarial`
+(2), `ws_scope_adversarial` (4), `query_gate` (8), `serve_https_gate` (1), `serve_authz_adversarial`
+(6), `ws_gate` (1), `ingress_gate` (2). `cargo build --release` (feature off + `--features http`),
+`clippy --all-targets --all-features -D warnings`, `fmt --check` all clean. `podman ps -a --filter
+label=tenon.home` shows only the live demo base `tenon.base:647207`.
