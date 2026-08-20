@@ -1170,6 +1170,63 @@ kernel more directly than a cross-process Rust harness could; the Rust `ws_gate.
 stripped release binary carries a ~147-byte difference in rustc's crate-metadata/symbol hash caused
 by declaring the four gated `http` modules; this is metadata, not code.
 
+## App platform: ingress (P4.5)
+
+RFC 8c's app platform, under the `http` feature. An app running **inside** a sandbox publishes an
+HTTP service and `serve` proxies `/app/<name>/*` to it. All of it reuses P3's boundary and P4's
+facades: one authorizer, one kv registry, no new process, no new port for the app to expose to the
+host itself.
+
+**Registration.** An app calls the gateway's `link` service to reach base — `svc link.request
+["ingress.register", {name, port, public?}]` — the only path an in-sandbox process has to the front
+door. Base takes the caller's env from **the node connection that carried the call**, never from the
+app, so a child can never register into a parent (RFC 8d). It validates: the name is
+`[A-Za-z0-9_-]{1,64}`, it is free of any **other** env (names are host-global, unique across the whole
+tree), the env is within `ingress.max_per_env` and the host within `ingress.max_total`, and the
+`port` was actually published for that env's sandbox. It then writes `/ingress/<name> -> {env, addr,
+public, port, lease}` into kv under the reserved `@ingress` namespace as a **lease-backed** key and
+returns `{name, env, addr, public, lease_id, ttl_ms}`. `ingress.unregister{name}` drops a route the
+caller's env owns; `ingress.list{env?}` and `tenon ingress` read the registry (a scoped app sees only
+its own env's routes, base/CLI see all or one named env).
+
+**Port mapping — how the host reaches inside.** Each agent env's sandbox publishes a fixed span of
+container ports `[18080, 18080 + max_per_env)` at spawn and forwards the list as
+`TENON_INGRESS_PORTS`; an app binds one and names it. The host-reachable address is the backend's:
+oci publishes each container port to a free `127.0.0.1:<host-port>` (podman 4.x refuses host port 0,
+so base reserves a free port itself, then maps it — `Instance::ingress_addr`), landlock and none
+share the host network namespace so the answer is `127.0.0.1:<container-port>` directly. Empty span =
+the whole non-`http` build and the guardian, so the spawn line is unchanged where ingress is not
+compiled or not wanted.
+
+**The lease, and how a route expires.** The route key is bound to a kv lease. Base runs one liveness
+loop (`ingress.probe_ms`) that HTTP-probes each route's own address; a live app renews the lease, two
+consecutive failed probes drop the route at once, and the lease TTL (`ingress.lease_ttl_ms`) is the
+backstop if base cannot probe. So a plain server that only registers and serves gets automatic
+expiry when it dies — no keep-alive client embedded in the app (a documented deviation from the RFC's
+"the app keeps it alive": base keeps it alive on the app's behalf, because an in-sandbox app has no
+timer in the SDK's single-threaded loop, and an HTTP probe is the one liveness signal that stays
+reliable through a rootless-podman port forwarder, which a bare `connect` does not).
+
+**Routing.** `serve` resolves `/app/<name>/*` through base (`ingress.resolve`), strips the
+`/app/<name>` prefix, forwards method/body/headers to the sandbox address, and streams the response
+back. It stamps `X-Tenon-App: <name>` and `X-Tenon-Env: <env>` (and drops any the client tried to
+set — no route spoofing), replaces `Host`, and never forwards `Authorization` (the app never sees the
+platform token). A WebSocket upgrade on the same path passes through: the handshake carries the
+`X-Tenon-*` headers and then both directions are copied verbatim. Auth is the single authorizer with
+the route's `public` flag — a `public` app skips the token, everything else requires it; a name with
+no live lease is a clean `404`, an unreachable app a `502`. `ingress.body_limit` caps the streamed
+response and `ingress.max_connections` bounds concurrent `/app` connections. No subdomains, no
+per-app TLS, no load balancing — one host, one proxy route.
+
+**Data-layering rule (RFC 8c, the SQL answer).** One app, one file: an app's relational data lives in
+its own sqlite file inside its workspace (git-snap snapshots it, so DB time-travel is free). The
+platform offers no shared SQL server; cross-app or shared state goes through kv/bus/blob only
+(permissioned, audited, evented). kv/bus are coordination primitives, not a query engine for app
+schemas; the `query` facade serves the platform's own log and memory, not an app's tables.
+
+`config.yml` `ingress:` block: `max_per_env` (4), `max_total` (32), `lease_ttl_ms` (15000),
+`probe_ms` (1000), `body_limit` (1 MiB), `max_connections` (64).
+
 ## Commands
 
 | Command | What |
@@ -1179,6 +1236,7 @@ by declaring the four gated `http` modules; this is metadata, not code.
 | `tenon approvals [--status STATUS]` | the approval queue, one line per row: `id status env kind reason`. `pending` by default, `all` for the history |
 | `tenon approve <id> [--deny] [--note TEXT]` | answer one pending approval; whatever call is blocked on it resumes or fails with the reason |
 | `tenon serve --http ADDR [--env NAME] [--https [--cert PEM --key PEM]] [--auth-token TOKEN] [--public]` | the same UI as a localhost web page, plus the `/ws` WebSocket carrier (cargo feature `http`, off by default). `--https` terminates TLS (rustls; a dev self-signed cert with a printed SHA-256 when no `--cert`/`--key`); every request needs the bearer token (`--auth-token` or `TENON_AUTH_TOKEN`) unless `--public` |
+| `tenon ingress [--env NAME]` | the `/app/<name>` routes base is serving (RFC 8c, cargo feature `http`): `{count, routes: [{name, env, addr, public}]}`, every env or one named env |
 | `tenon stop [--all]` | stop every env, then G, then base; `--all` also reaps this home's dead-base sandbox leftovers afterward |
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon install-service --user [--print]` | write the OS service unit for this binary and home, and enable it where there is a user service manager; `--print` prints it instead. Never starts base |
@@ -1224,6 +1282,8 @@ Ids are per direction. Nodes and CLI clients speak the same socket and the same 
 | `sandbox.exec{env,cmd,args,timeout}` | CLI | run `cmd args..` inside that env's sandbox instance (`timeout` ms, default 30000); answers `{status,stdout,stderr,timed_out}`. A test aid — the worker's tool surface is the agent-facing path |
 | `snap.pull{env}` | CLI | ask that env's worker for everything committed since the last stored pack and store it; answers `{step, ref, bytes, pulled}`. Runs on a timer too |
 | `snap.list{env}` | CLI | the packs the host holds for that env: `{count, packs: [{step, ref, bytes, created_at}]}` |
+| `ingress.register{name,port,public?}` | in-sandbox app (via `link`) | claim `/app/<name>`; env is taken from the carrying node connection, validated for uniqueness/quota/published port, written to kv as a lease-backed route (feature `http`) |
+| `ingress.unregister{name}` / `ingress.list{env?}` / `ingress.resolve{name}` | app, CLI, serve | drop a route the caller's env owns; list routes (env-scoped for a scoped caller); resolve a name to `{addr, public, env}` for the proxy (feature `http`) |
 | `runtime.spawn{parent?,overrides}` | node, CLI | create a child environment; answers `{env, parent, depth, ram_mb, profile, service, pid}` |
 | `runtime.stop{env}` | node, CLI | stop one child environment and its subtree; answers `{stopped: [...]}` |
 | `sandbox.destroy{env}` | CLI | destroy that env's sandbox instance now, without touching the node; the next `reset` (or node restart) creates a fresh one. Also a P3.1 test aid |
@@ -1696,6 +1756,16 @@ something dies" above) and this home will never `start` again to trigger the ord
 reap, so the fixture reaps it directly instead of leaving it for `podman ps -a` to
 accumulate across CI runs.
 
+`cli/tests/ingress_gate.rs` (1, feature `http`, skipped without oci or a release, ~13 s here) is
+the P4.5 gate: it drops a ~30-line stdlib python app (and the py SDK) into the root workspace,
+launches it inside the oci sandbox through the worker's `bash`, and the app registers `hello-app`
+via the gateway's `link` service then serves `GET /hello` and `POST /echo`. With `tenon serve
+--https --auth-token` up, the test asserts `GET /app/hello-app/hello` with the token returns the
+app's own `hi from root`, `POST /app/hello-app/echo` proves the `X-Tenon-App`/`X-Tenon-Env` headers
+reached the app, no token is `401`, a **second** env (a spawned child running the same app) is
+refused the already-owned name (`owned by env root`), and a `kill -9` of the app expires the route
+so the proxy then `404`/`502`s.
+
 ## Deviations from the RFC
 
 1. **No `rollback`, `approve` or `run` subcommand, and no `wire` crate.** They belong to
@@ -2050,3 +2120,15 @@ accumulate across CI runs.
     a restart even for revisions spent by ephemeral writes; and `blob.open` past end-of-blob and
     `blob.get`/`blob.stat` of an unknown hash return clean errors (offsets within the blob still
     clamp).
+68. **P4.5 ingress: base renews the lease, the app does not.** RFC 8c writes "the app keeps it
+    alive", but an in-sandbox app has no timer in the SDK's single-threaded loop, so base's own
+    liveness loop HTTP-probes each route and renews (or drops) the lease. This keeps the demo app —
+    and any app — to "register then serve" with no keep-alive client, and an HTTP probe is the one
+    liveness signal that stays reliable through a rootless-podman port forwarder (a bare `connect`
+    is accepted by the forwarder even when the app behind it is dead). The route is still a
+    lease-backed kv key, so a `kill -9` of base drops every route with the ephemeral store.
+69. **P4.5 oci publishes a fixed span of ports at spawn.** podman 4.x refuses host port `0`, and no
+    engine can add a published port to a running container, so each agent env's sandbox publishes
+    `[18080, 18080+max_per_env)` up front (base reserves a free host port per container port and
+    maps it). An app binds one of `TENON_INGRESS_PORTS`; a name with no live lease 404s. The whole
+    non-`http` build and the guardian publish nothing, so their spawn line is byte-identical.
