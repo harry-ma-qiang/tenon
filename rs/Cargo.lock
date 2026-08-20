@@ -1905,6 +1905,7 @@ dependencies = [
  "futures-util",
  "libc",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustls",
  "rustls-pemfile",

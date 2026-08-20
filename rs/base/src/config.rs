@@ -168,6 +168,55 @@ pub struct Ingress {
     pub max_connections: usize,
 }
 
+/// RFC P4.7 triggers + inbound webhook. `hop_cap` is the loop/amplification
+/// guard (RFC 8d.3): a trigger drops an envelope whose hop counter would exceed
+/// it. `calls_per_min` bounds one `http_post` trigger's outbound rate.
+/// `webhook_body_limit` caps a `POST /hook/<topic>` body.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Triggers {
+    #[serde(default = "hop_cap")]
+    pub hop_cap: u32,
+    #[serde(default = "calls_per_min")]
+    pub calls_per_min: u32,
+    #[serde(default = "webhook_body_limit")]
+    pub webhook_body_limit: usize,
+    #[serde(default = "http_retries")]
+    pub http_retries: u32,
+    /// Action kinds that require a human approval before they fire
+    /// (`http_post`, `prompt`). A cross-env prompt and an http_post to a new
+    /// host are the sensitive cases (RFC 8d.3).
+    #[serde(default)]
+    pub gated_actions: Vec<String>,
+}
+
+fn hop_cap() -> u32 {
+    4
+}
+
+fn calls_per_min() -> u32 {
+    60
+}
+
+fn webhook_body_limit() -> usize {
+    65_536
+}
+
+fn http_retries() -> u32 {
+    3
+}
+
+impl Default for Triggers {
+    fn default() -> Self {
+        Self {
+            hop_cap: hop_cap(),
+            calls_per_min: calls_per_min(),
+            webhook_body_limit: webhook_body_limit(),
+            http_retries: http_retries(),
+            gated_actions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "root_env")]
@@ -212,6 +261,8 @@ pub struct Config {
     pub tiers: Tiers,
     #[serde(default)]
     pub benchmark: Benchmark,
+    #[serde(default)]
+    pub triggers: Triggers,
 }
 
 fn root_env() -> String {
@@ -491,6 +542,7 @@ impl Default for Config {
             budget_tick_ms: budget_tick_ms(),
             tiers: Tiers::default(),
             benchmark: Benchmark::default(),
+            triggers: Triggers::default(),
         }
     }
 }

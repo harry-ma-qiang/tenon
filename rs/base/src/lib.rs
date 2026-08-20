@@ -53,6 +53,7 @@ pub mod timer;
 #[cfg(feature = "http")]
 pub mod tls;
 pub mod token;
+pub mod trigger;
 pub mod tui;
 pub mod ui;
 pub mod upgrade;
@@ -136,7 +137,7 @@ pub async fn foreground(opts: StartOpts) -> Result<i32> {
         Duration::from_millis(config.budget_tick_ms.max(500)),
         cmds.clone(),
     );
-    let facades = bus::Facades::build(&home)?;
+    let facades = bus::Facades::build(&home, &config)?;
     let mut state = base::Base::new(
         home.clone(),
         config.clone(),

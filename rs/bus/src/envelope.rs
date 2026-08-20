@@ -67,6 +67,12 @@ pub struct Envelope {
     pub step: Option<i64>,
     #[serde(default)]
     pub event_id: String,
+    /// RFC 8d.3 loop/amplification guard: how many trigger actions produced this
+    /// envelope. A source envelope is 0; an action-produced one is its source's
+    /// hop + 1; the trigger plugin drops one whose hop would exceed the config
+    /// cap, so a publish -> trigger -> publish cycle cannot run away.
+    #[serde(default)]
+    pub hop: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
     #[serde(default)]
@@ -95,6 +101,7 @@ impl Envelope {
             session: None,
             step: None,
             event_id: ulid(),
+            hop: 0,
             tags: BTreeMap::new(),
             payload,
         }
