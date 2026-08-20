@@ -33,7 +33,7 @@ belong to the barebone and must not be reachable by an agent editing the profile
 | `TENON_GUARDIAN_FAILURES` | guardian only, consecutive failing passes before `reset` (default 6) |
 | `TENON_GUARDIAN_PROBE_TIMEOUT_MS` | guardian only, deadline of one probe call and the line above which it counts as wedged (default 5000) |
 | `TENON_GUARDIAN_PROBES` | guardian only, `:`-separated paths of the extra probe executables base approved |
-| `TENON_GATEWAY` | agent only, listen address: `unix:<path>` or `tcp:<host>:<port>` (default `unix:<TENON_HOME or ~/.tenon>/run/gateway-<TENON_ENV>.sock`) |
+| `TENON_GATEWAY` | agent only, listen address: `unix:<path>`, `tcp:<host>:<port>` or `ws:<host>:<port>` (default `unix:<TENON_HOME or ~/.tenon>/run/gateway-<TENON_ENV>.sock`) |
 
 `rel/env.sh.eex` sets `RELEASE_DISTRIBUTION=none` (no distribution, no epmd, no cookie) and
 `RELEASE_MODE=embedded` (all modules preloaded, no code loading from disk at runtime), so a
@@ -124,6 +124,16 @@ is a child of the gateway fiber, so unmounting the gateway (or its node dying) d
 them for free, the same cascade that already unwinds any other parent/child mount.
 Mounted only in agent-role nodes — a guardian node has no sandbox to register plugins from.
 
+**`ws:` carrier (P4.4).** `TENON_GATEWAY` also accepts `ws:<host>:<port>`, so a browser
+extension (the vibe-browse Chrome bridge) registers as a plugin without a python side-server.
+The listen socket is raw (`{:packet, 0}`) because a WebSocket does its own framing; on accept,
+`Gateway.WebSocket` completes the RFC 6455 handshake, then bridges — the kernel is frozen and
+mounts a real `{:packet, 4}` socket, so the handler holds one end of a loopback socket-pair
+whose other end it mounts, relays each WS text message onto it and wraps each kernel frame back
+as a text message. The bridge runs concurrently with `:tenon.mount` because the mount blocks
+until the plugin's hello/load/rep handshake completes. Everything downstream is identical:
+one connection = one socket-fiber, disconnect closes the pair and the fiber is gone.
+
 ## Check
 
 `Tenon.Beam.Check` is the kernel contract suite, shipped as a release artifact so an
@@ -141,7 +151,7 @@ mix compile --warnings-as-errors && mix format --check-formatted
 mix credo --strict && mix test && MIX_ENV=prod mix release
 ```
 
-38 tests. `test/link_test.exs` (14) covers register, `health`, `tree`, `reload`, the unknown
+40 tests. `test/link_test.exs` (14) covers register, `health`, `tree`, `reload`, the unknown
 method, request correlation in both outcomes, the node-stop on close, and the failed load
 without a socket. `test/guardian_test.exs` (15) covers one test per probe kind — base not answering, an
 unhealthy env, a root fiber that is not active, a worker and a harness that do not answer
@@ -160,3 +170,6 @@ against a contract version the suite does not implement (refused by name).
 fake clients directly (no base needed): a `:tenon.svc` call reaches a connected client,
 disconnecting fails that client's fiber and drops its service, a second client gets its own
 fiber, and unmounting the gateway drops an active connection's service.
+`test/gateway_ws_test.exs` (2) mounts a gateway on a `ws:` address and drives a hand-rolled
+WebSocket client through the plugin handshake: a client speaks hello/provide and its svc
+answers through the kernel, and closing the WS connection drops its fiber.

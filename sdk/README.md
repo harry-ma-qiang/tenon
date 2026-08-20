@@ -137,14 +137,22 @@ plugin.provide("inside", {"ping": lambda: "pong"})
 plugin.run()
 ```
 
-If the `TENON_GATEWAY` environment variable is set (`unix:<path>` or `tcp:<host>:<port>`,
-the same string the node itself was started with — see `../beam/README.md`), `Plugin()`
-connects a `socket.socket` to that address instead of opening file descriptors 3 and 4,
-and wraps it in a read side and a write side with `sock.makefile(...)`; everything past
-that point — `hello`, `load`, `provide`, `svc`, `on`/hooks — is identical, since the
-kernel treats a socket-backed fiber exactly like a port-backed one. Without
-`TENON_GATEWAY` set, behavior is unchanged: fd 3/4, as before. Passing `wire_in`/`wire_out`
-explicitly (tests, `example.py`) always wins over both.
+If the `TENON_GATEWAY` environment variable is set (`unix:<path>`, `tcp:<host>:<port>` or
+`ws:<host>:<port>`, the same string the node itself was started with — see
+`../beam/README.md`), `Plugin()` connects to that address instead of opening file
+descriptors 3 and 4; everything past that point — `hello`, `load`, `provide`, `svc`,
+`on`/hooks — is identical, since the kernel treats a socket-backed fiber exactly like a
+port-backed one. Without `TENON_GATEWAY` set, behavior is unchanged: fd 3/4, as before.
+Passing `wire_in`/`wire_out` explicitly (tests, `example.py`) always wins over both.
+
+**`ws:` (P4.4).** A `ws:<host>:<port>` gateway makes the SDK speak the same plugin wire over
+a WebSocket: it opens a raw socket, performs the RFC 6455 client handshake (`GET /ws`,
+`Sec-WebSocket-Key`), then sends each JSON plugin frame as one masked text message and reads
+one frame per server text message (no `{packet,4}` prefix — the WS framing replaces it). This
+is what lets a browser extension such as the vibe-browse Chrome bridge register as a plugin
+without a python side-server; the transport is stdlib-only (`socket`, `base64`, `struct`).
+For `unix:`/`tcp:` the SDK still wraps the socket with `sock.makefile(...)` and the length
+prefix, unchanged.
 
 `rs/src/lib.rs` does the same since P3.2, because `tenon worker` is a rust plugin that
 runs inside the sandbox:

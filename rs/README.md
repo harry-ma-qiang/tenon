@@ -1113,6 +1113,63 @@ answer `303 See Other` back to `/`, so a reload never repeats an action and the 
 UI state beyond one session id per process. Loopback only — the page is the human gate, not a
 public surface — and it works with JavaScript off.
 
+## Serve hardening (P4.4)
+
+All of it is under the `http` feature and off by default; the default binary pulls no TLS, WS or
+secrets dependency and its compiled behaviour is unchanged (the release binary differs only by
+rustc's crate-metadata symbol hash from declaring the gated modules — see the deviation note below).
+
+**One authorizer (RFC 8d.1).** Every serve carrier — HTTP, WS, SSE later — passes through exactly
+one function, `base::auth::authorize(carrier, request, auth) -> Result<Scope, Reject>` in
+`rs/base/src/auth.rs`, and the bearer-token check lives there and nowhere else, so adding a route
+never adds an auth path. The token comes from `--auth-token` or `TENON_AUTH_TOKEN`; it is required
+on every HTTP/WS request (from `Authorization: Bearer` or `?token=`) unless the serve surface is
+`--public` (per-app `public` is P4.5 ingress; the flag is honoured here), and the compare is
+constant-time. No/wrong token is `401`. The two local carriers keep P3's authorizer, recorded in the
+same `Carrier` enum: base UDS uses the peer/runtime-token path (`auth.scope` → `Conn::scoped_env`,
+the single 8d.2 env-scope gate), and the gateway uses connection→env by socket location.
+
+**TLS.** `tenon serve --https [--cert PEM --key PEM]` terminates TLS with rustls (ring provider).
+With no cert given, rcgen mints an in-memory self-signed cert for `localhost`/`127.0.0.1` and prints
+its SHA-256 fingerprint (`tenon: self-signed cert sha-256 <hex>`), so a `curl --cacert`/`-k` client
+can pin it; the same request handler runs under TLS and plaintext (it is generic over the stream).
+Localhost bind only. Production SSO stays a documented seam (reverse proxy / JWT pass-through).
+
+**WebSocket carrier — the 5th wire transport, same frames, no new protocol.** `GET /ws` upgrades
+(same bearer authorizer first). After the handshake the connection is bridged transparently to
+base's own front door: each text frame is one front-door request or a pushed `t:"ev"` envelope, so
+every RPC and `bus.subscribe` stream ride the exact shapes the UDS carrier uses (server pushes
+coalesced envelope batches as text frames). Binary frames are reserved for media (accepted and
+ignored for now). On the gateway (beam) `TENON_GATEWAY` gains a `ws:` scheme: the gateway accepts WS
+connections and mounts each as a kernel socket-fiber exactly like `tcp:`/`unix:` (one connection =
+one fiber, disconnect = fiber gone), so a browser extension such as the vibe-browse Chrome bridge
+registers as a plugin without a python side-server. The kernel stays frozen: the beam WS handler
+bridges the browser socket to a loopback socket-pair whose other end is the real `{packet,4}` socket
+the kernel mounts, and runs the bridge concurrently with the mount (the kernel's mount blocks until
+the hello/load/rep handshake completes).
+
+**secrets facade + mask|block leak policy (RFC 8d.4).** `secret.set{name, value, leak: mask|block,
+grants?}` / `secret.get{name}` / `secret.list` (names + policy + grants, never a value). Values live
+only in base's own `secrets.yml` (mode 0600), never in an env's state file and never inside an
+envelope; `secret.get` is grant-checked against the caller's bound env (an unscoped base/CLI caller
+always reads; a scoped env reads only what `grants` lists, else `not_granted`). The leak choke point
+is the Hub: base pushes the value+policy set into the hub, and before any envelope is fanned out or
+persisted the hub scans its payload for known secret values — `mask` rewrites the value in place to
+`***<name>***` (vibe-term's PTY-mask idea at the envelope layer), `block` refuses the publish with an
+error and fans out a value-free `guardian/violation` event. Base's own event-log append calls the
+same one hub scrub before it writes, so the state file never holds a raw value either — one choke
+point, applied at both doors. Secret values never appear in logs.
+
+**Deviations.** (1) `serve --http` with neither `--auth-token`/`TENON_AUTH_TOKEN` nor `--public`
+now refuses to start rather than serving unauthenticated; `--https` may still start tokenless for a
+quick local look. (2) The gateway `ws:` carrier's end-to-end coverage (a client speaking
+hello/provide whose svc answers through the kernel) lives in the beam suite
+(`beam/test/gateway_ws_test.exs`) and a python-SDK cross-language smoke, which exercise the real
+kernel more directly than a cross-process Rust harness could; the Rust `ws_gate.rs` covers serve
+`/ws` subscribe. (3) Feature-off is byte-identical in compiled code and dependency set, but the
+stripped release binary carries a ~147-byte difference in rustc's crate-metadata/symbol hash caused
+by declaring the four gated `http` modules; this is metadata, not code.
+
 ## Commands
 
 | Command | What |
@@ -1121,7 +1178,7 @@ public surface — and it works with JavaScript off.
 | `tenon attach [--env NAME] [--ui]` | print the status document, then stream the event log until Ctrl-C. `--ui` renders the built-in ASCII UI instead (raw mode, keys `p a r 0-9 q`) |
 | `tenon approvals [--status STATUS]` | the approval queue, one line per row: `id status env kind reason`. `pending` by default, `all` for the history |
 | `tenon approve <id> [--deny] [--note TEXT]` | answer one pending approval; whatever call is blocked on it resumes or fails with the reason |
-| `tenon serve --http ADDR [--env NAME]` | the same UI as a localhost web page (cargo feature `http`, off by default) |
+| `tenon serve --http ADDR [--env NAME] [--https [--cert PEM --key PEM]] [--auth-token TOKEN] [--public]` | the same UI as a localhost web page, plus the `/ws` WebSocket carrier (cargo feature `http`, off by default). `--https` terminates TLS (rustls; a dev self-signed cert with a printed SHA-256 when no `--cert`/`--key`); every request needs the bearer token (`--auth-token` or `TENON_AUTH_TOKEN`) unless `--public` |
 | `tenon stop [--all]` | stop every env, then G, then base; `--all` also reaps this home's dead-base sandbox leftovers afterward |
 | `tenon reset [--env NAME]` | SIGTERM/SIGKILL that env, restore its LKG profile, start it again. G is untouched |
 | `tenon install-service --user [--print]` | write the OS service unit for this binary and home, and enable it where there is a user service manager; `--print` prints it instead. Never starts base |
