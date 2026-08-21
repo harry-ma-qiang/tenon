@@ -151,3 +151,32 @@ Total < 1k new Rust, no new architecture, no kernel change.
   switch) is always-on, microsecond reaction, does NOT depend on any LLM. LLM wake-checks are the
   JUDGMENT layer (progress/stuck/drift): Opus every ~10 min, Fable every ~1 h. Safety never relies on
   the LLM cadence.
+
+## 10. P5.0c resolutions (2026-08-21, from the first real agy trial)
+
+The CLI wiring (`tenon cli-agent run/preflight/status/stop`), the mandatory auth preflight, and the
+scratch disk cap landed, and one supervised real `agy` trial ran. Findings that resolve or refine the
+open questions above:
+
+- **OQ1 refined — the auth probe.** A zero-cost preflight of `agy --version` + `agy mcp list` is NOT
+  sufficient: neither authenticates, so a jail-blocked credential passes them and only fails on the real
+  paid run ("You are not logged into Antigravity"). `agy models` DOES exercise the credential token
+  source at zero cost and is the probe that catches it. The preflight now runs all three and scans for
+  auth-failure signatures; only a clean pass allows a paid call.
+- **NEW — credential dir must be READ-WRITE for agy, not read-only.** agy refreshes its OAuth token by
+  writing to its own state dir, so a read-only grant breaks auth. The `--writable-state` opt-in grants
+  the agent's own `~/.gemini` + `~/.cache` read-write (never `~/workspace`, the repo, `deepseek.env.sh`,
+  or `~/.ssh` — the hard boundary is unchanged). Default stays read-only (the safe floor); a working agy
+  run turns it on.
+- **NEW — `RLIMIT_AS` is off for cli-agent runs.** agy/claude are Go/Node binaries whose runtimes
+  reserve huge virtual address space; a tight `RLIMIT_AS` triggers a false `fatal error: out of memory`.
+  Memory capping is delegated to the cgroup `memory.max`, enforced only when base runs under the
+  delegated user manager (else no memory cap — documented). NPROC/CPU/NOFILE, the scratch watcher, and
+  the wall/step budget remain the floor.
+- **Tool routing for real work.** Under the jail with base down, agy's native terminal/file tool is
+  degraded (`empty component: terminal_sandbox`) and did not land a file write, though the model turns
+  ran. The intended path (RFC section 3 layer B) is base up + Tenon-as-MCP as the only tool source; the
+  run registers it automatically when base is reachable.
+- **Safety confirmed.** On every trial the `~/workspace` canary was byte-for-byte unchanged, nothing
+  escaped scratch, and the run tore down cleanly — the kernel-level floor held regardless of the agent's
+  auth/tool state.
