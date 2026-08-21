@@ -119,6 +119,26 @@ impl Sandbox for Oci {
             args.push("-e".to_string());
             args.push(format!("TENON_INGRESS_PORTS={}", csv.join(",")));
         }
+        // RFC P5.0-v2 mount model: the cli-agent's cred/session volume, per-env
+        // cache, machine-id file and read-only base dirs. A file mount's parent
+        // must exist on the host; a directory mount is created so a fresh cache
+        // volume is not a spawn error.
+        for mount in &spec.mounts {
+            if mount.host.extension().is_some() || mount.host.is_file() {
+                if let Some(parent) = mount.host.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            } else {
+                let _ = std::fs::create_dir_all(&mount.host);
+            }
+            let mode = if mount.ro { "ro" } else { "rw" };
+            args.push("-v".to_string());
+            args.push(format!("{}:{}:{mode}", mount.host.display(), mount.guest));
+        }
+        if let Some(hostname) = &spec.hostname {
+            args.push("--hostname".to_string());
+            args.push(hostname.clone());
+        }
         args.push(image.to_string());
         args.push("sleep".to_string());
         args.push("infinity".to_string());
@@ -275,6 +295,25 @@ impl Instance for OciInstance {
 
     fn ingress_addr(&self, container_port: u16) -> Option<String> {
         self.ingress.get(&container_port).cloned()
+    }
+
+    fn spawn_streaming(&self, spec: &crate::ExecSpec) -> Result<std::process::Child> {
+        let mut command = Command::new(self.cli);
+        command.arg("exec");
+        if let Some(cwd) = &spec.cwd {
+            command.arg("-w").arg(cwd);
+        }
+        for (key, value) in &spec.env {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
+        command.arg(&self.id).arg(&spec.cmd).args(&spec.args);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+            .spawn()
+            .with_context(|| format!("{} exec {}", self.cli, spec.cmd))
     }
 
     fn destroy(&self) -> Result<()> {

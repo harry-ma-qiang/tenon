@@ -46,6 +46,8 @@ fn check(name: &str) {
         base_pid: std::process::id() as i32,
         images: None,
         ingress_ports: Vec::new(),
+        mounts: Vec::new(),
+        hostname: None,
     };
     let instance = sandbox.spawn(&spec).expect("spawn");
 
@@ -220,6 +222,8 @@ fn krun_backend_conformance() {
         base_pid: std::process::id() as i32,
         images: None,
         ingress_ports: Vec::new(),
+        mounts: Vec::new(),
+        hostname: None,
     };
     let sandbox = backend("krun").expect("the krun backend");
     let instance = sandbox.spawn(&spec).expect("spawn");

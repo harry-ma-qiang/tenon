@@ -1,6 +1,5 @@
-use crate::jail::{self, JailSpec, Limits};
-use std::io::Read;
-use std::path::PathBuf;
+use std::time::Duration;
+use tenon_sandbox::Instance;
 
 /// Case-insensitive substrings that mean the agent could not authenticate. A
 /// blocked credential path shows up as one of these on an otherwise zero-cost
@@ -15,21 +14,17 @@ const SIGNATURES: &[&str] = &[
     "401",
 ];
 
-/// A zero-cost auth preflight (RFC P5.0, deliverable 2). `probes` are read-only
-/// commands run UNDER THE JAIL (e.g. `agy --version`, `agy mcp list`) that spend
-/// nothing but exercise the same credential paths a real run needs. If the jail
-/// blocks a cred path, the agent prints an auth-failure signature and the
-/// preflight fails loud without proceeding to the model.
+/// A zero-cost auth preflight (RFC P5.0-v2, deliverable 2). `probes` are
+/// read-only commands run INSIDE THE SANDBOX (e.g. `agy --version`,
+/// `agy models`) that spend nothing but exercise the same credential paths a
+/// real run needs. If the container blocks a cred path, the agent prints an
+/// auth-failure signature and the preflight fails loud without a model call.
 pub struct PreflightSpec {
     pub cmd: String,
     pub probes: Vec<Vec<String>>,
-    pub scratch: PathBuf,
-    pub tmp: PathBuf,
-    pub agent_home: PathBuf,
-    pub rw_allow: Vec<PathBuf>,
-    pub ro_allow: Vec<PathBuf>,
-    pub limits: Limits,
     pub env: Vec<(String, String)>,
+    pub cwd: String,
+    pub timeout: Duration,
 }
 
 pub struct Preflight {
@@ -49,41 +44,20 @@ pub fn auth_failure_signature(text: &str) -> Option<String> {
         .map(|needle| (*needle).to_string())
 }
 
-/// Run each probe under the jail in turn; the first that prints an auth-failure
-/// signature or exits non-zero fails the preflight. A clean pass across every
-/// probe is the only thing that clears a paid run.
-pub fn run(spec: &PreflightSpec) -> anyhow::Result<Preflight> {
-    std::fs::create_dir_all(&spec.scratch)?;
-    std::fs::create_dir_all(&spec.tmp)?;
+/// Run each probe inside `instance` in turn; the first that prints an
+/// auth-failure signature or exits non-zero fails the preflight. A clean pass
+/// across every probe is the only thing that clears a paid run. The probe env
+/// carries the same credential/home wiring the real run uses, so a blocked
+/// cred volume fails here and never on a paid call.
+pub fn run(instance: &dyn Instance, spec: &PreflightSpec) -> anyhow::Result<Preflight> {
     for probe in &spec.probes {
-        let jail_spec = JailSpec {
-            cmd: spec.cmd.clone(),
-            args: probe.clone(),
-            cwd: spec.scratch.clone(),
-            scratch: spec.scratch.clone(),
-            tmp: spec.tmp.clone(),
-            rw_allow: spec.rw_allow.clone(),
-            ro_allow: spec.ro_allow.clone(),
-            env: spec.env.clone(),
-            limits: spec.limits.clone(),
-            cgroup_parent: None,
-        };
-        let mut jail = jail::spawn(&jail_spec)?;
-        let mut out = String::new();
-        if let Some(mut stdout) = jail.child.stdout.take() {
-            let _ = stdout.read_to_string(&mut out);
-        }
-        let mut err = String::new();
-        if let Some(mut stderr) = jail.child.stderr.take() {
-            let _ = stderr.read_to_string(&mut err);
-        }
-        let status = jail
-            .child
-            .wait()
-            .map(|status| status.code().unwrap_or(-1))
-            .unwrap_or(-1);
-        jail.kill();
-        let combined = format!("{out}\n{err}");
+        let argv = with_cwd(&spec.cwd, &spec.cmd, probe, &spec.env);
+        let outcome = instance.exec("sh", &argv, spec.timeout)?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr)
+        );
         if let Some(signature) = auth_failure_signature(&combined) {
             return Ok(Preflight {
                 ok: false,
@@ -92,12 +66,20 @@ pub fn run(spec: &PreflightSpec) -> anyhow::Result<Preflight> {
                 detail: tail(&combined),
             });
         }
-        if status != 0 {
+        if outcome.timed_out {
             return Ok(Preflight {
                 ok: false,
                 probe: probe.join(" "),
                 signature: None,
-                detail: format!("exit {status}: {}", tail(&combined)),
+                detail: format!("timed out: {}", tail(&combined)),
+            });
+        }
+        if outcome.status != 0 {
+            return Ok(Preflight {
+                ok: false,
+                probe: probe.join(" "),
+                signature: None,
+                detail: format!("exit {}: {}", outcome.status, tail(&combined)),
             });
         }
     }
@@ -107,6 +89,26 @@ pub fn run(spec: &PreflightSpec) -> anyhow::Result<Preflight> {
         signature: None,
         detail: "clean".to_string(),
     })
+}
+
+/// Build a `sh -c` line that cds into the agent cwd, exports the run's env and
+/// runs `cmd probe...`. One `sh -c` keeps the cwd and env identical to the real
+/// streamed run without a second exec API on the backend.
+fn with_cwd(cwd: &str, cmd: &str, probe: &[String], env: &[(String, String)]) -> Vec<String> {
+    let mut script = format!("cd {} 2>/dev/null; ", shell_quote(cwd));
+    for (key, value) in env {
+        script.push_str(&format!("export {}={}; ", key, shell_quote(value)));
+    }
+    script.push_str(&shell_quote(cmd));
+    for arg in probe {
+        script.push(' ');
+        script.push_str(&shell_quote(arg));
+    }
+    vec!["-c".to_string(), script]
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn tail(text: &str) -> String {
@@ -131,5 +133,19 @@ mod tests {
         );
         assert_eq!(auth_failure_signature("agy version 1.1.17"), None);
         assert_eq!(auth_failure_signature("No MCP servers configured."), None);
+    }
+
+    #[test]
+    fn with_cwd_cds_and_exports() {
+        let argv = with_cwd(
+            "/workspace",
+            "agy",
+            &["models".to_string()],
+            &[("HOME".to_string(), "/root".to_string())],
+        );
+        assert_eq!(argv[0], "-c");
+        assert!(argv[1].contains("cd '/workspace'"));
+        assert!(argv[1].contains("export HOME='/root'"));
+        assert!(argv[1].trim_end().ends_with("'agy' 'models'"));
     }
 }

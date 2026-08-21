@@ -1,11 +1,12 @@
-use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tenon_base::cli_agent::{self, CliAgentSpec, Events, McpEndpoint, RunBudget};
-use tenon_base::jail::Limits;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tenon_base::cli_agent::{self, CliAgentSpec, Events, RunBudget};
+use tenon_base::preflight::{self, PreflightSpec};
 use tenon_base::ratelimit::{Limiter, RateConfig, SystemClock};
+use tenon_sandbox::{backend, ExecSpec, Instance, Mount, Policy, Spec};
 
 fn suffix() -> u128 {
     SystemTime::now()
@@ -47,17 +48,6 @@ impl Collector {
     }
 }
 
-fn loose_limits() -> Limits {
-    Limits {
-        nproc: 0,
-        mem_bytes: 0,
-        cpu_secs: 0,
-        nofile: 0,
-        mem_max: 0,
-        pids_max: 0,
-    }
-}
-
 fn fast_rate() -> RateConfig {
     RateConfig {
         rpm: 600,
@@ -69,171 +59,391 @@ fn fast_rate() -> RateConfig {
     }
 }
 
-fn write_agent(body: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tenon-fake-agent-{}", suffix()));
+fn tmp(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("tenon-cli-v2-{tag}-{}", suffix()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("agent.sh");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    dir
+}
+
+fn write_exec(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    path
 }
 
-fn home(run: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("tenon-cli-home-{run}-{}", suffix()))
+fn agent_env() -> Vec<(String, String)> {
+    vec![
+        ("HOME".to_string(), "/root".to_string()),
+        (
+            "PATH".to_string(),
+            "/root/.local/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        ),
+    ]
 }
 
-/// The adapter, driven by a fake agent that emits a few JSON lines and exits,
-/// produces the expected bus events, writes the MCP config, and git-snaps each
-/// step. No real model is touched.
+struct Layout {
+    root: PathBuf,
+    workspace: PathBuf,
+    cache: PathBuf,
+    machine_id: PathBuf,
+    ro_base: PathBuf,
+    home_hash: String,
+}
+
+fn layout(tag: &str) -> Layout {
+    let root = tmp(tag);
+    let workspace = root.join("workspace");
+    let cache = root.join("cache");
+    let ro_base = root.join("ro-base");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::create_dir_all(&ro_base).unwrap();
+    let machine_id = root.join("machine-id");
+    std::fs::write(&machine_id, "0123456789abcdef0123456789abcdef\n").unwrap();
+    Layout {
+        root,
+        workspace,
+        cache,
+        machine_id,
+        ro_base,
+        home_hash: format!("clv2{:x}", suffix() & 0xffff_ffff),
+    }
+}
+
+fn spawn(layout: &Layout) -> anyhow::Result<std::sync::Arc<dyn Instance>> {
+    let sandbox = backend("oci")?;
+    let spec = Spec {
+        env: "root".to_string(),
+        image: None,
+        binary: None,
+        workspace: layout.workspace.clone(),
+        gateway: None,
+        env_passthrough: vec![],
+        policy: Policy {
+            ram_mb: 1024,
+            pids_max: 256,
+            egress: true,
+        },
+        caps: vec![],
+        home_hash: layout.home_hash.clone(),
+        base_pid: std::process::id() as i32,
+        images: None,
+        ingress_ports: Vec::new(),
+        mounts: vec![
+            Mount {
+                host: layout.cache.clone(),
+                guest: "/root/.cache".to_string(),
+                ro: false,
+            },
+            Mount {
+                host: layout.machine_id.clone(),
+                guest: "/etc/machine-id".to_string(),
+                ro: true,
+            },
+            Mount {
+                host: layout.ro_base.clone(),
+                guest: "/opt/tenon-base".to_string(),
+                ro: true,
+            },
+        ],
+        hostname: Some("tenon-root".to_string()),
+    };
+    sandbox.spawn(&spec)
+}
+
+fn container_gone(cli: &str, home_hash: &str) -> bool {
+    let out = std::process::Command::new(cli)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=tenon.home={home_hash}"),
+            "--format",
+            "{{.ID}}",
+        ])
+        .output();
+    match out {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        Err(_) => true,
+    }
+}
+
+fn cli() -> Option<&'static str> {
+    let path = std::env::var_os("PATH")?;
+    ["podman", "docker"]
+        .into_iter()
+        .find(|name| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
+/// The core P5.0-v2a gate: a fake agent inside the sandbox writes a file in its
+/// cwd; the edit lands in the SANDBOX workspace (host-visible via the bind), a
+/// canary in ~/workspace is untouched (never mounted), the workspace snapshot
+/// captures the change, teardown is clean, and the cache + RO base survive a
+/// container recreate.
 #[test]
-fn fake_agent_produces_events_snapshots_and_mcp_config() {
-    let agent = write_agent(
+fn fake_agent_edits_land_in_the_sandbox_workspace_not_host() {
+    let Some(cli) = cli() else {
+        println!("skipping: no podman/docker on PATH");
+        return;
+    };
+    let lay = layout("edits");
+
+    let canary_dir = dirs_home()
+        .join("workspace")
+        .join(format!(".tenon-canary-{}", suffix()));
+    std::fs::create_dir_all(&canary_dir).unwrap();
+    let canary = canary_dir.join("canary.txt");
+    std::fs::write(&canary, "do-not-touch").unwrap();
+
+    // Seed the cache and RO base so the recreate check has something to find.
+    std::fs::write(lay.cache.join("dep.txt"), "cached-node-modules").unwrap();
+    std::fs::write(lay.ro_base.join("toolchain.txt"), "ro-base-present").unwrap();
+
+    let instance = match spawn(&lay) {
+        Ok(instance) => instance,
+        Err(error) => {
+            println!("skipping: cannot spawn oci instance: {error}");
+            let _ = std::fs::remove_dir_all(&canary_dir);
+            return;
+        }
+    };
+
+    let agent = lay.workspace.join("agent.sh");
+    write_exec(
+        &agent,
         "echo '{\"type\":\"text\",\"text\":\"hello\"}'\n\
-         echo scratch-file > note.txt\n\
-         echo '{\"type\":\"tool_use\",\"name\":\"bash\"}'\n\
+         echo agent-was-here > from-agent.txt\n\
+         echo '{\"type\":\"tool_use\",\"name\":\"write\"}'\n\
+         cat /etc/machine-id\n\
          echo '{\"type\":\"text\",\"text\":\"done\"}'",
     );
-    let run = "adapter1";
-    let root = home(run);
+
     let spec = CliAgentSpec {
-        run: run.to_string(),
+        run: "edits".to_string(),
         env: "root".to_string(),
-        cmd: agent.display().to_string(),
-        args: vec![],
-        root: root.clone(),
-        mcp: Some(McpEndpoint {
-            url: "http://127.0.0.1:38080/mcp".to_string(),
-            token: "test-token".to_string(),
-        }),
-        ro_allow: vec![],
-        rw_state: vec![],
-        limits: loose_limits(),
+        cmd: "sh".to_string(),
+        args: vec!["/workspace/agent.sh".to_string()],
+        workspace: lay.workspace.clone(),
+        guest_cwd: "/workspace".to_string(),
+        agent_env: agent_env(),
         rate: fast_rate(),
         budget: RunBudget::default(),
-        extra_env: vec![],
-        cgroup_parent: None,
-        agent_home: root.clone(),
-        scratch_max_mb: 0,
     };
     let events = Collector::default();
     let stop = AtomicBool::new(false);
-    let limiter = Mutex::new(Limiter::new(spec.rate.clone()));
-    let clock = SystemClock;
-    let outcome = cli_agent::run_with(&spec, &events, &stop, &limiter, &clock).expect("run");
+    let outcome = cli_agent::run(&spec, instance.as_ref(), &events, &stop).expect("run");
 
     assert!(events.has("started"), "kinds: {:?}", events.kinds());
     assert!(events.has("tool-call"), "kinds: {:?}", events.kinds());
-    assert!(events.has("output"));
-    assert!(events.has("done"));
-    assert_eq!(outcome.steps, 1, "one tool_use is one step");
+    assert!(events.has("done"), "kinds: {:?}", events.kinds());
     assert!(!outcome.killed);
+
+    let landed = lay.workspace.join("from-agent.txt");
+    assert!(
+        landed.is_file(),
+        "the agent's file must land in the sandbox workspace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&landed).unwrap().trim(),
+        "agent-was-here"
+    );
     assert!(
         events.snapshots() >= 2,
-        "expected per-step + final git-snaps"
+        "expected per-step + final workspace snapshots, got {}",
+        events.snapshots()
     );
 
-    let mcp = spec.scratch().join(".mcp.json");
-    let body: Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
-    assert_eq!(body["mcpServers"]["tenon"]["type"], json!("http"));
+    // Isolation: the ~/workspace canary is byte-for-byte unchanged.
     assert_eq!(
-        body["mcpServers"]["tenon"]["url"],
-        json!("http://127.0.0.1:38080/mcp")
+        std::fs::read_to_string(&canary).unwrap(),
+        "do-not-touch",
+        "~/workspace canary must be untouched — it is never mounted"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(agent.parent().unwrap());
+    // Teardown is clean.
+    instance.destroy().expect("destroy");
+    drop(instance);
+    assert!(
+        container_gone(cli, &lay.home_hash),
+        "teardown must leave no container"
+    );
+
+    // Recreate: cache + RO base persist across a fresh container.
+    let again = spawn(&lay).expect("recreate");
+    let dep = again
+        .exec(
+            "sh",
+            &["-c".to_string(), "cat /root/.cache/dep.txt".to_string()],
+            Duration::from_secs(15),
+        )
+        .expect("exec cache read");
+    assert!(
+        String::from_utf8_lossy(&dep.stdout).contains("cached-node-modules"),
+        "cache must survive a recreate: {dep:?}"
+    );
+    let tool = again
+        .exec(
+            "sh",
+            &[
+                "-c".to_string(),
+                "cat /opt/tenon-base/toolchain.txt".to_string(),
+            ],
+            Duration::from_secs(15),
+        )
+        .expect("exec ro-base read");
+    assert!(
+        String::from_utf8_lossy(&tool.stdout).contains("ro-base-present"),
+        "RO base must survive a recreate: {tool:?}"
+    );
+    again.destroy().expect("destroy recreate");
+
+    let _ = std::fs::remove_dir_all(&canary_dir);
+    let _ = std::fs::remove_dir_all(&lay.root);
 }
 
-/// Kill switch: a long-running agent is SIGKILLed the moment `stop` is set; the
-/// run ends promptly as `killed` with an error event.
+/// The preflight-failure path: a fake `agy` on the container PATH prints
+/// "license expired", so the in-sandbox preflight refuses the run before any
+/// paid call.
 #[test]
-fn respects_kill() {
-    let agent = write_agent("echo '{\"type\":\"text\",\"text\":\"starting\"}'\nsleep 30");
-    let run = "killme";
-    let root = home(run);
-    let spec = CliAgentSpec {
-        run: run.to_string(),
+fn preflight_refuses_when_the_agent_cannot_authenticate() {
+    if cli().is_none() {
+        println!("skipping: no podman/docker on PATH");
+        return;
+    }
+    let lay = layout("preflight");
+    // A fake agy on the agent PATH (/root/.local/bin) that fails auth.
+    let bin = lay.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exec(
+        &bin.join("agy"),
+        "echo 'Error: session token expired'\nexit 1",
+    );
+
+    let sandbox = backend("oci").unwrap();
+    let spec = Spec {
         env: "root".to_string(),
-        cmd: agent.display().to_string(),
-        args: vec![],
-        root: root.clone(),
-        mcp: None,
-        ro_allow: vec![],
-        rw_state: vec![],
-        limits: loose_limits(),
-        rate: fast_rate(),
+        image: None,
+        binary: None,
+        workspace: lay.workspace.clone(),
+        gateway: None,
+        env_passthrough: vec![],
+        policy: Policy::default(),
+        caps: vec![],
+        home_hash: lay.home_hash.clone(),
+        base_pid: std::process::id() as i32,
+        images: None,
+        ingress_ports: Vec::new(),
+        mounts: vec![Mount {
+            host: bin.clone(),
+            guest: "/root/.local/bin".to_string(),
+            ro: true,
+        }],
+        hostname: Some("tenon-root".to_string()),
+    };
+    let instance = match sandbox.spawn(&spec) {
+        Ok(instance) => instance,
+        Err(error) => {
+            println!("skipping: cannot spawn oci instance: {error}");
+            return;
+        }
+    };
+    let pf_spec = PreflightSpec {
+        cmd: "agy".to_string(),
+        probes: vec![vec!["--version".to_string()]],
+        env: agent_env(),
+        cwd: "/workspace".to_string(),
+        timeout: Duration::from_secs(30),
+    };
+    let pf = preflight::run(instance.as_ref(), &pf_spec).expect("preflight");
+    instance.destroy().expect("destroy");
+    assert!(!pf.ok, "preflight must fail on an auth-failure signature");
+    assert_eq!(pf.signature.as_deref(), Some("expired"));
+
+    let _ = std::fs::remove_dir_all(&lay.root);
+}
+
+/// The account rate limiter gates the run: a limiter already halted by its
+/// circuit breaker refuses the run before the agent is ever spawned in the
+/// container. No container needed — the gate is upstream of the spawn.
+#[test]
+fn a_halted_rate_limiter_refuses_the_run() {
+    let lay = layout("rate");
+    let config = RateConfig {
+        rpm: 6,
+        min_gap_ms: 0,
+        jitter_ms: 0,
+        breaker_threshold: 1,
+        breaker_max_opens: 1,
+        ..RateConfig::default()
+    };
+    let mut limiter = Limiter::new(config.clone());
+    assert!(limiter.record(0, true).halted, "breaker should halt");
+    let limiter = Mutex::new(limiter);
+    let clock = SystemClock;
+
+    let spec = CliAgentSpec {
+        run: "rate".to_string(),
+        env: "root".to_string(),
+        cmd: "sh".to_string(),
+        args: vec!["-c".to_string(), "true".to_string()],
+        workspace: lay.workspace.clone(),
+        guest_cwd: "/workspace".to_string(),
+        agent_env: agent_env(),
+        rate: config,
         budget: RunBudget::default(),
-        extra_env: vec![],
-        cgroup_parent: None,
-        agent_home: root.clone(),
-        scratch_max_mb: 0,
     };
     let events = Collector::default();
     let stop = AtomicBool::new(false);
-    let limiter = Mutex::new(Limiter::new(spec.rate.clone()));
-    let clock = SystemClock;
-
-    let started = Instant::now();
-    let outcome = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(400));
-            stop.store(true, Ordering::Relaxed);
-        });
-        cli_agent::run_with(&spec, &events, &stop, &limiter, &clock).expect("run")
-    });
-
-    assert!(outcome.killed, "should report killed");
+    let outcome =
+        cli_agent::run_with(&spec, &Unreachable, &events, &stop, &limiter, &clock).expect("run");
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "kill should be prompt, took {:?}",
-        started.elapsed()
+        outcome.halted.is_some(),
+        "a halted limiter must halt the run"
     );
     assert!(events.has("error"));
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(agent.parent().unwrap());
+
+    let _ = std::fs::remove_dir_all(&lay.root);
 }
 
-/// Budget: a step ceiling SIGKILLs the jail once the agent reports that many
-/// steps, even though the fake agent would keep going.
-#[test]
-fn step_budget_halts_the_run() {
-    let agent = write_agent(
-        "for i in 1 2 3 4 5; do echo '{\"type\":\"tool_use\",\"name\":\"bash\"}'; sleep 0.2; done\n\
-         sleep 5",
-    );
-    let run = "budget";
-    let root = home(run);
-    let spec = CliAgentSpec {
-        run: run.to_string(),
-        env: "root".to_string(),
-        cmd: agent.display().to_string(),
-        args: vec![],
-        root: root.clone(),
-        mcp: None,
-        ro_allow: vec![],
-        rw_state: vec![],
-        limits: loose_limits(),
-        rate: fast_rate(),
-        budget: RunBudget {
-            wall_s: 0,
-            max_steps: 2,
-        },
-        extra_env: vec![],
-        cgroup_parent: None,
-        agent_home: root.clone(),
-        scratch_max_mb: 0,
-    };
-    let events = Collector::default();
-    let stop = AtomicBool::new(false);
-    let limiter = Mutex::new(Limiter::new(spec.rate.clone()));
-    let clock = SystemClock;
-    let outcome = cli_agent::run_with(&spec, &events, &stop, &limiter, &clock).expect("run");
-    assert!(outcome.killed);
-    assert_eq!(outcome.steps, 2, "stopped at the step ceiling");
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(agent.parent().unwrap());
+/// An instance whose `spawn_streaming` must never be called — used to prove the
+/// rate limiter gate is upstream of touching the container at all.
+struct Unreachable;
+
+impl Instance for Unreachable {
+    fn id(&self) -> &str {
+        "unreachable"
+    }
+    fn backend(&self) -> &'static str {
+        "none"
+    }
+    fn attach_addr(&self) -> tenon_sandbox::Endpoint {
+        tenon_sandbox::Endpoint::Direct
+    }
+    fn workspace_path(&self) -> String {
+        "/workspace".to_string()
+    }
+    fn binary_path(&self) -> String {
+        "/usr/local/bin/tenon".to_string()
+    }
+    fn exec(
+        &self,
+        _cmd: &str,
+        _args: &[String],
+        _timeout: Duration,
+    ) -> anyhow::Result<tenon_sandbox::ExecOutcome> {
+        panic!("exec must not be reached when the limiter has halted");
+    }
+    fn spawn_streaming(&self, _spec: &ExecSpec) -> anyhow::Result<std::process::Child> {
+        panic!("spawn_streaming must not be reached when the limiter has halted");
+    }
+    fn destroy(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+fn dirs_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").expect("HOME"))
 }

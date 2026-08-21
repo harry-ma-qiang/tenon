@@ -169,7 +169,7 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
     },
-    /// Run an affordable CLI agent (agy/claude) under the host jail (RFC P5.0)
+    /// Run an affordable CLI agent (agy/claude) inside the env sandbox (RFC P5.0-v2)
     #[command(name = "cli-agent")]
     CliAgent {
         #[command(subcommand)]
@@ -187,7 +187,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CliAgentCommand {
-    /// Preflight, then run one task under the jail with rate/budget/scratch caps
+    /// Preflight, then run one task inside the sandbox with rate/budget caps
     Run {
         /// What the agent should do
         task: String,
@@ -203,22 +203,12 @@ enum CliAgentCommand {
         /// Step/model-call hard stop (0 = none)
         #[arg(long = "max-calls", default_value_t = 0, value_name = "N")]
         max_calls: u64,
-        /// Override the scratch disk cap in MB (config default 512)
-        #[arg(long = "scratch-max-mb", value_name = "MB")]
-        scratch_max_mb: Option<u64>,
-        /// Grant the agent's own credential/state dir read-write (needed by agy
-        /// to refresh its auth token). Off by default; workspace/repo/ssh stay
-        /// unreachable regardless
-        #[arg(long = "writable-state")]
-        writable_state: bool,
     },
-    /// The zero-cost auth preflight on its own: is the model authenticated?
+    /// The zero-cost auth preflight on its own: is the model authenticated
+    /// inside the sandbox?
     Preflight {
         #[arg(long, default_value = "agy", value_name = "MODEL")]
         model: String,
-        /// Preflight with the agent's credential/state dir read-write
-        #[arg(long = "writable-state")]
-        writable_state: bool,
     },
     /// List every cli-agent run this home has scaffolded
     Status,
@@ -453,8 +443,6 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
                 rpm,
                 wall_s,
                 max_calls,
-                scratch_max_mb,
-                writable_state,
             } => {
                 tenon_base::cli_agent_cmd::run(
                     home,
@@ -464,16 +452,13 @@ async fn dispatch(home: Option<PathBuf>, command: Command) -> Result<i32> {
                         rpm,
                         wall_s,
                         max_calls,
-                        scratch_max_mb,
-                        writable_state,
                     },
                 )
                 .await
             }
-            CliAgentCommand::Preflight {
-                model,
-                writable_state,
-            } => tenon_base::cli_agent_cmd::preflight_cmd(home, model, writable_state).await,
+            CliAgentCommand::Preflight { model } => {
+                tenon_base::cli_agent_cmd::preflight_cmd(home, model).await
+            }
             CliAgentCommand::Status => tenon_base::cli_agent_cmd::status(home).await,
             CliAgentCommand::Stop { run } => tenon_base::cli_agent_cmd::stop(home, run).await,
         },
