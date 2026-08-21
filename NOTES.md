@@ -2309,3 +2309,76 @@ incl. 3 doctor); integration green individually — `guardian_gate`, `ingress_ga
 the documented pre-existing adversarial timing flake (2 crash tests) only while a second agent's
 release build saturated the CPU; clean in isolation. The P4.6 fixture race did not recur. `podman ps
 -a --filter label=tenon.home` shows only the live demo base `tenon.base:647207`.
+
+## P5.0a/b result — host jail + cli-agent runtime + account rate limiter (2026-08-21)
+
+The first user of the runtime contract that runs an affordable CLI agent (`agy`/`claude -p`) on this
+host safely. Three new modules in `rs/base/src/`, ~640 LoC, reusing the P3.1 Landlock backend and the
+worker's parentless-snapshot shape. No architecture change.
+
+### The safety floor (the point)
+
+`jail.rs` (~300 LoC incl. cgroup) forks the agent behind Landlock + rlimits + best-effort cgroup, all
+unprivileged, applied in the child's `pre_exec` before `execve`. Landlock RW is scratch + per-run tmp +
+named `/dev/*` files only; RO is a minimal system set + a parameterised credential allowlist;
+`~/workspace`, the tenon repo, `deepseek.env.sh` and `~/.ssh` are never granted. `Jail::kill()` SIGKILLs
+the whole process group (and `cgroup.kill`). Egress is unrestricted in v1 (documented).
+
+**The rogue-rm gate passed.** `base/tests/jail_gate.rs::rogue_rm_cannot_touch_the_workspace_canary`
+plants a canary in the real `~/workspace`, then runs a stand-in agent whose body is
+`rm -rf "$HOME"; touch "$HOME/pwned"; rm -f <canary>; echo PWNED > <canary>` under the jail. The canary
+survives byte-for-byte (`SAFE`) — Landlock denied both the unlink and the overwrite — while the rogue
+`rm` reached only scratch. The test asserts the denial and never actually destroys anything real.
+`scratch_is_writable` proves the deny is real (scratch write succeeds). `rlimit_nproc_caps_a_fork_bomb`
+sets `RLIMIT_NPROC` just above the live per-uid count and a 400-fork burst leaves only a bounded handful
+alive (counted by pgroup). `rlimit_as_caps_memory` caps an awk memory hog to a non-zero exit instead of
+eating the box. All 5 jail_gate tests green.
+
+**Landlock ABI:** kernel 6.17 has Landlock in the LSM; `confine` requests ABI v2 at
+`CompatLevel::BestEffort`, so it applies what the kernel supports and never fails `execve` on a missing
+feature. `sandbox` conformance (incl. landlock) still 3/3.
+
+**cgroup on this host degrades to rlimit-only.** The delegated `user@<uid>.service` subtree is writable
+and a subdir can be created with `memory.max`/`pids.max`, but a session-scoped process cannot be
+migrated into it (cgroup-v2 delegation-containment denies the cross-scope move). `Cgroup::add` logs the
+degrade and the run proceeds on rlimits (`RLIMIT_AS` stands in for `memory.max`). cgroup enforcement
+works when base itself runs under the delegated user manager — documented, tested via
+`cgroup_degrades_without_delegation`.
+
+### The adapter and the limiter
+
+`cli_agent.rs` (~330 LoC) scaffolds scratch, writes the MCP config, git-snaps each step, spawns the
+agent through the jail, streams stdout into `cli-agent/<run>/*` bus events, and enforces the rate
+limiter + run budget (wall/steps) — killing the jail on breach or kill switch. Never runs agent code in
+base. **MCP wiring:** it writes a standard `mcpServers` `.mcp.json` pointing the agent at Tenon over
+loopback HTTP (serve `/mcp`, bearer token) plus a `mcp-register.sh` with the exact
+`agy mcp add --header "Authorization: Bearer <token>" tenon <url>` (confirmed against `agy mcp add`'s
+`[flags] <name> <commandOrUrl>` signature). `cli_agent_gate.rs` (3 tests) drives a **fake** agent
+script (no real model): asserts started/tool-call/output/done events, per-step + final git-snaps, the
+written `.mcp.json`, prompt SIGKILL on `stop`, and a step-budget halt. All green.
+
+`ratelimit.rs` (~260 LoC incl. tests) is a token bucket with a hard per-minute counter as the
+authority (`rpm` default 6), `rpd`, min-gap + deterministic jitter, `concurrency=1`, and a circuit
+breaker (N consecutive 429s open + exponential backoff, M opens emit a violation and halt). Pure,
+clock-injected; 6 unit tests incl. the soak test (≤ rpm over a simulated 100-call minute) all green.
+
+### Gates
+
+`cargo build --release` (feature off + `--features http`), `clippy --all-targets --all-features
+-D warnings`, `fmt --check` all clean. New tests: ratelimit 6/6, jail_gate 5/5, cli_agent_gate 3/3.
+P4 unchanged: sandbox 3/3, base lib 30/30, `contract_gate` + `mcp_gate` green. My tests use the jail
+directly (no sandbox spawn) so no containers were created; `podman ps -a --filter label=tenon.home`
+shows no leaked containers and the live demos were untouched. No real `agy`/`claude` was invoked — the
+first real run is a human-triggered step.
+
+### Open questions resolved / remaining
+
+- OQ1 (agy MCP + native-tool control): **resolved** — `agy mcp add` registers an http MCP server;
+  Tenon-as-MCP over loopback is the tool source. Disabling agy's native tools for the real run is the
+  human step (`--sandbox` / config); the jail is the floor regardless.
+- OQ2 (bwrap vs landlock): **resolved** — unprivileged Landlock + rlimit (+ best-effort cgroup), no
+  bwrap, as the prereq check called.
+- OQ3 (egress): **resolved for v1** — documented-unrestricted.
+- **Remaining before the first real agy run:** cgroup enforcement needs base under the delegated user
+  manager (else rlimit-only, which is sufficient for the fork-bomb/OOM floor); and `RLIMIT_NPROC` must
+  be set relative to the host's current per-uid process count, not an absolute, since it is per-uid.
