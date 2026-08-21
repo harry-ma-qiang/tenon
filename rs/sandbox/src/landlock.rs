@@ -60,6 +60,23 @@ impl Sandbox for Landlock {
     }
 }
 
+/// A parameterised Landlock restriction for a single forked child, reused by
+/// base's host jail (P5.0a): read-write only the paths in `rw`, read-only the
+/// paths in `ro`, and nothing else the kernel can name. Compatibility is best
+/// effort so a kernel that supports only an older ABI keeps whatever it can
+/// rather than refusing outright; caller-supplied paths must exist (a
+/// non-existent path is a `RulesetError`), so the caller filters first.
+pub fn confine(rw: &[PathBuf], ro: &[PathBuf]) -> Result<RestrictionStatus, RulesetError> {
+    let abi = ABI::V2;
+    Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_all(abi))?
+        .create()?
+        .add_rules(path_beneath_rules(ro, AccessFs::from_read(abi)))?
+        .add_rules(path_beneath_rules(rw, AccessFs::from_all(abi)))?
+        .restrict_self()
+}
+
 fn restrict(
     workspace: &Path,
     gateway_dir: Option<&Path>,

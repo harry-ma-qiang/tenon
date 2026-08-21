@@ -6,6 +6,24 @@ mod proc;
 
 pub use none::NoSandbox;
 
+/// Apply a parameterised Landlock restriction to the current process: read-write
+/// the `rw` paths, read-only the `ro` paths, deny everything else. Called from a
+/// forked child's `pre_exec` by base's host jail (P5.0a). A non-existent path is
+/// an error, so the caller filters to existing paths first. `Err` on a kernel
+/// without Landlock, which the jail turns into a logged degrade.
+pub fn landlock_confine(rw: &[PathBuf], ro: &[PathBuf]) -> Result<(), String> {
+    landlock::confine(rw, ro)
+        .map(|_status| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Whether Landlock is usable on the running kernel (ABI v1 or better). The jail
+/// probes this before spawning so it can log a clear degrade warning instead of
+/// failing the child's `execve`.
+pub fn landlock_available() -> bool {
+    landlock::probe().is_ok()
+}
+
 use anyhow::{bail, Result};
 use serde::Serialize;
 use std::path::PathBuf;
