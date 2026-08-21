@@ -39,11 +39,23 @@ pub struct CliAgentSpec {
     pub root: PathBuf,
     pub mcp: Option<McpEndpoint>,
     pub ro_allow: Vec<PathBuf>,
+    /// Read-write credential/state dirs (the `--writable-state` opt-in). Empty by
+    /// default; when set, the agent's own state dir is writable so it can refresh
+    /// its auth token. Never the user's workspace, repo, secrets or `~/.ssh`.
+    pub rw_state: Vec<PathBuf>,
     pub limits: Limits,
     pub rate: RateConfig,
     pub budget: RunBudget,
     pub extra_env: Vec<(String, String)>,
     pub cgroup_parent: Option<PathBuf>,
+    /// The `HOME` the agent sees. For `agy`/`claude` this is the real user home
+    /// so the agent finds its own credential dir (`ro_allow` grants it read-only);
+    /// tests point it at scratch. Never `~/workspace` — that stays unreachable.
+    pub agent_home: PathBuf,
+    /// The scratch disk ceiling in MB, enforced by a background watcher that
+    /// SIGKILLs the jail if the scratch tree grows past it (so an overnight agent
+    /// cannot fill the host disk). `0` disables the watcher.
+    pub scratch_max_mb: u64,
 }
 
 impl CliAgentSpec {
@@ -155,8 +167,9 @@ pub fn run_with(
         cwd: scratch.clone(),
         scratch: scratch.clone(),
         tmp: tmp.clone(),
+        rw_allow: spec.rw_state.clone(),
         ro_allow: spec.ro_allow.clone(),
-        env: child_env(spec, &scratch, &tmp),
+        env: child_env(spec, &tmp),
         limits: spec.limits.clone(),
         cgroup_parent: spec.cgroup_parent.clone(),
     };
@@ -201,11 +214,31 @@ fn pump(
     drop(tx);
     let draining = stderr.map(|err| std::thread::spawn(move || drain(err)));
 
+    let over_quota = Arc::new(AtomicBool::new(false));
+    let watcher_done = Arc::new(AtomicBool::new(false));
+    let watcher = spawn_disk_watcher(
+        scratch,
+        spec.scratch_max_mb,
+        over_quota.clone(),
+        watcher_done.clone(),
+    );
+
     let started = Instant::now();
     let mut steps = 0u64;
     let mut killed = false;
     let mut halted: Option<String> = None;
     loop {
+        if over_quota.load(Ordering::Relaxed) {
+            let reason = format!("scratch disk cap exceeded ({} MB)", spec.scratch_max_mb);
+            events.emit(
+                "violation",
+                json!({"run": spec.run, "reason": reason.clone()}),
+            );
+            halted = Some(reason);
+            jail.kill();
+            killed = true;
+            break;
+        }
         match rx.recv_timeout(POLL) {
             Ok(line) => {
                 handle_line(
@@ -244,6 +277,10 @@ fn pump(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+    watcher_done.store(true, Ordering::Relaxed);
+    if let Some(watcher) = watcher {
+        let _ = watcher.join();
     }
     if let Some(reader) = reader {
         let _ = reader.join();
@@ -378,9 +415,9 @@ fn wait_for_slot(limiter: &Mutex<Limiter>, clock: &dyn Clock, stop: &AtomicBool)
     }
 }
 
-fn child_env(spec: &CliAgentSpec, scratch: &Path, tmp: &Path) -> Vec<(String, String)> {
+fn child_env(spec: &CliAgentSpec, tmp: &Path) -> Vec<(String, String)> {
     let mut env = vec![
-        ("HOME".to_string(), scratch.display().to_string()),
+        ("HOME".to_string(), spec.agent_home.display().to_string()),
         ("TMPDIR".to_string(), tmp.display().to_string()),
         (
             "PATH".to_string(),
@@ -433,6 +470,50 @@ fn write_mcp_config(scratch: &Path, spec: &CliAgentSpec) -> anyhow::Result<()> {
     );
     std::fs::write(scratch.join("mcp-register.sh"), register)?;
     Ok(())
+}
+
+/// A best-effort scratch disk guard: poll the scratch tree's size and, the first
+/// time it crosses the cap, raise `over_quota` so the pump SIGKILLs the jail. It
+/// is a floor for the unprivileged case where a size-limited tmpfs is not
+/// mountable — the agent cannot fill the host disk overnight either way.
+fn spawn_disk_watcher(
+    scratch: &Path,
+    max_mb: u64,
+    over_quota: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    if max_mb == 0 {
+        return None;
+    }
+    let scratch = scratch.to_path_buf();
+    let max_bytes = max_mb.saturating_mul(1024 * 1024);
+    Some(std::thread::spawn(move || {
+        while !done.load(Ordering::Relaxed) {
+            if dir_size(&scratch) > max_bytes {
+                over_quota.store(true, Ordering::Relaxed);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }))
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            total += dir_size(&entry.path());
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 fn pipe_lines(reader: impl std::io::Read, tx: mpsc::Sender<String>) {

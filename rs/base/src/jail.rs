@@ -44,6 +44,11 @@ pub struct JailSpec {
     pub cwd: PathBuf,
     pub scratch: PathBuf,
     pub tmp: PathBuf,
+    /// Extra read-write trees beyond scratch/tmp. Empty by default; the cli-agent
+    /// opt-in `--writable-state` uses it to grant the agent's OWN credential/state
+    /// dir (e.g. `~/.gemini/antigravity-cli`) read-write, which some agents need
+    /// to refresh their auth token. Never `~/workspace`, the repo, or `~/.ssh`.
+    pub rw_allow: Vec<PathBuf>,
     pub ro_allow: Vec<PathBuf>,
     pub env: Vec<(String, String)>,
     pub limits: Limits,
@@ -187,6 +192,7 @@ pub fn spawn(spec: &JailSpec) -> Result<Jail> {
 
 fn writable_paths(spec: &JailSpec) -> Vec<PathBuf> {
     let mut rw = vec![spec.scratch.clone(), spec.tmp.clone()];
+    rw.extend(spec.rw_allow.iter().cloned());
     rw.extend(RW_DEVICES.iter().map(PathBuf::from));
     rw.retain(|path| path.exists());
     rw
