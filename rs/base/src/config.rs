@@ -137,35 +137,7 @@ pub struct Benchmark {
     pub cost_tolerance: f64,
 }
 
-/// RFC P5.0 cli-agent runtime knobs (P5.0c). `scratch_max_mb` is the scratch
-/// disk ceiling the run's background watcher enforces (tmpfs is not mountable
-/// unprivileged here, so the watcher is the floor). `nproc_headroom` is how many
-/// processes above the current per-uid count the jail's per-uid `RLIMIT_NPROC`
-/// allows — a ceiling relative to live load, never an absolute.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CliAgent {
-    #[serde(default = "scratch_max_mb")]
-    pub scratch_max_mb: u64,
-    #[serde(default = "nproc_headroom")]
-    pub nproc_headroom: u64,
-}
-
-fn scratch_max_mb() -> u64 {
-    512
-}
-
-fn nproc_headroom() -> u64 {
-    256
-}
-
-impl Default for CliAgent {
-    fn default() -> Self {
-        Self {
-            scratch_max_mb: scratch_max_mb(),
-            nproc_headroom: nproc_headroom(),
-        }
-    }
-}
+pub use crate::cli_agent_config::{CliAgent, MountCfg};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Envs {

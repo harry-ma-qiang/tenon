@@ -169,6 +169,35 @@ impl Home {
         self.root.join("images")
     }
 
+    /// The persistent cred/session volume for the sandbox-native cli-agent (RFC
+    /// P5.0-v2 §10.1): bind-mounted read-write into the container at the path the
+    /// agent expects, so the human logs in ONCE and every run reuses it. The
+    /// host's real `~/.gemini` is never mounted.
+    pub fn agy_session_dir(&self) -> PathBuf {
+        self.root.join("agy-session")
+    }
+
+    /// The per-env persistent cache volume (npm/pip/venv/node_modules), reused
+    /// across container recreates when the version manifest still matches.
+    pub fn cli_cache_dir(&self, env: &str) -> PathBuf {
+        self.root.join("cache").join(env)
+    }
+
+    pub fn cli_cache_manifest(&self, env: &str) -> PathBuf {
+        self.cli_cache_dir(env).join("manifest.json")
+    }
+
+    /// The env's fixed machine-id, generated once and reused so the agent does
+    /// not see a new machine each run (RFC P5.0-v2 §10.1, §10.5). 32 lowercase
+    /// hex digits, mounted at `/etc/machine-id` in the container.
+    pub fn cli_machine_id_file(&self, env: &str) -> PathBuf {
+        self.root.join("cli").join(format!("machine-id-{env}"))
+    }
+
+    pub fn cli_run_dir(&self, run: &str) -> PathBuf {
+        self.root.join("cli").join(run)
+    }
+
     pub fn sock(&self) -> PathBuf {
         self.run().join("base.sock")
     }
