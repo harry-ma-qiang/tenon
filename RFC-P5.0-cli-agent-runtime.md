@@ -180,3 +180,73 @@ open questions above:
 - **Safety confirmed.** On every trial the `~/workspace` canary was byte-for-byte unchanged, nothing
   escaped scratch, and the run tore down cleanly — the kernel-level floor held regardless of the agent's
   auth/tool state.
+
+## 10. v2 — sandbox-native design (supersedes the host-jail approach in §3, §6, §7)
+
+The host-jail trial (2026-08-21) proved the safety floor works but exposed the real problem: agy's
+native tools DEGRADE under a host Landlock jail ("empty component: terminal_sandbox") and agy is not
+under our control, so forcing it through MCP is fragile. Decision: stop treating agy as "brain on
+host, hands forwarded". Instead run agy INSIDE the env's OCI sandbox, exactly where the worker and
+DeepSeek's tools already run — everything converges to one model: all agents run in the sandbox.
+
+Correction to earlier notes: this host HAS containers (podman/docker work; the oci backend uses them);
+it only lacks KVM (microVM/krun). No new VM is built — reuse the existing oci sandbox + bind mounts.
+
+### 10.1 Mount model (RO base + RW overlay + persistent cache)
+
+- creds/session: a persistent host dir/volume `~/.tenon/agy-session/` bind-mounted RW; the human logs
+  in ONCE inside the sandbox (or drops the session file there); reused every run. The host's real
+  `~/.gemini` is NOT mounted. `/etc/machine-id` mounted from a fixed per-sandbox value so agy does not
+  see "a new machine" each run.
+- workspace: a per-env RW dir the agent edits; the worker snapshots it (git-snap). agy uses its OWN
+  native tools normally (a real container fs) — no MCP forcing, no tool forwarding; Tenon captures
+  changes by snapshotting the workspace (on filesystem change via inotify, or a timer). Snapshot
+  granularity is coarser than per-tool-call; the safety boundary is the container, so this is fine.
+- read-only base: big prebuilt things (DSH installed on the host, toolchains) mount RO into the
+  sandbox. The agent experiments freely; a break costs only a container recreate — RO base is intact.
+- persistent cache: a host dir `~/.tenon/cache/<env>/` bind-mounted RW for node_modules/venv/pip/npm
+  caches, with a small version manifest (what + version). On reload, reuse if versions match, else
+  rebuild. Fixes the tmpfs 500 MB limit for ALL agents, not just agy. Benefits agy, DSH, big deps.
+
+### 10.2 What this deletes vs adds
+
+Delete: `rs/base/src/jail.rs` (host Landlock jail) and the host-jail path in cli_agent.rs; the
+MCP-forcing complexity for agy. Reuse: oci sandbox + bind mounts + worker + snapshots (all built,
+tested). Add: mount config (RO/RW/cache), the cred/session volume + one-time-login flow, a cache
+version manifest, configurable sandbox machine identity. Net LoC ~flat or negative; conceptually one
+layer instead of three (container boundary = safety; worker snapshot = rollback; no forwarding).
+
+### 10.3 Isolation posture
+
+Same boundary DSH/DeepSeek tools already use: the rootless-podman container. agy inside can touch only
+its RW mounts (session volume, workspace, cache); the rest of the host is not mounted and is
+unreachable. Restart is cheap (drop the container + workspace overlay; RO base + cache survive).
+Residual risk = container escape, identical to the existing sandbox story, accepted and consistent.
+
+### 10.4 Open risk to test first
+
+agy's ToS / anti-automation may detect a container and refuse. MUST run a preflight INSIDE the
+container (one zero-cost agy command) before any paid run; if agy hard-refuses in a container, report
+and stop — do not work around it.
+
+### 10.5 Configurable machine identity + mobile direction (roadmap only, ethics-bounded)
+
+Make the sandbox's machine identity (machine-id, hostname, and later more env identity) a config
+value. Direction (NOT built now, roadmap note): if the sandbox can host Android/iOS emulators, Tenon
+gains mobile-app fullstack dev/test ability. ETHICS GUARDRAIL (hard rule): configurable identity and
+emulators are for running the agent's OWN apps and legitimate cross-platform dev/testing ONLY — never
+for bypassing the security controls of third-party services or any illegal use. No anti-detection /
+jailbreak tooling is built. This guardrail is part of the barebone's hard rules.
+
+### 10.6 Revised kickstart
+
+- P5.0-v2a: refactor cli-agent to run the agent INSIDE the oci sandbox with the mount model; delete
+  the host jail; add the cred/session volume + machine-id config; workspace snapshot on change/timer.
+  Gate: with a fake agent, edits land in the sandbox workspace and are snapshotted; a canary in
+  ~/workspace is unreachable (not mounted); container recreate is cheap.
+- P5.0-v2b: cache mount + version manifest (node_modules/venv persistence); RO-base mount (DSH as the
+  worked example). Gate: install a dep once, recreate the container, dep is reused from cache.
+- Human step (once): log in to agy inside the session volume; then a container preflight confirms agy
+  authenticates and can create a file in the sandbox workspace.
+- Then the overnight benchmark run with monitors (mechanical always-on: container boundary + budget +
+  kill + rate limiter; judgment: Opus ~10 min, Fable ~1 h).
