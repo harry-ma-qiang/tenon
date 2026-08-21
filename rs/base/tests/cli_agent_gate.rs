@@ -110,11 +110,14 @@ fn fake_agent_produces_events_snapshots_and_mcp_config() {
             token: "test-token".to_string(),
         }),
         ro_allow: vec![],
+        rw_state: vec![],
         limits: loose_limits(),
         rate: fast_rate(),
         budget: RunBudget::default(),
         extra_env: vec![],
         cgroup_parent: None,
+        agent_home: root.clone(),
+        scratch_max_mb: 0,
     };
     let events = Collector::default();
     let stop = AtomicBool::new(false);
@@ -160,11 +163,14 @@ fn respects_kill() {
         root: root.clone(),
         mcp: None,
         ro_allow: vec![],
+        rw_state: vec![],
         limits: loose_limits(),
         rate: fast_rate(),
         budget: RunBudget::default(),
         extra_env: vec![],
         cgroup_parent: None,
+        agent_home: root.clone(),
+        scratch_max_mb: 0,
     };
     let events = Collector::default();
     let stop = AtomicBool::new(false);
@@ -209,6 +215,7 @@ fn step_budget_halts_the_run() {
         root: root.clone(),
         mcp: None,
         ro_allow: vec![],
+        rw_state: vec![],
         limits: loose_limits(),
         rate: fast_rate(),
         budget: RunBudget {
@@ -217,6 +224,8 @@ fn step_budget_halts_the_run() {
         },
         extra_env: vec![],
         cgroup_parent: None,
+        agent_home: root.clone(),
+        scratch_max_mb: 0,
     };
     let events = Collector::default();
     let stop = AtomicBool::new(false);
