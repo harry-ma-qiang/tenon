@@ -133,6 +133,17 @@ builds and publishes the single binary for linux-x86_64, linux-aarch64 and macos
 
 Coding rules for agents and humans: `AGENTS.md`.
 
+## AI self-evolution
+
+Tenon is small on purpose: a kernel a machine can read, understand, and improve.
+To test that, an off-the-shelf CLI coding agent was let loose — sandboxed,
+throttled, and fully audited — to read the kernel from source and propose
+improvements without ever touching the real tree. Reading only the source, it
+found a real, unpatched denial-of-service in the kernel (atom-table exhaustion
+via wire-supplied strings) and a genuine spec-versus-implementation drift in the
+message bus; both were verified by hand. The full write-up, method, verdict, and
+reproducibility notes: [`docs/ai-self-evolution.md`](docs/ai-self-evolution.md).
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Tenon is a functional port of the Cordis kernel concepts; no
