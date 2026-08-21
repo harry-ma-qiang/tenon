@@ -114,12 +114,30 @@ Total < 1k new Rust, no new architecture, no kernel change.
 
 1. Does `agy` support MCP + disabling native tools? If not, the `$PATH` shim (Layer B fallback) is
    required — verify before P5.0a.
+   **RESOLVED (P5.0a, 2026-08-21).** `agy mcp add [flags] <name> <commandOrUrl>` registers an MCP
+   server (stdio or http). The adapter writes a standard `mcpServers` `.mcp.json` and an
+   `agy mcp add --header "Authorization: Bearer <token>" tenon <url>` register script, pointing agy at
+   Tenon-as-MCP over loopback HTTP (serve `/mcp`). Disabling agy's native tools for the real run is the
+   human step (`--sandbox` / config); the host jail is the safety floor regardless of tool config, so
+   the `$PATH` shim fallback is not needed for the floor.
 2. bwrap vs landlock+seccomp on this host (bwrap may need setuid; landlock is unprivileged) — pick the
    unprivileged path.
+   **RESOLVED (P5.0a).** Unprivileged Landlock (ABI v2, `CompatLevel::BestEffort`, kernel 6.17 LSM) +
+   `setrlimit` + best-effort cgroup v2. No bwrap. The rogue-`rm -rf ~` gate passes: a canary in
+   `~/workspace` survives while scratch is the only writable tree. Seccomp was not added — Landlock +
+   rlimit + cgroup is the v1 floor; a seccomp syscall filter is a later tightening.
 3. Egress allowlist in v1 (proxy) or documented-unrestricted — lean documented-unrestricted first,
    tighten later.
+   **RESOLVED for v1 (P5.0a): documented-unrestricted.** The agent needs its model endpoint and Tenon's
+   MCP over loopback; the filesystem+rlimit floor is what protects the host. An allowlist proxy is a
+   later tightening.
 4. Which cheap model backs the "fleet copy" for the same benchmark (deepseek off-peak vs cerebras
    free) — decide per run.
+5. **NEW (P5.0a): cgroup delegation.** cgroup v2 enforcement (`memory.max`/`pids.max`) requires base to
+   run under the delegated `user@<uid>.service` manager; a process started from an interactive session
+   scope cannot migrate into the delegated subtree (delegation-containment rule), so the adapter
+   degrades to rlimit-only there (`RLIMIT_AS` stands in for `memory.max`). `RLIMIT_NPROC` must be set
+   relative to the host's current per-uid process count, since it is per-uid, not per-tree.
 
 ## 9. Prereq check (2026-08-21, this host)
 

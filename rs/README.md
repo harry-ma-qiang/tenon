@@ -1402,6 +1402,102 @@ plain single request/response POST — no SSE server-push — which is enough fo
 the env's whole tools-bus catalog rather than a hand-picked subset; the tools bus still gates every
 call, so nothing escapes the boundary by being listed.
 
+## The cli-agent runtime: host jail, rate limiter, MCP wiring (P5.0a/b)
+
+RFC P5.0's first real user of the runtime contract: a `cli-agent` runtime kind that runs an affordable
+CLI agent (`agy`/`claude -p`) on the host to explore and build, WITHOUT reaching the user's real files
+and WITHOUT hammering the model account. The brain is the CLI agent; the hands and guardrails are
+Tenon's. Three parts, all in `base/src/`: `jail.rs`, `cli_agent.rs`, `ratelimit.rs`.
+
+**The host jail (`base/src/jail.rs`, RFC section 3 layer A).** `jail::spawn(JailSpec)` forks the agent
+process behind three unprivileged confinements, applied in the child's `pre_exec` before `execve`:
+
+- **Landlock** (reusing the P3.1 backend via `tenon_sandbox::landlock_confine(rw, ro)`): read-write
+  only the caller's scratch dir, the per-run tmp, and a named short-list of device files
+  (`/dev/null`, `/dev/urandom`, …, one file at a time — never all of `/dev`); read-only a minimal
+  system set (`/usr /lib /lib64 /bin /sbin /proc /etc/ssl /etc/resolv.conf` and the named TLS/resolver
+  files — **not** all of `/etc`) plus a parameterised credential allowlist (`ro_allow`: the agent's own
+  `~/.config`, `~/.agy`, `~/.claude`, default conservative). **`~/workspace`, the tenon repo,
+  `deepseek.env.sh` and `~/.ssh` are never granted**, so a rogue `rm -rf ~` reaches only scratch.
+- **rlimits** (`setrlimit`): `RLIMIT_NPROC`, `RLIMIT_AS` (address space — the unprivileged memory cap),
+  `RLIMIT_CPU`, `RLIMIT_NOFILE`, all absolute from `Limits`; `0` leaves one alone.
+- **cgroup v2** (`memory.max`, `pids.max`) under a delegated subtree when one is writable, else
+  rlimit-only with a logged degrade — see "Deviations".
+
+`spawn` also `setpgid`s the child into its own process group; the returned `Jail::kill()` SIGKILLs the
+whole group (and writes `cgroup.kill` when a cgroup took), so a fork-bomb that reparents still dies.
+**Network egress is unrestricted in v1** (documented, RFC open question 3): the agent needs its model
+endpoint, and the filesystem+rlimit floor is what keeps the host safe regardless of the network.
+
+**Landlock ABI on this host.** Kernel 6.17 has Landlock in the LSM; `confine` requests ABI v2 at
+`CompatLevel::BestEffort`, so it uses what the kernel offers and never fails `execve` for a missing
+newer feature. The gate test asserts `jail.landlocked` before trusting the confinement, and refuses to
+run its destructive body at all when Landlock is absent.
+
+**The cli-agent adapter (`base/src/cli_agent.rs`, RFC section 6).** `cli_agent::run(spec, events, stop)`
+takes a `{run, env, cmd, args, root, mcp, ro_allow, limits, rate, budget}` spec and: (a) creates the
+scratch under `<home>/cli/<run>/scratch` and a per-run tmp; (b) writes the MCP config (below);
+(c) git-snapshots the scratch (a sibling `snap.git`, parentless commits like the worker, so every step
+is reversible); (d) acquires an account slot from the rate limiter, then spawns the agent through the
+jail with `cwd=scratch` and an env carrying only `HOME=scratch`, `TMPDIR`, a minimal `PATH`, and
+`TENON_*`/`TENON_MCP_*`; (e) streams the agent's stdout, parsing JSON lines into bus events on
+`cli-agent/<run>/*` (`started`, `step`, `tool-call`, `output`, `done`, `error`, `violation`), snapping
+per step; (f) enforces the run budget (wall/steps) and the rate limiter/breaker — on a breach, the
+kill switch (`stop`), or a halting breaker, it SIGKILLs the jail. **It never runs agent code in base**:
+the agent is the jailed child; base only scaffolds, streams and enforces.
+
+**Registering Tenon as the agent's MCP server (RFC section 3 layer B).** The adapter writes a standard
+`mcpServers` config into the scratch cwd as `.mcp.json`, pointing the agent at Tenon-as-MCP over
+loopback HTTP (the serve `/mcp` endpoint, bearer-authorized) — HTTP because the jail deliberately does
+not grant the front-door unix socket under `~/.tenon/run`:
+
+```json
+{ "mcpServers": { "tenon": { "type": "http",
+    "url": "http://127.0.0.1:<serve-port>/mcp",
+    "headers": { "Authorization": "Bearer <runtime-token>" } } } }
+```
+
+The exact command to register the same server by hand (written beside it as `mcp-register.sh`, for the
+human-triggered run) is, per `agy mcp add [flags] <name> <commandOrUrl>`:
+
+```
+agy mcp add --header "Authorization: Bearer <token>" tenon http://127.0.0.1:<port>/mcp
+```
+
+With Tenon its only tool source, the agent's edits and commands go through Tenon's sandboxed
+bash/fs/edit/snapshot (every step git-snapped, reversible), not its native host tools.
+
+**The account rate limiter + circuit breaker (`base/src/ratelimit.rs`, RFC section 4).** A token bucket
+with a hard per-minute counter as the authority (`rpm`, default 6), a daily cap (`rpd`), a minimum gap
+plus deterministic jitter between grants (`min_gap_ms`+`jitter_ms`), and `concurrency=1` per account —
+one account is never fanned out. A circuit breaker consumes the 429/403 failures the adapter reports:
+`breaker_threshold` (default 3) in a row opens it and backs off exponentially (`backoff_base_ms` →
+`backoff_max_ms`); `breaker_max_opens` (default 5) opens over the run emit a `violation` and halt the
+env. Pure and clock-injected (`trait Clock`), so the soak test drives 100 calls through a simulated
+minute without sleeping and asserts the grant count never exceeds `rpm`.
+
+**Launching a run (the human triggers the real one).** The real `agy`/`claude` invocation spends the
+user's subscription, so it is a deliberate human step, not something a test or a boot does. The shape
+is `cli_agent::run(&spec, &HubEvents{..}, &stop)` with `spec.cmd = "agy"`, `spec.args = ["-p", task]`,
+`spec.mcp = Some(serve /mcp url + runtime token)`, conservative `rate`/`budget`, and `ro_allow` naming
+only the agent's own credential dirs. Set `nproc` relative to the host's current per-uid process count
+(`RLIMIT_NPROC` is per-uid, not per-tree).
+
+**Deviations / limitations.** (1) **cgroup on this host degrades to rlimit-only.** The delegated
+`user@<uid>.service` subtree is writable, but a process started from an interactive session scope
+cannot be migrated into it (the cgroup-v2 delegation-containment rule denies the cross-scope move);
+`Cgroup::add` logs a warning and the run proceeds on rlimits, which are the effective ceiling here.
+`RLIMIT_AS` stands in for `memory.max`. cgroup enforcement works when base itself runs under the
+delegated user manager. (2) **v1 leaves egress unrestricted** (RFC open question 3, lean
+documented-unrestricted). (3) The adapter gates model calls at the granularity of run-start and
+parsed steps, not each individual model call — the agent manages its own context/calls internally, so
+finer per-call pacing would require routing the agent's model traffic through Tenon (future). (4)
+Full base-actor supervision of a `cli-agent` node (so `tenon status`/`tree` list it and base restarts
+it) is scaffolded via `CliAgentSpec::manifest()` (a runtime-contract manifest the run can register
+under) but the actor-side node kind is deferred; P5.0a/b ships the jail, the adapter and the limiter as
+the safety and rate floor, driven directly and covered by `base/tests/jail_gate.rs` and
+`base/tests/cli_agent_gate.rs`.
+
 ## Commands
 
 | Command | What |
