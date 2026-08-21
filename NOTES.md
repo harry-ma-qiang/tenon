@@ -2441,3 +2441,59 @@ cap**; run base under `user@<uid>.service` for a real `memory.max`. (2) tool rou
 actually DO work reversibly, bring base up so Tenon-as-MCP is the tool source (agy's native file tool is
 degraded under the jail); the run already registers it when base is reachable. `--writable-state` is
 required for agy to authenticate. Not started here — that is the human's step.
+
+## P5.0-v2 result — sandbox-native cli-agent, host jail deleted (2026-08-21)
+
+RFC P5.0-v2 (§10) supersedes the host-jail approach. The 2026-08-21 host-jail trial proved the floor
+held but exposed the real problem: agy's native tools DEGRADE under a host Landlock jail ("empty
+component: terminal_sandbox") and agy is not under our control, so forcing it through MCP is fragile.
+Decision applied: run the CLI agent INSIDE the env's OCI sandbox — the same rootless-podman container
+the worker and DeepSeek tools already use. One layer (container boundary = safety; workspace snapshot =
+rollback) instead of three; no host jail, no MCP forcing, no tool forwarding.
+
+Deleted: `rs/base/src/jail.rs` (host Landlock+rlimit+cgroup jail) and `rs/base/src/mcp_loopback.rs`
+(Tenon-as-MCP loopback), plus `tests/jail_gate.rs` and `tests/cli_agent_run.rs`. Reused unchanged: the
+oci sandbox + bind mounts + worker + snapshots, and `ratelimit.rs` (the account limiter/breaker).
+Added: a `mounts: Vec<Mount>` + `hostname` on `tenon_sandbox::Spec`, an `Instance::spawn_streaming`
+(oci `podman exec` with piped stdout), and the mount-model orchestration. Net LoC roughly flat-to-
+negative: `cli_agent.rs` 579->440, `cli_agent_cmd.rs` 556->~430, `preflight.rs` 136->~160, minus jail
+(283) and mcp_loopback (135) deleted; sandbox +~60.
+
+The mount model (all host paths under `~/.tenon`): workspace -> `/workspace` rw (snapshotted,
+host-visible); `agy-session/` -> `/root/.gemini/antigravity-cli` rw (the cred/session volume, the human
+logs in ONCE, the host's real `~/.gemini` is never mounted); `cli/machine-id-<env>` -> `/etc/machine-id`
+ro (a fixed per-env id generated once, reused, so the agent does not see a new machine each run);
+`cache/<env>/` -> `/root/.cache` rw (npm/pip/venv cache, with a `manifest.json` version file); and the
+`cli_agent.ro_base` list -> ro (toolchains/DSH, default empty, plumbing wired). Container hostname
+`tenon-<env>`. On kill/SIGINT/budget/breaker the container is destroyed — the PID namespace takes the
+agent and everything it forked, the cheap-restart kill switch.
+
+The adapter (`cli_agent::run(spec, instance, events, stop)`) takes an already-spawned instance, acquires
+a rate slot, streams the agent as a child inside the container, snapshots the workspace per parsed step,
+and enforces the wall/step budget + limiter. The orchestration (`cli_agent_cmd`) builds the instance
+(forcing the `oci` backend), runs the mandatory auth preflight INSIDE the container (`agy --version` +
+`agy models`, scanned for auth-failure signatures), and only then runs the agent. `preflight.rs` now
+runs probes via `Instance::exec` (one `sh -c` per probe with cwd+env), no jail.
+
+Machine identity is a config value with a HARD ETHICS guardrail (RFC §10.5, documented in rs/README):
+configurable identity + roadmap emulators are for the agent's OWN apps and legitimate cross-platform dev
+ONLY — never to bypass third-party security controls, never for illegal use; no anti-detection tooling.
+
+Gate (`base/tests/cli_agent_gate.rs`, skips cleanly without podman/docker, no real agy — fake scripts
+only): a fake agent inside the sandbox writes a file in its cwd; the edit lands in the SANDBOX workspace
+(host-visible via the bind); a canary placed in a temp subdir of `~/workspace` is byte-for-byte
+untouched (never mounted) and removed after; the workspace snapshot captures the change (>=2 snaps);
+teardown leaves no container; a recreate reuses the cache + RO base; a fake `agy` printing "expired"
+refuses preflight; a halted rate limiter refuses the run before the container is even touched. 3/3
+green; `podman ps -a --filter label=tenon.home` clean after.
+
+Gates: `cargo build --release` and `--features http` clean; `cargo clippy --all-targets --all-features
+-- -D warnings` clean; `cargo fmt --check` clean; `cargo test -p tenon-base --test cli_agent_gate` 3/3;
+`cargo test -p tenon-sandbox` (conformance oci/landlock/krun) 3/3; P3 gates `spawn_gate` + `worker_boot`
+green (sandbox Spec change is additive). Commits `6052646` (adapter + jail deletion), `35aaf2d`
+(cred/session volume + machine-id + cache mount).
+
+Ready for the human's one-time step: give the container agy+node (set `cli_agent.image` or mount the
+host toolchain via `cli_agent.ro_base`), `agy` login inside the `~/.tenon/agy-session` volume,
+`tenon cli-agent preflight --model agy`, then `tenon cli-agent run "<task>" --model agy`. The real login
+and first paid run are the human's step — no real agy was invoked here.

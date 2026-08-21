@@ -240,13 +240,19 @@ jailbreak tooling is built. This guardrail is part of the barebone's hard rules.
 
 ### 10.6 Revised kickstart
 
-- P5.0-v2a: refactor cli-agent to run the agent INSIDE the oci sandbox with the mount model; delete
+- [x] P5.0-v2a: refactor cli-agent to run the agent INSIDE the oci sandbox with the mount model; delete
   the host jail; add the cred/session volume + machine-id config; workspace snapshot on change/timer.
   Gate: with a fake agent, edits land in the sandbox workspace and are snapshotted; a canary in
-  ~/workspace is unreachable (not mounted); container recreate is cheap.
-- P5.0-v2b: cache mount + version manifest (node_modules/venv persistence); RO-base mount (DSH as the
-  worked example). Gate: install a dep once, recreate the container, dep is reused from cache.
-- Human step (once): log in to agy inside the session volume; then a container preflight confirms agy
-  authenticates and can create a file in the sandbox workspace.
-- Then the overnight benchmark run with monitors (mechanical always-on: container boundary + budget +
+  ~/workspace is unreachable (not mounted); container recreate is cheap. **DONE 2026-08-21** (commit
+  `6052646`): `jail.rs` + `mcp_loopback.rs` deleted; `cli_agent.rs` streams the agent via
+  `Instance::spawn_streaming` inside the oci instance; `cli_agent_gate.rs` proves the canary is
+  untouched, edits land in the sandbox workspace, snapshots are captured, teardown is clean.
+- [x] P5.0-v2b: cache mount + version manifest (node_modules/venv persistence); RO-base mount (DSH as the
+  worked example). Gate: install a dep once, recreate the container, dep is reused from cache. **DONE
+  2026-08-21** (commit `35aaf2d`): per-env cache bind + `manifest.json`, `ro_base` config list, both
+  proven to persist across a container recreate in the gate.
+- [ ] Human step (once): log in to agy inside the session volume; then a container preflight confirms agy
+  authenticates and can create a file in the sandbox workspace. *(ready; see rs/README "The one-time
+  human step")*
+- [ ] Then the overnight benchmark run with monitors (mechanical always-on: container boundary + budget +
   kill + rate limiter; judgment: Opus ~10 min, Fable ~1 h).
