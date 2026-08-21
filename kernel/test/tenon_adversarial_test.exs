@@ -107,6 +107,7 @@ defmodule TenonAdversarialTest do
   import sys, struct, json, os, time
 
   MODE = sys.argv[1] if len(sys.argv) > 1 else "misc"
+  NAME = sys.argv[2] if len(sys.argv) > 2 else "x"
 
 
   WIRE_IN = os.fdopen(3, "rb", 0)
@@ -169,7 +170,12 @@ defmodule TenonAdversarialTest do
       if frame is None:
           break
       kind = frame.get("t")
-      if kind == "load":
+      if kind == "load" and MODE == "atomflood":
+          send({"t": "provide", "name": "advnovel_svc_" + NAME})
+          send({"t": "on", "hook": 1, "event": "advnovel_evt_" + NAME, "arity": 0, "mode": "emit"})
+          send({"t": "emit", "event": "advnovel_emit_" + NAME, "args": []})
+          send({"t": "rep", "req": frame["req"], "result": "ok"})
+      elif kind == "load":
           send({"t": "on", "hook": 1, "event": "adv/malformed", "arity": 0, "mode": "emit"})
           send({"t": "on", "hook": 2, "event": "adv/no_t", "arity": 0, "mode": "emit"})
           send({"t": "on", "hook": 3, "event": "adv/flood", "arity": 0, "mode": "emit"})
@@ -493,6 +499,38 @@ defmodule TenonAdversarialTest do
   end
 
   @tag :capture_log
+  test "wire-supplied names never mint atoms, so the atom table cannot be exhausted" do
+    {k, ctx} = kernel()
+    suffix = Integer.to_string(:erlang.unique_integer([:positive]))
+
+    names = [
+      "advnovel_svc_" <> suffix,
+      "advnovel_evt_" <> suffix,
+      "advnovel_emit_" <> suffix
+    ]
+
+    for n <- names do
+      assert_raise ArgumentError, fn -> :erlang.binary_to_existing_atom(n, :utf8) end
+    end
+
+    {:ok, fiber} =
+      :tenon.mount(ctx, %{
+        cmd: String.to_charlist(@plugin),
+        args: [String.to_charlist("atomflood"), String.to_charlist(suffix)],
+        config: %{}
+      })
+
+    wait_until(fn -> :tenon.status(fiber) == :active end)
+
+    for n <- names do
+      assert_raise ArgumentError, fn -> :erlang.binary_to_existing_atom(n, :utf8) end
+    end
+
+    assert :tenon.status(fiber) == :active
+    assert Process.alive?(k)
+    :tenon.stop(k)
+  end
+
   test "a malformed wire frame does not take down the kernel" do
     {_k, ctx} = kernel()
     {:ok, fiber} = wire_plugin(ctx, "misc")

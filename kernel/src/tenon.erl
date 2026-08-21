@@ -816,7 +816,7 @@ take_pending(#f{pending = Pending} = State, Req) ->
 handle_frame(#{<<"t">> := <<"hello">>} = Frame, State0) ->
     {Entry, State1} = take_pending(State0, hello),
     cancel_timer(Entry),
-    Inject = [to_atom(N) || N <- maps:get(<<"inject">>, Frame, [])],
+    Inject = [wire_key(N) || N <- maps:get(<<"inject">>, Frame, [])],
     State2 = State1#f{inject = Inject, phase = ready},
     write_row(State2),
     index_inject(State2),
@@ -826,25 +826,25 @@ handle_frame(#{<<"t">> := <<"on">>} = Frame, State) ->
 handle_frame(#{<<"t">> := <<"off">>} = Frame, State) ->
     wire_off(maps:get(<<"hook">>, Frame), State);
 handle_frame(#{<<"t">> := <<"provide">>} = Frame, State) ->
-    wire_provide(to_atom(maps:get(<<"name">>, Frame)), State);
+    wire_provide(wire_key(maps:get(<<"name">>, Frame)), State);
 handle_frame(#{<<"t">> := <<"unprovide">>} = Frame, State) ->
-    wire_off({service, to_atom(maps:get(<<"name">>, Frame))}, State);
+    wire_off({service, wire_key(maps:get(<<"name">>, Frame))}, State);
 handle_frame(#{<<"t">> := <<"emit">>} = Frame, State) ->
     Ctx = State#f.ctx,
-    Event = to_atom(maps:get(<<"event">>, Frame)),
+    Event = wire_key(maps:get(<<"event">>, Frame)),
     Args = maps:get(<<"args">>, Frame, []),
     _ = spawn(fun() -> emit(Ctx, Event, Args) end),
     State;
 handle_frame(#{<<"t">> := <<"call">>} = Frame, State) ->
     Ctx = State#f.ctx,
-    Event = to_atom(maps:get(<<"event">>, Frame)),
+    Event = wire_key(maps:get(<<"event">>, Frame)),
     Args = maps:get(<<"args">>, Frame, []),
     worker(State, maps:get(<<"id">>, Frame),
            fun() -> call(Ctx, Event, Args, next(fun(Out) -> Out end, length(Args))) end);
 handle_frame(#{<<"t">> := <<"svc">>} = Frame, State) ->
     Ctx = State#f.ctx,
-    Name = to_atom(maps:get(<<"name">>, Frame)),
-    Method = to_atom(maps:get(<<"method">>, Frame)),
+    Name = wire_key(maps:get(<<"name">>, Frame)),
+    Method = wire_key(maps:get(<<"method">>, Frame)),
     Args = maps:get(<<"args">>, Frame, []),
     worker(State, maps:get(<<"id">>, Frame), fun() -> svc(Ctx, Name, Method, Args) end);
 handle_frame(#{<<"t">> := <<"next">>} = Frame, State0) ->
@@ -914,7 +914,7 @@ worker(State, Id, Body) ->
 
 wire_on(Frame, State) ->
     Id = maps:get(<<"hook">>, Frame),
-    Event = to_atom(maps:get(<<"event">>, Frame)),
+    Event = wire_key(maps:get(<<"event">>, Frame)),
     Arity = maps:get(<<"arity">>, Frame, 1),
     Mode = maps:get(<<"mode">>, Frame, <<"emit">>),
     Prepend = maps:get(<<"prepend">>, Frame, false),
@@ -978,8 +978,15 @@ wire_off(Key, #f{wire = Wire} = State) ->
             State
     end.
 
-to_atom(Value) when is_binary(Value) -> binary_to_atom(Value, utf8);
-to_atom(Value) when is_atom(Value) -> Value.
+%% intern a wire-supplied name without ever minting a new atom: untrusted
+%% frames must not be able to exhaust the global (never-GC'd) atom table.
+wire_key(Value) when is_atom(Value) -> Value;
+wire_key(Value) when is_binary(Value) ->
+    try
+        binary_to_existing_atom(Value, utf8)
+    catch
+        error:badarg -> Value
+    end.
 
 enc(Term) when is_binary(Term); is_number(Term) -> Term;
 enc(true) -> true;
