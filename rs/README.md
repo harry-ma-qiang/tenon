@@ -1498,6 +1498,48 @@ under) but the actor-side node kind is deferred; P5.0a/b ships the jail, the ada
 the safety and rate floor, driven directly and covered by `base/tests/jail_gate.rs` and
 `base/tests/cli_agent_gate.rs`.
 
+### Driving a run from the CLI: `tenon cli-agent` (P5.0c)
+
+`tenon cli-agent run <task> [--model agy|claude] [--rpm N] [--wall-s S] [--max-calls N]
+[--scratch-max-mb MB] [--writable-state]` is the subcommand that turns the adapter into a real,
+supervised run. It: resolves the model binary; creates the run under `~/.tenon/cli/<run>/scratch`; sets
+`RLIMIT_NPROC` **relative to the current per-uid process count** plus `cli_agent.nproc_headroom`
+(default 256), since NPROC is per-uid, not per-tree; runs the **mandatory auth preflight** (below) and
+refuses the paid run unless it is clean; starts the Tenon-as-MCP loopback server when base is up (else
+documents the native-tool fallback); writes `.mcp.json`; spawns the agent through the jail with
+`cwd=scratch`; streams events (printed, and published to the bus under `cli-agent/<run>/*` when base is
+up); enforces the rate limiter + wall/step budget; and on SIGINT or `tenon cli-agent stop <run>` tears
+down (jail SIGKILL + MCP stop). `tenon cli-agent status` lists every run from its `meta.json`. base
+itself runs no agent code — the agent is the jailed child.
+
+**Scratch disk cap.** A background watcher polls the scratch tree and SIGKILLs the jail (emitting a
+`violation`) the moment it exceeds `cli_agent.scratch_max_mb` (default 512, `--scratch-max-mb` per run),
+so an overnight agent cannot fill the host disk. A size-limited tmpfs is not mountable unprivileged on
+this host, so the watcher is the floor (RFC open question, best-effort).
+
+**Auth preflight (`base/src/preflight.rs`, mandatory before any paid call).** `preflight(model)` runs
+zero-cost read-only probes UNDER THE JAIL — `agy --version`, `agy mcp list`, and crucially `agy models`
+(the auth probe: it exercises the credential token source without a completion) — and scans the
+combined output for auth-failure signatures (case-insensitive `license`, `not logged in`,
+`unauthenticated`, `login`, `expired`, `forbidden`, `401`) or a non-zero exit. On a hit it FAILS LOUD,
+naming the likely blocked credential path, and does **not** proceed to the model. `tenon cli-agent
+preflight [--model agy] [--writable-state]` runs it on its own. `--version`/`mcp list` alone do not
+authenticate, so `models` is what actually catches a jail-blocked credential.
+
+**`--writable-state` (why a working agy run needs it).** The safe default grants the agent's own
+credential dir **read-only** (`~/.gemini`, `~/.cache/antigravity` for agy). agy, however, must *write*
+its state to refresh its OAuth token — with the dir read-only it fails with "You are not logged into
+Antigravity", which the `models` probe now catches. `--writable-state` grants the agent's own state and
+cache dirs (`~/.gemini`, `~/.cache`) **read-write** so the token refresh and its language-server/browser
+sidecar work. This is still inside the agent's own home — `~/workspace`, the tenon repo,
+`deepseek.env.sh` and `~/.ssh` remain unreachable in both modes.
+
+**`RLIMIT_AS` is off for cli-agent runs.** agy/claude are Go/Node binaries whose runtimes reserve huge
+*virtual* address space; a tight `RLIMIT_AS` triggers a false `fatal error: out of memory` before the
+agent runs. `jail_limits` sets `mem_bytes = 0`, so real memory capping is the cgroup `memory.max`
+(enforced only when base runs under the delegated user manager, else no memory cap — documented). The
+scratch watcher, `RLIMIT_NPROC`, `RLIMIT_CPU`, `RLIMIT_NOFILE` and the wall/step budget remain the floor.
+
 ## Commands
 
 | Command | What |
@@ -1524,6 +1566,10 @@ the safety and rate floor, driven directly and covered by `base/tests/jail_gate.
 | `tenon harness [--env NAME]` | the agent process of one env. Base starts one per env; run by hand only against a live gateway |
 | `tenon worker [--workspace DIR]` | the in-sandbox tool process. Speaks the wire on `TENON_GATEWAY` when it is set, fd 3/4 otherwise. `--workspace` defaults to `$TENON_WORKSPACE`, then `/workspace`, then the working directory |
 | `tenon mcp [--env NAME]` | expose that env's tools bus as an MCP server over stdio (newline-delimited JSON-RPC 2.0): `initialize`, `tools/list`, `tools/call` routed through the tools bus (env-scoped, gated tools -> approvals). Lets an MCP client such as Claude Code use Tenon as a sandboxed executor (RFC P4.7) |
+| `tenon cli-agent run <task> [--model agy\|claude] [--rpm N] [--wall-s S] [--max-calls N] [--scratch-max-mb MB] [--writable-state]` | preflight (mandatory, zero-cost), then run the CLI agent under the host jail with a scratch disk cap, the account rate limiter, the wall/step budget, an optional Tenon-as-MCP loopback server, and SIGINT teardown (RFC P5.0c). `--writable-state` grants the agent's own state/cache dir read-write (agy needs it to refresh its token) |
+| `tenon cli-agent preflight [--model agy] [--writable-state]` | the zero-cost auth preflight on its own: runs `--version`/`mcp list`/`models` under the jail and reports whether the model is authenticated and which cred paths the jail grants |
+| `tenon cli-agent status` | every cli-agent run this home has scaffolded, from its `meta.json` |
+| `tenon cli-agent stop <run>` | ask a running cli-agent run to stop (drops its stop file, which the adapter's watcher turns into the kill switch) |
 
 `--exit-on-detach` stops everything when the last **subscriber** disconnects. `status` and
 `stop` connect without subscribing, so only `attach` holds the door open.

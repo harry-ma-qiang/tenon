@@ -2382,3 +2382,62 @@ first real run is a human-triggered step.
 - **Remaining before the first real agy run:** cgroup enforcement needs base under the delegated user
   manager (else rlimit-only, which is sufficient for the fork-bomb/OOM floor); and `RLIMIT_NPROC` must
   be set relative to the host's current per-uid process count, not an absolute, since it is per-uid.
+
+## P5.0c-prep result — cli-agent CLI + auth preflight + scratch cap + one real agy trial (2026-08-21)
+
+Made the P5.0a/b safety floor actually runnable from the CLI and did ONE supervised real `agy` trial.
+Three new modules in `rs/base/src/` (`cli_agent_cmd.rs` orchestration, `preflight.rs`, `mcp_loopback.rs`),
+a `cli-agent` subcommand tree in `rs/cli/src/main.rs`, a `CliAgent` config section, and `rw_allow` on the
+jail. No architecture change.
+
+### What shipped
+
+`tenon cli-agent run <task> [--model agy|claude] [--rpm N] [--wall-s S] [--max-calls N]
+[--scratch-max-mb MB] [--writable-state]`, plus `preflight`, `status`, `stop`. The run: resolves the
+model binary; scaffolds `~/.tenon/cli/<run>/scratch`; sets `RLIMIT_NPROC` = current per-uid process
+count + `cli_agent.nproc_headroom` (256); runs the mandatory zero-cost preflight and refuses the paid
+run unless clean; starts a Tenon-as-MCP loopback server (bearer token, `crate::mcp::handle` routed to
+the front-door socket) when base is up, else documents the native-tool fallback; writes `.mcp.json`;
+spawns agy/claude through the jail with `cwd=scratch`; streams `cli-agent/<run>/*` events (printed +
+bus-published when base is up); enforces the limiter + wall/step budget; and tears down on SIGINT /
+`stop <run>`. **Scratch disk cap:** a background watcher SIGKILLs the jail (emits `violation`) when
+scratch exceeds `scratch_max_mb` (default 512) — a size-limited tmpfs is not mountable unprivileged, so
+the watcher is the floor. **Auth preflight (`preflight.rs`):** zero-cost `agy --version` / `mcp list` /
+`models` under the jail, scanned for auth-failure signatures; `models` is the one that actually
+exercises the credential token source.
+
+Tests: `base/tests/cli_agent_run.rs` (4) — scratch-cap watcher kills the jail on overflow (with
+`violation`), preflight refuses on an auth signature ("license expired"), preflight passes on clean
+output, preflight refuses on a non-zero probe exit. `cli_agent_gate.rs` (3) and `jail_gate.rs` (5)
+updated for the new `rw_state`/`rw_allow` fields, still green.
+
+### The one real agy trial (supervised, low rate)
+
+Preflight was the story. `agy --version` + `mcp list` alone do NOT authenticate, so the first attempt's
+preflight passed but the real `-p` run failed at auth: **"You are not logged into Antigravity"** because
+the jail granted the credential dir READ-ONLY and agy must WRITE to refresh its OAuth token. Fix 1:
+added `agy models` (auth probe, zero-cost) — the default read-only preflight now correctly FAILS naming
+the blocked cred path. Fix 2: `--writable-state` grants the agent's own `~/.gemini` + `~/.cache`
+read-write (still not `~/workspace`/repo/ssh) so the token refresh works; preflight then CLEAN. Second
+run then hit **`fatal error: out of memory`** — `RLIMIT_AS` (2 GB) is incompatible with Go's huge
+virtual-address reservations. Fix 3: `jail_limits` sets `mem_bytes = 0` (RLIMIT_AS off); memory capping
+is the cgroup `memory.max` (best-effort here). Third run: **agy authenticated, exited 0, made real
+Gemini 3.7 Flash calls** (multiple `streamGenerateContent` requests in the log). It did NOT write
+`hello.txt`: agy's native terminal/file-tool sidecar is degraded under the jail ("empty component:
+terminal_sandbox") and base was not up to serve Tenon-MCP as the tool source, so the model turns ran but
+the file tool did not land a write.
+
+**Safety held on every run:** the `~/workspace` canary was byte-for-byte identical (sha256 unchanged)
+after each trial, no `hello.txt` escaped to `~/workspace`, the scratch tree was the only writable output,
+the rate limiter/budget were respected, and the run tore down cleanly. Model spend was tiny (a handful
+of Flash turns on the successful run; the two failed runs made no completion).
+
+### Is it safe to start an overnight run?
+
+The safety floor (Landlock confinement, scratch cap, NPROC, wall/step budget, kill switch, canary
+intact) is proven. Two things the human/Fable must decide first: (1) memory — with `RLIMIT_AS` off and
+cgroup enforcement unavailable outside the delegated user manager, an overnight run has **no memory
+cap**; run base under `user@<uid>.service` for a real `memory.max`. (2) tool routing — for the agent to
+actually DO work reversibly, bring base up so Tenon-as-MCP is the tool source (agy's native file tool is
+degraded under the jail); the run already registers it when base is reachable. `--writable-state` is
+required for agy to authenticate. Not started here — that is the human's step.
