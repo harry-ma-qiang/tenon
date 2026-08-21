@@ -93,6 +93,50 @@ what the frameworks above offer; they orchestrate but do not sandbox each call.
 - No change to the model's freedom to just call one tool; the plan is an
   option, not a requirement.
 
+## Addendum: exec_flow - LispAST-in-JSON (proposed language layer)
+
+Proposed by the cli-agent (agy) during batch-1. A concrete realization of
+design direction 1, and the current front-runner for the language layer.
+
+The shape: a single tool `exec_flow(flow)` whose `flow` argument is a JSON
+S-expression AST - "LispAST in JSON", homoiconic (code = data = JSON):
+
+- Leaf: `[tool_name, args_obj]` evaluates to `tools.dispatch(tool_name, args)`.
+- Combinators: `["parallel", child, ...]` (Tokio JoinSet), `["if", cond, then,
+  else]`, `["for", ...]`, evaluated recursively in `rs/harness` over the
+  existing ToolRegistry. The whole tree returns as one tool-result string.
+- Smart fallback: when the model returns an ordinary array of tool calls that
+  are all read-only, the scheduler transparently runs them in parallel and
+  reassembles results in original order - no prompt or client change.
+
+Why this is the right shape:
+- LLMs emit JSON reliably; a homoiconic JSON AST is the most natural action
+  space for them, with no bespoke grammar or parser.
+- Code-as-data makes the program trivially validatable, sandboxable, and
+  auditable - directly serving the determinism/isolation/audit goals. It is
+  strictly easier to sandbox and make deterministic than code-as-action
+  (arbitrary Python), while keeping if/for/parallel expressivity.
+- Leaves reuse the existing ToolRegistry and the `tools/pre-execute` policy
+  waterfall; only the combinators are new.
+
+Honest caveats (must not be logged as settled fact):
+- Performance claims (e.g. 50% token / 5-10x speed) are unverified; the
+  measured reference is LLMCompiler's 3.7x latency / 6.7x cost, and gains are
+  workload-dependent (only steps with independent I/O benefit).
+- The AST solves expressivity + determinism + audit, NOT isolation. Parallel
+  MUTATING calls still need the thread/WASM/microVM isolation tier underneath.
+  Language layer is not the isolation layer.
+- A model-controlled AST is an attack surface: enforce recursion-depth and
+  size limits (the same untrusted-input DoS class as the atom-table bug), run
+  every leaf under the policy gate and env-scope, and add a data-flow binding
+  (`let` / `$ref`) so a node can consume a prior node's result.
+- The smart fallback depends on the `parallel_safe` tool classification the
+  harness does not have yet.
+
+Prior art for a computable JSON DSL: JSONLogic (rules/logic as JSON),
+s-expression homoiconicity (Lisp / MAL), plus LLMCompiler (DAG) and CodeAct
+(code as action) already cited above.
+
 ## First concrete step when scheduled
 
 1. Add `parallel_safe: bool` (default false) to the tool `Row` and thread it
