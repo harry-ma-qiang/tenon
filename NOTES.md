@@ -50,6 +50,8 @@ Order: sh script echo demo -> DSH headless via the same lines protocol -> then c
 - P2 loader: yml tree + patch layers + ops (mount/unload/update/restart/dump) + hot code reload.
 - P3 bridge: `:port`+`:lines` sh demo -> MCP -> DSH headless/ACP. Demo: supervise 2 external agents, hot-swap one Elixir policy plugin.
 - P4: native seams (session log / tools / llm), Rustler term-core, more launchers, isolate.
+- P5: cli-agent runtime + self-evolution experiment (RFC-P5.0, RFC-P5.1); memory + navigator (brain, separate design).
+- P6 (roadmap, not scheduled): tool orchestration runtime - if/else/for/parallel-batch control flow over tools with per-call isolation (RFC-P6). Promoted from the self-evolution experiment's proposal 03.
 
 Gates (every commit): `mix compile --warnings-as-errors && mix format --check-formatted && mix credo --strict && mix test`.
 Rules: `../vibe-forge/rules-template/elixir.md`, `universal.md` (600 lines, no comments, no emoji).
