@@ -363,6 +363,8 @@ mod tests {
             base_pid: 1,
             images,
             ingress_ports: Vec::new(),
+            mounts: Vec::new(),
+            hostname: None,
         }
     }
 

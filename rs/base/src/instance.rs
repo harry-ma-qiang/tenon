@@ -60,6 +60,8 @@ impl Base {
             base_pid: std::process::id() as i32,
             images: Some(self.home.images_dir()),
             ingress_ports: self.ingress_ports(role),
+            mounts: Vec::new(),
+            hostname: None,
         };
         self.sandbox
             .spawn(&spec)

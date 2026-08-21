@@ -70,6 +70,39 @@ pub struct Spec {
     /// non-`http` build) publishes nothing, so the spawn line is unchanged.
     #[serde(default)]
     pub ingress_ports: Vec<u16>,
+    /// Extra host->guest bind mounts on top of the workspace (RFC P5.0-v2 mount
+    /// model): the cli-agent's cred/session volume, its per-env cache, its
+    /// machine-id file and any read-only base dirs. Empty by default, so every
+    /// existing spawn line is unchanged. Only the oci backend honours them.
+    #[serde(default)]
+    pub mounts: Vec<Mount>,
+    /// A fixed hostname for the instance, so an agent inside does not see a new
+    /// random container name each run (RFC P5.0-v2 §10.1). `None` leaves the
+    /// backend default.
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+/// One extra bind mount: a host path exposed at a guest path, read-only or
+/// read-write. A file mount (machine-id) and a directory mount (session, cache,
+/// ro-base) use the same shape; the oci backend passes it straight to `-v`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Mount {
+    pub host: PathBuf,
+    pub guest: String,
+    pub ro: bool,
+}
+
+/// A command to run inside a live instance as a streamed child: the caller reads
+/// its piped stdout line by line and kills it by destroying the instance. Used by
+/// the sandbox-native cli-agent, whose agent process is long-running and whose
+/// output is turned into bus events as it arrives.
+#[derive(Debug, Clone)]
+pub struct ExecSpec {
+    pub cmd: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -100,6 +133,14 @@ pub trait Instance: Send + Sync {
     fn binary_path(&self) -> String;
     fn exec(&self, cmd: &str, args: &[String], timeout: Duration) -> Result<ExecOutcome>;
     fn destroy(&self) -> Result<()>;
+
+    /// Spawn a long-running child inside the instance with stdout/stderr piped,
+    /// for a caller that streams the output and kills the child by destroying
+    /// the whole instance. The default errors — only a backend with a real
+    /// separate exec process (oci) implements it.
+    fn spawn_streaming(&self, _spec: &ExecSpec) -> Result<std::process::Child> {
+        bail!("{} has no streaming exec", self.backend())
+    }
 
     /// Starts the resident worker inside the instance and reports whether the
     /// backend took the job. `false` — every backend that can `exec` into a
@@ -234,6 +275,8 @@ mod tests {
             base_pid: std::process::id() as i32,
             images: None,
             ingress_ports: Vec::new(),
+            mounts: Vec::new(),
+            hostname: None,
         }
     }
 
