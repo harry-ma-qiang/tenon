@@ -30,7 +30,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 rusqlite = { version = "0.40", features = ["blob", "bundled"] }
 serde = { version = "1", features = ["derive"] }
