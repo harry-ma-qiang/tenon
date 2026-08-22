@@ -27,7 +27,7 @@ jobs:
         with:
           otp-version: ${{ env.OTP }}
           elixir-version: ${{ env.ELIXIR }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             kernel/_build
