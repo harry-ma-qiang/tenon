@@ -13,7 +13,7 @@
     "check": "tsc -p . --noEmit"
   },
   "devDependencies": {
-    "@types/node": "^22.15.3",
+    "@types/node": "^26.2.0",
     "typescript": "^5.9.2"
   }
 }
