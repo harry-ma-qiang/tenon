@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# least privilege: every job here only builds, tests, lints and scans
+permissions:
+  contents: read
+
 env:
   OTP: "27"
   ELIXIR: "1.18"

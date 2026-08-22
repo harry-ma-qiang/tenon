@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # Rust workspace
+  - package-ecosystem: "cargo"
+    directory: "/rs"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # Elixir / BEAM (projects with real hex deps; the kernel is zero-dep)
+  - package-ecosystem: "mix"
+    directory: "/beam"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "mix"
+    directory: "/loader"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "mix"
+    directory: "/cli"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # TypeScript / node packages
+  - package-ecosystem: "npm"
+    directory: "/sdk/ts"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "npm"
+    directory: "/bridge/dsh"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # GitHub Actions workflow versions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
