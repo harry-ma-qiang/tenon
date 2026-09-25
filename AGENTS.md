@@ -20,11 +20,11 @@ commit. Report the full output; never claim a clean run after filtering it.
 
 ## Rules
 
-* `../vibe-forge/rules-template/universal.md` — 600 lines per file, no comments, no emoji,
+* the house `universal` rules — 600 lines per file, no comments, no emoji,
   read before writing, stay in scope, honest reporting, no secrets.
-* `../vibe-forge/rules-template/elixir.md` — zero warnings, credo strict, `mix format`,
+* the house `elixir` rules — zero warnings, credo strict, `mix format`,
   `@spec` on public functions, behaviour before implementations, let it crash for bugs.
-* `../vibe-forge/rules-template/tools.md` — the Rust section (`cargo clippy` clean on
+* the house `tools` rules — the Rust section (`cargo clippy` clean on
   files you touched) and the TypeScript section (pnpm only).
 
 `mix.lock` and `Cargo.lock` are committed: Elixir convention, and every rust crate here is

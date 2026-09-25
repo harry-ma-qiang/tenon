@@ -193,7 +193,7 @@ Reproduce the e2e in ~10 minutes with the single-file binary:
 
 ```
 export PATH="$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$PATH"
-export DEEPSEEK_API_KEY="<your key>"
+export DEEPSEEK_API_KEY="<your key>"   # or source it from wherever you keep it
 # build the single-file http binary once (embedded payload):
 cd beam && MIX_ENV=prod mix release --overwrite && cd ..
 tar -czf /tmp/p.tgz -C beam/_build/prod/rel tenon_beam

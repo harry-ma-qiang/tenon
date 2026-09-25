@@ -224,7 +224,7 @@ found. `AGENTS.md` has the gate commands per subproject if you want to rerun the
 To reproduce the CLI e2e in ~10 minutes:
 ```
 export PATH="$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$PATH"
-export DEEPSEEK_API_KEY="<your key>"
+export DEEPSEEK_API_KEY="<your key>"   # or source it from wherever you keep it
 cd rs && TENON_RELEASE_DIR=$PWD/../beam/_build/prod/rel/tenon_beam \
   ./target/release/tenon --home /tmp/review-try start
 ./target/release/tenon --home /tmp/review-try status   # wait for harness "ready"
