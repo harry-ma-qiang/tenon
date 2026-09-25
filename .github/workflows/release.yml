@@ -27,7 +27,7 @@ jobs:
           - name: macos-arm64
             runner: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # setup-beam publishes builds for the Linux runners; on macOS Homebrew is
       # the reliable path and gives the same OTP 27 / Elixir 1.18 pair.
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
