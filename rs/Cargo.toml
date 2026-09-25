@@ -14,7 +14,7 @@ arc-swap = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21", default-features = false }
 globset = "0.4"
 ignore = "0.4"
 libc = "0.2"
